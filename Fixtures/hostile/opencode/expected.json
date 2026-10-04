@@ -1,0 +1,10 @@
+[
+  {"name":"question","opened_canonical_path":true,"created_elsewhere":false},
+  {"name":"hash","opened_canonical_path":true,"created_elsewhere":false},
+  {"name":"percent","opened_canonical_path":true,"created_elsewhere":false},
+  {"name":"ampersand","opened_canonical_path":true,"created_elsewhere":false},
+  {"name":"equals","opened_canonical_path":true,"created_elsewhere":false},
+  {"name":"space","opened_canonical_path":true,"created_elsewhere":false},
+  {"name":"unicode","opened_canonical_path":true,"created_elsewhere":false},
+  {"name":"uri-injection","opened_canonical_path":true,"created_elsewhere":false}
+]

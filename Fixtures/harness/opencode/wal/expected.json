@@ -1,0 +1,14 @@
+{
+  "counts": {"initial_records":6,"after_part_prune_records":6,"after_revision_records":6},
+  "records": [
+    {"session_id":"session-a","message_id":"legacy-explicit","input":10,"output":20,"reasoning":3,"cache_read":4,"cache_write":5,"total":99,"provenance":"reported","total_mismatch":true},
+    {"session_id":"session-a","message_id":"legacy-derived","input":10,"output":20,"reasoning":3,"cache_read":4,"cache_write":5,"total":42,"provenance":"derived","source_convention":"codexbar-3239175f-disjoint"},
+    {"session_id":"session-a","message_id":"part-parent","input":30,"output":50,"reasoning":7,"cache_read":7,"cache_write":6,"total":100,"selected_part_ids":["p1","p2"]},
+    {"session_id":"session-a","message_id":"same-id","input":100,"output":0,"reasoning":0,"cache_read":0,"cache_write":0,"total":100},
+    {"session_id":"session-v2","message_id":"v2-assistant","input":1,"output":2,"reasoning":0,"cache_read":0,"cache_write":0,"total":3},
+    {"session_id":"session-v2","message_id":"v2-compaction","input":2,"output":3,"reasoning":1,"cache_read":4,"cache_write":5,"total":15}
+  ],
+  "same_id_mirror_count": 1,
+  "regenerated_id_copy_reported_total": 200,
+  "verified_consumption": null
+}

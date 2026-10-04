@@ -1,0 +1,18 @@
+[package]
+name = "quotern-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+test-faults = []
+
+[dependencies]
+jiff = { version = "0.2.35", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-concatenated"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+quotern-core = { path = ".", features = ["test-faults"] }

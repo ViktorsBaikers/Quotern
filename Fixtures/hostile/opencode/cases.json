@@ -1,0 +1,10 @@
+[
+  {"name":"question","component":"?"},
+  {"name":"hash","component":"#"},
+  {"name":"percent","component":"%"},
+  {"name":"ampersand","component":"&"},
+  {"name":"equals","component":"="},
+  {"name":"space","component":"space dir"},
+  {"name":"unicode","component":"répertoire"},
+  {"name":"uri-injection","component":"x?mode=rwc&vfs=unix"}
+]

@@ -1,0 +1,7 @@
+[
+  {"step":"generation_1","parts":{"p1":40,"p2":60},"expected_total":100,"pending_partial":false},
+  {"step":"prune_p2","parts":{"p1":40},"expected_total":100,"pending_partial":true},
+  {"step":"explicit_zero_p2","parts":{"p1":40,"p2":0},"expected_total":40,"pending_partial":false},
+  {"step":"stable_generation_revision","parts":{"p1":40,"p2":0},"expected_total":40,"pending_partial":false},
+  {"step":"same_generation_fingerprint_tie","parts":{"p1":40,"p2":0,"conflicting_p2":1},"expected_outcome":"source_changing","retain_total":40,"pending_partial":true}
+]

@@ -1,0 +1,13 @@
+[
+  {"name":"explicit_total_wins_mismatch","accepted":true,"record_id":"opencode:12:peer-session:11:explicit-99","input":10,"output":20,"reasoning":3,"cache_read":4,"cache_write":5,"total":99,"total_provenance":"reported","source_convention":null,"total_mismatch":true},
+  {"name":"named_convention_derives_42","accepted":true,"record_id":"opencode:12:peer-session:10:derived-42","input":10,"output":20,"reasoning":3,"cache_read":4,"cache_write":5,"total":42,"total_provenance":"derived","source_convention":"codexbar-3239175f-disjoint","total_mismatch":false},
+  {"name":"absent_reasoning_remains_missing","accepted":true,"record_id":"opencode:12:peer-session:17:missing-reasoning","input":10,"output":20,"reasoning":null,"cache_read":4,"cache_write":5,"total":99,"total_provenance":"reported","source_convention":null,"total_mismatch":false},
+  {"name":"explicit_zero_is_reported_zero","accepted":true,"record_id":"opencode:12:peer-session:4:zero","input":0,"output":0,"reasoning":0,"cache_read":0,"cache_write":0,"total":0,"total_provenance":"reported","source_convention":null,"total_mismatch":false},
+  {"name":"negative_counter_rejected","accepted":false,"failure":"invalid_record"},
+  {"name":"sqlite_integer_overflow_rejected","accepted":false,"failure":"invalid_record"},
+  {"name":"fractional_counter_rejected","accepted":false,"failure":"invalid_record"},
+  {"name":"missing_timestamp_rejected","accepted":false,"failure":"invalid_record"},
+  {"name":"v2_compaction_is_reported","accepted":true,"record_id":"opencode:12:peer-session:12:compaction-1","input":2,"output":3,"reasoning":1,"cache_read":4,"cache_write":5,"total":15,"total_provenance":"reported","source_convention":null,"total_mismatch":false},
+  {"name":"delimiter_tuple_is_distinct","accepted":true,"record_id":"opencode:3:a:b:1:c","total":2},
+  {"name":"delimiter_tuple_other_order_is_distinct","accepted":true,"record_id":"opencode:1:a:3:b:c","total":2}
+]

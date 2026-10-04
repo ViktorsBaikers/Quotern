@@ -1,0 +1,92 @@
+[
+  {
+    "name": "explicit_total_wins_mismatch",
+    "format": "legacy",
+    "session_id": "peer-session",
+    "message_id": "explicit-99",
+    "time_created": 1700000000000,
+    "data": {"role":"assistant","tokens":{"input":10,"output":20,"reasoning":3,"cache":{"read":4,"write":5},"total":99},"content":"QUOTERN-SENTINEL-4F2A"}
+  },
+  {
+    "name": "named_convention_derives_42",
+    "format": "legacy",
+    "session_id": "peer-session",
+    "message_id": "derived-42",
+    "time_created": 1700000001000,
+    "data": {"role":"assistant","tokens":{"input":10,"output":20,"reasoning":3,"cache":{"read":4,"write":5}}}
+  },
+  {
+    "name": "absent_reasoning_remains_missing",
+    "format": "v2",
+    "record_type": "assistant",
+    "session_id": "peer-session",
+    "message_id": "missing-reasoning",
+    "time_created": 1700000002000,
+    "data": {"tokens":{"input":10,"output":20,"cache":{"read":4,"write":5},"total":99}}
+  },
+  {
+    "name": "explicit_zero_is_reported_zero",
+    "format": "json",
+    "session_id": "peer-session",
+    "message_id": "zero",
+    "time_created": 1700000003000,
+    "data": {"role":"assistant","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":0}}
+  },
+  {
+    "name": "negative_counter_rejected",
+    "format": "legacy",
+    "session_id": "peer-session",
+    "message_id": "negative",
+    "time_created": 1700000004000,
+    "data": {"role":"assistant","tokens":{"input":-1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}
+  },
+  {
+    "name": "sqlite_integer_overflow_rejected",
+    "format": "legacy",
+    "session_id": "peer-session",
+    "message_id": "overflow",
+    "time_created": 1700000005000,
+    "data": {"role":"assistant","tokens":{"input":9223372036854775808,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}
+  },
+  {
+    "name": "fractional_counter_rejected",
+    "format": "json",
+    "session_id": "peer-session",
+    "message_id": "fractional",
+    "time_created": 1700000006000,
+    "data": {"role":"assistant","tokens":{"input":1.5,"output":0}}
+  },
+  {
+    "name": "missing_timestamp_rejected",
+    "format": "json",
+    "session_id": "peer-session",
+    "message_id": "no-time",
+    "time_created": null,
+    "data": {"role":"assistant","tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}
+  },
+  {
+    "name": "v2_compaction_is_reported",
+    "format": "v2",
+    "record_type": "compaction",
+    "session_id": "peer-session",
+    "message_id": "compaction-1",
+    "time_created": 1700000007000,
+    "data": {"tokens":{"input":2,"output":3,"reasoning":1,"cache":{"read":4,"write":5},"total":15}}
+  },
+  {
+    "name": "delimiter_tuple_is_distinct",
+    "format": "json",
+    "session_id": "a:b",
+    "message_id": "c",
+    "time_created": 1700000008000,
+    "data": {"role":"assistant","tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0},"total":2}}
+  },
+  {
+    "name": "delimiter_tuple_other_order_is_distinct",
+    "format": "json",
+    "session_id": "a",
+    "message_id": "b:c",
+    "time_created": 1700000009000,
+    "data": {"role":"assistant","tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0},"total":2}}
+  }
+]

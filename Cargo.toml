@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/quotern-core"]
+resolver = "3"
