@@ -349,6 +349,7 @@ const AT_SYMLINK_NOFOLLOW: c_int = 0x0100;
 const F_OK: c_int = 0;
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
+const LOCK_UN: c_int = 8;
 
 fn open_relative(directory: &File, name: &OsStr, flags: c_int) -> std::io::Result<File> {
     let name = CString::new(name.as_bytes())
@@ -528,6 +529,11 @@ impl Drop for DataDirOwner {
         // The hook runs before the descriptor closes, so it observes the owner still held.
         #[cfg(feature = "test-faults")]
         run_owner_release_hook();
+        // A process spawned while the owner was held references this descriptor until its exec
+        // closes it, close-on-exec notwithstanding, and the lock lasts while any reference does.
+        // Unlocking explicitly ends the claim here, not at that other process's exec.
+        // SAFETY: `directory` is a live descriptor; `flock` only changes its advisory lock.
+        unsafe { flock(self.directory.as_raw_fd(), LOCK_UN) };
     }
 }
 
@@ -3929,6 +3935,22 @@ mod tests {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         assert_eq!(version, 1);
+        Ok(())
+    }
+
+    /// A process spawned while an owner is held references its descriptor until its exec
+    /// closes it, even with close-on-exec. Dropping the owner still releases the claim.
+    #[test]
+    fn a_dropped_owner_releases_its_claim_despite_a_duplicate_descriptor() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let data = directory.path().canonicalize()?.join("data");
+        std::fs::create_dir(&data)?;
+        let (data, anchor) = crate::discovery::anchor_for(&data)?;
+        let owner = DataDirOwner::claim(&data, &anchor, false)?;
+        let duplicate = owner.directory.try_clone()?;
+        drop(owner);
+        DataDirOwner::claim(&data, &anchor, false)?;
+        drop(duplicate);
         Ok(())
     }
 }
