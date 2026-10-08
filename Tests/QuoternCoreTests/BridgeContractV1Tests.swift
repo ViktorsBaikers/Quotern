@@ -104,10 +104,28 @@ final class BridgeContractV1Tests: XCTestCase {
             }
         }
 
+        // Every Observation-bearing golden carries the full shape: value, unit, provenance and
+        // completeness as acquired, Rust's lifecycle status and last good instant.
+        XCTAssertEqual(catching.sourceReported.first?.input.status, .catchingUp)
+        XCTAssertEqual(pending.sourceReported.first?.total.status, .error, "a failure after the success")
+        XCTAssertEqual(pending.sourceReported.first?.total.completeness, .partial)
+        XCTAssertEqual(reported.sourceReported.first?.total.provenance, .derived)
+        XCTAssertEqual(reported.sourceReported.first?.input.completeness, .complete)
+
+        // The lifecycle states golden: each entry's response decodes (ObservationStateTests
+        // renders and checks them).
+        let states = try XCTUnwrap(Support.json("Contracts/bridge-v1/snapshot-states.json") as? [String: Any])
+        let entries = try XCTUnwrap(states["states"] as? [[String: Any]])
+        XCTAssertEqual(entries.count, 16)
+        for entry in entries {
+            let response = try JSONSerialization.data(withJSONObject: XCTUnwrap(entry["response"]))
+            XCTAssertEqual(try Envelope.decode(Array(response), as: TodaySnapshot.self).sourceReported.count, 1)
+        }
+
         // Inventory: every response golden in the contract directory is decoded above.
         let decoded = Set([
             "snapshot-empty.json", "snapshot-catching-up.json", "snapshot-pending-partial.json",
-            "snapshot-opencode-reported.json", "open-ok.json", "sources-list.json",
+            "snapshot-opencode-reported.json", "open-ok.json", "sources-list.json", "snapshot-states.json",
         ]).union(errors.keys)
         let directory = Support.root.appendingPathComponent("Contracts/bridge-v1").path
         let responses = try FileManager.default.contentsOfDirectory(atPath: directory)

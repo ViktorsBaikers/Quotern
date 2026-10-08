@@ -660,9 +660,62 @@ fn open_and_first_use_goldens_equal_live_responses() -> TestResult {
     );
     let mut reported = snapshot["data"]["source_reported"][0].clone();
     reported.as_object_mut().unwrap().remove("source_id");
-    assert_eq!(reported, oracle["source_reported"]);
+    assert_eq!(
+        acquired(&reported),
+        acquired_oracle(&oracle["source_reported"])
+    );
+    // Success at T and a snapshot at T: every present value is current, last good T.
+    for field in FIELDS {
+        assert_eq!(
+            (&reported[field]["status"], &reported[field]["last_good_ms"]),
+            (&json!("current"), &json!(T)),
+            "{field}"
+        );
+    }
     check_golden("snapshot-opencode-reported.json", normalized(snapshot))?;
     Ok(())
+}
+
+const FIELDS: [&str; 6] = [
+    "input",
+    "output",
+    "reasoning",
+    "cache_read",
+    "cache_write",
+    "total",
+];
+
+/// A projection without the lifecycle: each observation keeps value, unit, provenance and
+/// completeness; `status` and `last_good_ms` are removed.
+fn acquired(projection: &Value) -> Value {
+    let mut projection = projection.clone();
+    for field in FIELDS {
+        let observation = projection[field].as_object_mut().expect(field);
+        observation.remove("status");
+        observation.remove("last_good_ms");
+    }
+    projection
+}
+
+/// The hand-written four-key daily oracle in the acquired full shape: its acquired status
+/// becomes completeness (current → complete, partial → partial, unavailable → null).
+fn acquired_oracle(oracle: &Value) -> Value {
+    let mut oracle = oracle.clone();
+    for field in FIELDS {
+        let observation = oracle[field].as_object_mut().expect(field);
+        let completeness = match observation
+            .remove("status")
+            .as_ref()
+            .and_then(Value::as_str)
+        {
+            Some("current") => json!("complete"),
+            Some("partial") => json!("partial"),
+            Some("unavailable") => Value::Null,
+            other => panic!("{field}: oracle status {other:?}"),
+        };
+        observation.insert("completeness".into(), completeness);
+    }
+    oracle
 }
 
 /// The hand-written `validation_cases` of the daily oracle against the real `quotern_call`, on a
@@ -736,10 +789,10 @@ fn utc_oracle() -> TestResult<Value> {
         .find(|case| case["name"] == "utc_counters")
         .ok_or("utc_counters")?;
     assert_eq!(case["source_reported"]["records"], json!(4), "nonempty");
-    Ok(case["source_reported"].clone())
+    Ok(acquired_oracle(&case["source_reported"]))
 }
 
-/// The single source's projection in the UTC day of `T`, without its store-minted id.
+/// The single source's acquired projection in the UTC day of `T`, without its store-minted id.
 fn utc_reported(live: &Live) -> Value {
     let snapshot = live.call(
         "today_snapshot",
@@ -750,7 +803,7 @@ fn utc_reported(live: &Live) -> Value {
         .as_object_mut()
         .unwrap_or_else(|| panic!("no projection in {snapshot}"))
         .remove("source_id");
-    reported
+    acquired(&reported)
 }
 
 /// Two in-window input values set to i64::MAX and 1 by outside SQL with no handle live (a
@@ -831,15 +884,17 @@ fn every_golden_is_inventoried_by_a_live_comparison() -> TestResult {
                 "snapshot-empty.json",
                 "snapshot-opencode-reported.json",
                 "snapshot-pending-partial.json",
+                "snapshot-states.json",
                 "sources-list.json",
             ]
             .map(String::from)
         ),
-        "the 001 golden set"
+        "the 001 golden set plus the 008 lifecycle states"
     );
     open_and_first_use_goldens_equal_live_responses()?;
     empty_inventory_and_error_goldens_equal_live_responses()?;
     pending_and_catching_up_goldens_equal_live_responses()?;
+    state_goldens_equal_live_responses()?;
     first_use_request_goldens_use_production_codec()?;
     let mut consumed = CONSUMED.lock().unwrap().clone();
     consumed.extend(
@@ -926,6 +981,19 @@ fn pending_and_catching_up_goldens_equal_live_responses() -> TestResult {
         pending["data"]["source_reported"][0]["pending_partial"],
         json!(true)
     );
+    // The latest pass failed (not_sqlite) after the success at T: error, last good T.
+    for field in FIELDS {
+        let observation = &pending["data"]["source_reported"][0][field];
+        assert_eq!(
+            (
+                &observation["status"],
+                &observation["completeness"],
+                &observation["last_good_ms"]
+            ),
+            (&json!("error"), &json!("partial"), &json!(T)),
+            "{field}"
+        );
+    }
     check_golden("snapshot-pending-partial.json", normalized(pending))?;
 
     // Catching up: more rows than one pass reads, so nothing is published yet.
@@ -957,7 +1025,476 @@ fn pending_and_catching_up_goldens_equal_live_responses() -> TestResult {
         Some(published)
     );
     assert!((1..5_100).contains(&published), "{published}");
+    // A fresh success with a live backlog is catching up, never current.
+    for field in FIELDS {
+        let observation = &catching["data"]["source_reported"][0][field];
+        assert_eq!(
+            (&observation["status"], &observation["last_good_ms"]),
+            (&json!("catching_up"), &json!(T)),
+            "{field}"
+        );
+    }
     check_golden("snapshot-catching-up.json", normalized(catching))?;
+    Ok(())
+}
+
+/// The UTC day with no record of the daily rows: every observation null.
+const EMPTY_DAY_MS: i64 = 1_777_636_800_000;
+
+fn select(live: &Live) {
+    let selected = live.call(
+        "set_source_selection",
+        &json!({"harness": "opencode", "root": live.source(), "selected": true}).to_string(),
+    );
+    assert_eq!(selected["ok"], json!(true), "{selected}");
+}
+
+fn ingest_at(live: &Live, now_ms: i64) {
+    let ingested = live.call("ingest", &json!({"now_ms": now_ms}).to_string());
+    assert_eq!(ingested["ok"], json!(true), "{ingested}");
+}
+
+/// One named lifecycle state: the snapshot request and the live provider response.
+fn state(name: &str, live: &Live, now_ms: i64) -> Value {
+    let request = json!({"tz": "UTC", "now_ms": now_ms});
+    let response = live.call("today_snapshot", &request.to_string());
+    assert_eq!(response["ok"], json!(true), "{name}: {response}");
+    json!({"name": name, "request": request, "response": normalized(response)})
+}
+
+/// A record the adapter rejects: the next pass records `invalid_record` and publishes no new
+/// number.
+fn hostile(live: &Live, present: bool) -> TestResult {
+    let database = Connection::open(live.source().join("opencode.db"))?;
+    let changed = if present {
+        database.execute(
+            "INSERT INTO message(id, session_id, time_created, data) \
+             VALUES ('hostile', 'session-day', ?1, '{not json')",
+            [T + 5_000],
+        )?
+    } else {
+        database.execute("DELETE FROM message WHERE id = 'hostile'", [])?
+    };
+    assert_eq!(changed, 1);
+    Ok(())
+}
+
+/// Every lifecycle state the snapshot can present, each produced live through the real exports
+/// and kept as one entry of the SAME `snapshot-states.json` that Swift decodes, renders and
+/// checks for accessibility. Expected statuses and times are written here by hand from the
+/// precedence rule; values are the hand daily oracle.
+#[test]
+fn state_goldens_equal_live_responses() -> TestResult {
+    let mut states = Vec::new();
+
+    let (live, _) = open_live(&daily_rows())?;
+    select(&live);
+    ingest_at(&live, T);
+    states.push(state("current_at_600000_ms", &live, T + 600_000));
+    states.push(state("stale_at_600001_ms", &live, T + 600_001));
+    states.push(state("unavailable_empty_window", &live, EMPTY_DAY_MS));
+    let denied = live.call(
+        "set_source_selection",
+        &json!({"harness": "opencode", "root": live.source(), "selected": false}).to_string(),
+    );
+    assert_eq!(denied["ok"], json!(true), "{denied}");
+    states.push(state("denied_retains_values", &live, T));
+
+    // An attached failed pass after, at and before the success instant; then recovery.
+    for (name, attempt) in [
+        ("error_attached_newer_attempt", T + 1_000),
+        ("error_attached_equal_attempt", T),
+        ("error_attached_earlier_attempt", T - 1),
+    ] {
+        let (live, _) = open_live(&daily_rows())?;
+        select(&live);
+        ingest_at(&live, T);
+        hostile(&live, true)?;
+        ingest_at(&live, attempt);
+        states.push(state(name, &live, attempt.max(T)));
+        if attempt < T {
+            hostile(&live, false)?;
+            ingest_at(&live, T + 10_000);
+            states.push(state("current_after_attached_recovery", &live, T + 10_000));
+        }
+    }
+
+    // A persisted root missing at reopen: only open attempted, then ingest at and before the
+    // success instant; then the original root returns.
+    let (mut live, _) = open_live(&daily_rows())?;
+    select(&live);
+    ingest_at(&live, T);
+    live.close();
+    let moved = live.base().join("moved");
+    std::fs::rename(live.source(), &moved)?;
+    live.reopen()?;
+    states.push(state("error_unattached_null_attempt", &live, T));
+    ingest_at(&live, T);
+    states.push(state("error_unattached_equal_attempt", &live, T));
+    ingest_at(&live, T - 1);
+    states.push(state("error_unattached_earlier_attempt", &live, T));
+    std::fs::rename(&moved, live.source())?;
+    ingest_at(&live, T + 10_000);
+    states.push(state("current_after_reattach", &live, T + 10_000));
+
+    let bulk: Vec<Value> = (0..5_100)
+        .map(|i| json!({"id": format!("m{i}"), "session_id": "s", "time_created": T + i,
+            "data": {"role": "assistant", "tokens": {"input": 1, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}, "total": 1}}}))
+        .collect();
+    let (live, _) = open_live(&bulk)?;
+    select(&live);
+    ingest_at(&live, T);
+    states.push(state("catching_up_with_live_backlog", &live, T));
+
+    // A fresh success whose values were only partly acquired: partial completeness, current.
+    let (live, _) = open_live(&daily_rows())?;
+    select(&live);
+    ingest_at(&live, T);
+    states.push(state("fresh_partial_completeness_is_current", &live, T));
+
+    // One record without reasoning, cache or total: those values are null beside present ones,
+    // under a failed pass and then under denied consent.
+    let null_components: Vec<Value> = daily_rows()
+        .into_iter()
+        .filter(|row| row["id"] == "null-components")
+        .collect();
+    let (live, _) = open_live(&null_components)?;
+    select(&live);
+    ingest_at(&live, T);
+    hostile(&live, true)?;
+    ingest_at(&live, T + 1_000);
+    states.push(state("null_value_beside_error", &live, T + 1_000));
+    let (live, _) = open_live(&null_components)?;
+    select(&live);
+    ingest_at(&live, T);
+    let denied = live.call(
+        "set_source_selection",
+        &json!({"harness": "opencode", "root": live.source(), "selected": false}).to_string(),
+    );
+    assert_eq!(denied["ok"], json!(true), "{denied}");
+    states.push(state("null_value_beside_denied", &live, T));
+
+    // Hand table: (name, status of every present value, last_attempt_ms, last_good_ms, failed).
+    let table: [(&str, &str, Value, i64, bool); 16] = [
+        ("current_at_600000_ms", "current", json!(T), T, false),
+        ("stale_at_600001_ms", "stale", json!(T), T, false),
+        (
+            "unavailable_empty_window",
+            "unavailable",
+            json!(T),
+            T,
+            false,
+        ),
+        ("denied_retains_values", "denied", json!(T), T, false),
+        (
+            "error_attached_newer_attempt",
+            "error",
+            json!(T + 1_000),
+            T,
+            true,
+        ),
+        ("error_attached_equal_attempt", "error", json!(T), T, true),
+        (
+            "error_attached_earlier_attempt",
+            "error",
+            json!(T - 1),
+            T,
+            true,
+        ),
+        (
+            "current_after_attached_recovery",
+            "current",
+            json!(T + 10_000),
+            T + 10_000,
+            false,
+        ),
+        (
+            "error_unattached_null_attempt",
+            "error",
+            Value::Null,
+            T,
+            true,
+        ),
+        ("error_unattached_equal_attempt", "error", json!(T), T, true),
+        (
+            "error_unattached_earlier_attempt",
+            "error",
+            json!(T - 1),
+            T,
+            true,
+        ),
+        (
+            "current_after_reattach",
+            "current",
+            json!(T + 10_000),
+            T + 10_000,
+            false,
+        ),
+        (
+            "catching_up_with_live_backlog",
+            "catching_up",
+            json!(T),
+            T,
+            false,
+        ),
+        (
+            "fresh_partial_completeness_is_current",
+            "current",
+            json!(T),
+            T,
+            false,
+        ),
+        (
+            "null_value_beside_error",
+            "error",
+            json!(T + 1_000),
+            T,
+            true,
+        ),
+        ("null_value_beside_denied", "denied", json!(T), T, false),
+    ];
+    assert_eq!(states.len(), table.len());
+    let oracle = utc_oracle()?;
+    for (state, (name, status, attempt, good, failed)) in states.iter().zip(table) {
+        assert_eq!(state["name"], json!(name));
+        let data = &state["response"]["data"];
+        let source = &data["by_source"][0];
+        assert_eq!(source["last_attempt_ms"], attempt, "{name}: attempt");
+        assert_eq!(source["last_success_ms"], json!(good), "{name}: success");
+        assert_eq!(
+            source["last_error_code"].is_string(),
+            failed,
+            "{name}: failure"
+        );
+        let reported = &data["source_reported"][0];
+        for field in FIELDS {
+            let observation = &reported[field];
+            let expected = if observation["value"].is_null() {
+                "unavailable"
+            } else {
+                status
+            };
+            assert_eq!(observation["status"], json!(expected), "{name} {field}");
+            assert_eq!(observation["last_good_ms"], json!(good), "{name} {field}");
+        }
+        match name {
+            "unavailable_empty_window" => {
+                assert_eq!(reported["records"], json!(0));
+                for field in FIELDS {
+                    assert_eq!(
+                        reported[field],
+                        json!({"value": null, "unit": "tokens", "provenance": null,
+                            "completeness": null, "status": "unavailable", "last_good_ms": T}),
+                        "{field}: null is never 0"
+                    );
+                }
+            }
+            "catching_up_with_live_backlog" => {}
+            "null_value_beside_error" | "null_value_beside_denied" => {
+                let mut values = reported.clone();
+                values.as_object_mut().unwrap().remove("source_id");
+                assert_eq!(acquired(&values), null_components_oracle(), "{name}");
+                for (field, expected) in [
+                    ("input", status),
+                    ("output", status),
+                    ("reasoning", "unavailable"),
+                    ("cache_read", "unavailable"),
+                    ("cache_write", "unavailable"),
+                    ("total", "unavailable"),
+                ] {
+                    assert_eq!(reported[field]["status"], json!(expected), "{name} {field}");
+                }
+            }
+            _ => {
+                let mut values = reported.clone();
+                values.as_object_mut().unwrap().remove("source_id");
+                assert_eq!(acquired(&values), oracle, "{name}: values retained");
+                if name == "fresh_partial_completeness_is_current" {
+                    for field in ["reasoning", "cache_read", "cache_write", "total"] {
+                        assert_eq!(
+                            (&reported[field]["status"], &reported[field]["completeness"]),
+                            (&json!("current"), &json!("partial")),
+                            "{name} {field}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    check_golden("snapshot-states.json", json!({"states": states}))?;
+    Ok(())
+}
+
+/// The hand-written acquired projection of the fixture's `null-components` record alone (input 7,
+/// output 1, nothing else): reasoning, cache and total are null, never 0, and no total is derived
+/// from incomplete components.
+fn null_components_oracle() -> Value {
+    let absent = json!({"value": null, "unit": "tokens", "provenance": null, "completeness": null});
+    json!({
+        "records": 1,
+        "input": {"value": 7, "unit": "tokens", "provenance": "reported", "completeness": "complete"},
+        "output": {"value": 1, "unit": "tokens", "provenance": "reported", "completeness": "complete"},
+        "reasoning": absent.clone(),
+        "cache_read": absent.clone(),
+        "cache_write": absent.clone(),
+        "total": absent,
+        "source_convention": null,
+        "acquisition_consistency": "sqlite_read_transaction",
+        "origin_uncertainty": "unverified_origin",
+        "total_mismatch": false,
+        "mirror_conflict": false,
+        "pending_partial": false
+    })
+}
+
+/// The strict observation shape both consumers require: exactly the six keys, unit `tokens`, a
+/// lifecycle status, a nullable integer last-good time; provenance and completeness are null
+/// exactly when the value is, and a null value is `unavailable`.
+fn check_observation(observation: &Value) -> Result<(), String> {
+    let map = observation.as_object().ok_or("not an object")?;
+    let keys: BTreeSet<&str> = map.keys().map(String::as_str).collect();
+    let expected = BTreeSet::from([
+        "value",
+        "unit",
+        "provenance",
+        "completeness",
+        "status",
+        "last_good_ms",
+    ]);
+    if keys != expected {
+        return Err(format!("keys {keys:?}"));
+    }
+    let null = map["value"].is_null();
+    if !(null || map["value"].is_u64()) {
+        return Err(format!("value {}", map["value"]));
+    }
+    if map["unit"] != "tokens" {
+        return Err(format!("unit {}", map["unit"]));
+    }
+    let provenance = map["provenance"].as_str();
+    let completeness = map["completeness"].as_str();
+    let status = map["status"].as_str().unwrap_or_default();
+    let valid = if null {
+        map["provenance"].is_null() && map["completeness"].is_null() && status == "unavailable"
+    } else {
+        matches!(provenance, Some("reported" | "derived"))
+            && matches!(completeness, Some("complete" | "partial"))
+            && matches!(
+                status,
+                "current" | "stale" | "error" | "denied" | "catching_up" | "unavailable"
+            )
+    };
+    if !valid {
+        return Err(format!("inconsistent observation {observation}"));
+    }
+    if !(map["last_good_ms"].is_null() || map["last_good_ms"].is_i64()) {
+        return Err(format!("last_good_ms {}", map["last_good_ms"]));
+    }
+    Ok(())
+}
+
+/// Every observation of every `source_reported` projection anywhere in `golden`, checked
+/// strictly; the count of observations checked.
+fn check_observations(golden: &Value) -> Result<usize, String> {
+    match golden {
+        Value::Object(map) => {
+            let mut checked = 0;
+            for (key, value) in map {
+                if key == "source_reported" {
+                    for projection in value.as_array().ok_or("source_reported")? {
+                        for field in FIELDS {
+                            check_observation(&projection[field])
+                                .map_err(|error| format!("{field}: {error}"))?;
+                            checked += 1;
+                        }
+                    }
+                } else {
+                    checked += check_observations(value)?;
+                }
+            }
+            Ok(checked)
+        }
+        Value::Array(items) => items.iter().map(check_observations).sum(),
+        _ => Ok(0),
+    }
+}
+
+/// The real snapshot goldens pass the strict shape check; each mutant of the SAME states golden
+/// is rejected by it.
+#[test]
+fn observation_shape_rejects_mutated_goldens() -> TestResult {
+    for name in [
+        "snapshot-states.json",
+        "snapshot-opencode-reported.json",
+        "snapshot-catching-up.json",
+        "snapshot-pending-partial.json",
+        "snapshot-empty.json",
+    ] {
+        let checked = check_observations(&golden(name)?);
+        assert!(checked.is_ok(), "{name}: {checked:?}");
+    }
+    let states = golden("snapshot-states.json")?;
+    assert_eq!(check_observations(&states), Ok(16 * FIELDS.len()));
+
+    // states[0] input is a present value; states[2] total is a null one.
+    let present = "/states/0/response/data/source_reported/0/input";
+    let null = "/states/2/response/data/source_reported/0/total";
+    let mutants: [(&str, &str, &str, Option<Value>); 13] = [
+        ("missing completeness", present, "completeness", None),
+        ("missing provenance", present, "provenance", None),
+        ("missing status", present, "status", None),
+        ("missing last_good_ms", present, "last_good_ms", None),
+        ("extra key", present, "rate", Some(json!(1))),
+        (
+            "null completeness beside a value",
+            present,
+            "completeness",
+            Some(Value::Null),
+        ),
+        (
+            "null provenance beside a value",
+            present,
+            "provenance",
+            Some(Value::Null),
+        ),
+        ("unknown status", present, "status", Some(json!("fresh"))),
+        ("negative value", present, "value", Some(json!(-1))),
+        ("other unit", present, "unit", Some(json!("usd"))),
+        (
+            "provenance on a null value",
+            null,
+            "provenance",
+            Some(json!("reported")),
+        ),
+        (
+            "completeness on a null value",
+            null,
+            "completeness",
+            Some(json!("complete")),
+        ),
+        (
+            "null value not unavailable",
+            null,
+            "status",
+            Some(json!("current")),
+        ),
+    ];
+    for (label, pointer, key, replacement) in mutants {
+        let mut mutant = states.clone();
+        let observation = mutant
+            .pointer_mut(pointer)
+            .and_then(Value::as_object_mut)
+            .ok_or(pointer)?;
+        match replacement {
+            Some(value) => observation.insert(key.to_owned(), value),
+            None => observation.remove(key),
+        };
+        assert!(
+            check_observations(&mutant).is_err(),
+            "{label} must be rejected"
+        );
+    }
     Ok(())
 }
 
@@ -986,6 +1523,7 @@ fn numeric_width_boundaries() -> TestResult {
             start_ms: 0,
             end_ms: MAX_SOURCE_TIMESTAMP_MS,
             tz: "UTC".into(),
+            now_ms: MAX_SOURCE_TIMESTAMP_MS,
         },
         by_source: vec![SourceEntry {
             source_id: ID.into(),
@@ -1027,6 +1565,7 @@ fn numeric_width_boundaries() -> TestResult {
         "\"end_ms\":253402300799999",
         "\"last_attempt_ms\":253402300799999",
         "\"rejected_count\":4294967295",
+        "\"last_good_ms\":0",
     ] {
         assert!(text.contains(exact), "{exact} in {text}");
     }

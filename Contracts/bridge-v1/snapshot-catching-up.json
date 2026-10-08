@@ -19,35 +19,45 @@
       {
         "acquisition_consistency": "sqlite_read_transaction",
         "cache_read": {
+          "completeness": "complete",
+          "last_good_ms": 1775124000000,
           "provenance": "reported",
-          "status": "current",
+          "status": "catching_up",
           "unit": "tokens",
           "value": 0
         },
         "cache_write": {
+          "completeness": "complete",
+          "last_good_ms": 1775124000000,
           "provenance": "reported",
-          "status": "current",
+          "status": "catching_up",
           "unit": "tokens",
           "value": 0
         },
         "input": {
+          "completeness": "complete",
+          "last_good_ms": 1775124000000,
           "provenance": "reported",
-          "status": "current",
+          "status": "catching_up",
           "unit": "tokens",
           "value": 4968
         },
         "mirror_conflict": false,
         "origin_uncertainty": "unverified_origin",
         "output": {
+          "completeness": "complete",
+          "last_good_ms": 1775124000000,
           "provenance": "reported",
-          "status": "current",
+          "status": "catching_up",
           "unit": "tokens",
           "value": 0
         },
         "pending_partial": false,
         "reasoning": {
+          "completeness": "complete",
+          "last_good_ms": 1775124000000,
           "provenance": "reported",
-          "status": "current",
+          "status": "catching_up",
           "unit": "tokens",
           "value": 0
         },
@@ -55,8 +65,10 @@
         "source_convention": null,
         "source_id": "0123456789abcdef0123456789abcdef",
         "total": {
+          "completeness": "complete",
+          "last_good_ms": 1775124000000,
           "provenance": "reported",
-          "status": "current",
+          "status": "catching_up",
           "unit": "tokens",
           "value": 4968
         },

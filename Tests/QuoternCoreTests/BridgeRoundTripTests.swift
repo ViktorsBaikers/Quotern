@@ -38,14 +38,58 @@ enum Support {
         return try XCTUnwrap(file["cases"] as? [[String: Any]]).compactMap { $0["name"] as? String }
     }
 
-    /// The hand-written oracle of a case as the decoded DTO, for the store-minted `sourceId`.
-    static func reported(_ name: String, sourceId: String) throws -> SourceReported {
+    static let fields = ["input", "output", "reasoning", "cache_read", "cache_write", "total"]
+
+    /// The hand-written four-key oracle of a case in the full observation shape: its acquired
+    /// status becomes completeness (current → complete, partial → partial, unavailable → null).
+    /// `status` and `last_good_ms` are Rust's lifecycle at the request instant; the oracle
+    /// fixes them only through the arguments.
+    static func oracle(_ name: String, sourceId: String, status: String, lastGoodMs: Int64?) throws -> SourceReported {
         let entry = try expectedCase(name)
         var reported = try XCTUnwrap(entry["source_reported"] as? [String: Any])
         reported["source_id"] = sourceId
+        for field in fields {
+            var observation = try XCTUnwrap(reported[field] as? [String: Any], field)
+            let acquired = try XCTUnwrap(observation["status"] as? String, field)
+            let completeness: Any = ["current": "complete", "partial": "partial"][acquired] ?? NSNull()
+            observation["completeness"] = completeness
+            observation["status"] = observation["value"] is NSNull ? "unavailable" : status
+            observation["last_good_ms"] = lastGoodMs.map { NSNumber(value: $0) } ?? NSNull()
+            reported[field] = observation
+        }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(SourceReported.self, from: JSONSerialization.data(withJSONObject: reported))
+    }
+
+    /// The oracle as a snapshot at the instant of the source's last success presents it: present
+    /// values `current`, last good at the case's own `now_ms`.
+    static func reported(_ name: String, sourceId: String) throws -> SourceReported {
+        try oracle(name, sourceId: sourceId, status: "current", lastGoodMs: nowMs(name))
+    }
+
+    /// Only what Rust acquired: every observation without its lifecycle status and last-good
+    /// instant, for comparisons across request instants.
+    static func acquired(_ reported: SourceReported) -> [String] {
+        let observations = [reported.input, reported.output, reported.reasoning, reported.cacheRead, reported.cacheWrite, reported.total]
+        return ["\(reported.sourceId) \(reported.records) \(reported.sourceConvention ?? "-") \(reported.acquisitionConsistency ?? "-") \(reported.originUncertainty) \(reported.totalMismatch) \(reported.mirrorConflict) \(reported.pendingPartial)"]
+            + observations.map { "\($0.value.map(String.init) ?? "null") \($0.unit) \($0.provenance?.rawValue ?? "null") \($0.completeness?.rawValue ?? "null")" }
+    }
+
+    static func acquired(_ name: String, sourceId: String) throws -> [String] {
+        acquired(try oracle(name, sourceId: sourceId, status: "current", lastGoodMs: nil))
+    }
+
+    /// The error an error golden of `Contracts/bridge-v1` decodes to.
+    static func decodedError(_ golden: String) throws -> BridgeError {
+        let bytes = Array(try data("Contracts/bridge-v1/\(golden)"))
+        do throws(BridgeError) {
+            _ = try Envelope.decode(bytes, as: TodaySnapshot.self)
+        } catch {
+            return error
+        }
+        struct NotAnErrorGolden: Error {}
+        throw NotAnErrorGolden()
     }
 
     static func nowMs(_ name: String) throws -> Int64 {
@@ -435,7 +479,7 @@ final class BridgeRoundTripTests: XCTestCase {
             XCTAssertEqual(snapshot.window.endMs, window["end_ms"] as? Int64, name)
             XCTAssertEqual(snapshot.window.tz, zone, name)
             let reported = try XCTUnwrap(snapshot.sourceReported.first, name)
-            XCTAssertEqual(reported, try Support.reported(name, sourceId: reported.sourceId), name)
+            XCTAssertEqual(Support.acquired(reported), try Support.acquired(name, sourceId: reported.sourceId), name)
         }
         await client.close()
     }
@@ -458,7 +502,8 @@ final class BridgeRoundTripTests: XCTestCase {
         XCTAssertEqual(reopened.bySource.first?.lastSuccessMs, first.bySource.first?.lastSuccessMs)
         _ = try await client.ingest(nowMs: t + 600_000)
         let replayed = try await client.todaySnapshot(tz: "UTC", nowMs: t)
-        XCTAssertEqual(replayed.sourceReported, first.sourceReported, "replay adds zero")
+        XCTAssertEqual(replayed.sourceReported.map(Support.acquired), first.sourceReported.map(Support.acquired), "replay adds zero")
+        XCTAssertEqual(replayed.sourceReported.first?.total.status, .stale, "a success after the request instant is never current")
         await client.close()
         await client.close()
         let after = FFICounters.shared.current
@@ -488,7 +533,9 @@ final class BridgeRoundTripTests: XCTestCase {
         XCTAssertEqual(entry.lastErrorCode, "root_invalid")
         XCTAssertNil(entry.lastAttemptMs)
         XCTAssertEqual(entry.lastSuccessMs, durable.bySource.first?.lastSuccessMs)
-        XCTAssertEqual(unattached.sourceReported, durable.sourceReported, "durable unattached reads history")
+        XCTAssertEqual(unattached.sourceReported.map(Support.acquired), durable.sourceReported.map(Support.acquired), "durable unattached reads history")
+        XCTAssertEqual(unattached.sourceReported.first?.total.status, .error, "an unattached failure is never current")
+        XCTAssertEqual(unattached.sourceReported.first?.total.lastGoodMs, t)
 
         _ = try await client.ingest(nowMs: t + 5)
         let retried = try await client.todaySnapshot(tz: "UTC", nowMs: t)
@@ -497,7 +544,7 @@ final class BridgeRoundTripTests: XCTestCase {
         _ = try await client.ingest(nowMs: t + 10)
         let back = try await client.todaySnapshot(tz: "UTC", nowMs: t)
         XCTAssertNil(back.bySource.first?.lastErrorCode)
-        XCTAssertEqual(back.sourceReported, durable.sourceReported)
+        XCTAssertEqual(back.sourceReported.map(Support.acquired), durable.sourceReported.map(Support.acquired))
         await client.close()
     }
 }

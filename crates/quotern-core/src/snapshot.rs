@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{
     FailureCode, OPENCODE_SOURCE_CONVENTION, ObservationStatus, OriginUncertainty, PassCounters,
     PassOutcome, ProjectionConsistency, Provenance, SourceReportedObservation, TokenObservation,
-    bounded, is_valid_id_component, parse_tuple_record_id, required_nullable, tuple_record_id,
+    TokenUnit, bounded, is_valid_id_component, parse_tuple_record_id, required_nullable,
+    tuple_record_id,
 };
 use crate::limits::{
     MAX_OBSERVATION_PAGE, MAX_REPORTED_SOURCES, MAX_SELECTED_PART_IDS, MAX_SOURCE_TIMESTAMP_MS,
@@ -135,6 +136,10 @@ pub struct Window {
     pub start_ms: i64,
     pub end_ms: i64,
     pub tz: String,
+    /// The request instant the window was computed from and observation status is judged at.
+    /// The request already carries it, so it is not echoed on the wire.
+    #[serde(skip)]
+    pub now_ms: i64,
 }
 
 impl Window {
@@ -161,6 +166,7 @@ impl Window {
             start_ms: bounds.start_ms,
             end_ms: bounds.end_ms,
             tz: tz.to_owned(),
+            now_ms,
         })
     }
 
@@ -203,21 +209,171 @@ fn failure_wire<S: serde::Serializer>(
     }
 }
 
-/// One source's daily projection: only source-reported numbers, never measured.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// One source's daily projection: only source-reported numbers, never measured. It reaches the
+/// wire only inside [`TodaySnapshot`], whose observations carry their lifecycle status.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DailyReported {
     pub source_id: String,
-    #[serde(flatten)]
     pub projection: SourceProjection,
 }
 
 /// The v1 `today_snapshot` response. A store-less Engine yields the window with empty arrays,
-/// a genuinely empty inventory and never measurements.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// a genuinely empty inventory and never measurements. Each numeric value is serialized as a
+/// full [`Observation`] whose status is judged at `window.now_ms` from its source's entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TodaySnapshot {
     pub window: Window,
     pub by_source: Vec<SourceEntry>,
     pub source_reported: Vec<DailyReported>,
+}
+
+/// How long after its last success a source's values stay `current`.
+pub const FRESH_MS: i64 = 600_000;
+
+/// Lifecycle of one observation, separate from how completely its value was acquired.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleStatus {
+    Current,
+    Stale,
+    Unavailable,
+    Error,
+    Denied,
+    CatchingUp,
+}
+
+/// Whether every record contributing a value carried it (`complete`) or only some (`partial`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Completeness {
+    Complete,
+    Partial,
+}
+
+/// One numeric value as a snapshot presents it. `provenance` and `completeness` are null
+/// exactly when `value` is; `last_good_ms` is the source's last success, never fabricated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct Observation {
+    pub value: Option<u64>,
+    pub unit: TokenUnit,
+    pub provenance: Option<Provenance>,
+    pub completeness: Option<Completeness>,
+    pub status: LifecycleStatus,
+    pub last_good_ms: Option<i64>,
+}
+
+impl SourceEntry {
+    /// The status of this source's present values at `now_ms`. First match wins: denied; the
+    /// latest unresolved failure (the latest pass's or the current unattached failure, whatever
+    /// its attempt time); a live backlog; a success at most `FRESH_MS` before `now_ms`; else
+    /// stale (no success, an older one, or a clock earlier than the success).
+    pub fn lifecycle(&self, now_ms: i64) -> LifecycleStatus {
+        if self.consent == crate::domain::ConsentState::Denied {
+            return LifecycleStatus::Denied;
+        }
+        if self.last_error_code.is_some() {
+            return LifecycleStatus::Error;
+        }
+        if self.outcome == Some(PassOutcome::CatchingUp) {
+            return LifecycleStatus::CatchingUp;
+        }
+        let age = self
+            .last_success_ms
+            .and_then(|success| now_ms.checked_sub(success));
+        match age {
+            Some(age) if (0..=FRESH_MS).contains(&age) => LifecycleStatus::Current,
+            _ => LifecycleStatus::Stale,
+        }
+    }
+}
+
+impl Observation {
+    /// The acquired `observation` with its source's lifecycle: value, unit and provenance as
+    /// acquired; completeness from the acquired status; a null value is always `unavailable`.
+    pub fn of(observation: &TokenObservation, entry: &SourceEntry, now_ms: i64) -> Self {
+        let completeness = match observation.status {
+            ObservationStatus::Current => Some(Completeness::Complete),
+            ObservationStatus::Partial => Some(Completeness::Partial),
+            ObservationStatus::Unavailable => None,
+        };
+        let status = if observation.value.is_none() {
+            LifecycleStatus::Unavailable
+        } else {
+            entry.lifecycle(now_ms)
+        };
+        Self {
+            value: observation.value,
+            unit: observation.unit,
+            provenance: observation.provenance,
+            completeness,
+            status,
+            last_good_ms: entry.last_success_ms,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireReported<'a> {
+    source_id: &'a str,
+    records: u64,
+    input: Observation,
+    output: Observation,
+    reasoning: Observation,
+    cache_read: Observation,
+    cache_write: Observation,
+    total: Observation,
+    source_convention: &'a Option<String>,
+    acquisition_consistency: Option<ProjectionConsistency>,
+    origin_uncertainty: OriginUncertainty,
+    total_mismatch: bool,
+    mirror_conflict: bool,
+    pending_partial: bool,
+}
+
+#[derive(Serialize)]
+struct WireSnapshot<'a> {
+    window: &'a Window,
+    by_source: &'a [SourceEntry],
+    source_reported: Vec<WireReported<'a>>,
+}
+
+impl Serialize for TodaySnapshot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let now_ms = self.window.now_ms;
+        let mut source_reported = Vec::with_capacity(self.source_reported.len());
+        for daily in &self.source_reported {
+            let entry = self
+                .by_source
+                .iter()
+                .find(|entry| entry.source_id == daily.source_id)
+                .ok_or_else(|| serde::ser::Error::custom("a projection without its source"))?;
+            let projection = &daily.projection;
+            let observation =
+                |acquired: &TokenObservation| Observation::of(acquired, entry, now_ms);
+            source_reported.push(WireReported {
+                source_id: &daily.source_id,
+                records: projection.records,
+                input: observation(&projection.input),
+                output: observation(&projection.output),
+                reasoning: observation(&projection.reasoning),
+                cache_read: observation(&projection.cache_read),
+                cache_write: observation(&projection.cache_write),
+                total: observation(&projection.total),
+                source_convention: &projection.source_convention,
+                acquisition_consistency: projection.acquisition_consistency,
+                origin_uncertainty: projection.origin_uncertainty,
+                total_mismatch: projection.total_mismatch,
+                mirror_conflict: projection.mirror_conflict,
+                pending_partial: projection.pending_partial,
+            });
+        }
+        WireSnapshot {
+            window: &self.window,
+            by_source: &self.by_source,
+            source_reported,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl SourceSnapshot {

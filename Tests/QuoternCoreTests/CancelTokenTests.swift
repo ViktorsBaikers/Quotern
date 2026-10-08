@@ -48,7 +48,9 @@ final class CancelTokenTests: XCTestCase {
         XCTAssertEqual(snapshot.sourceReported, [try Support.reported("utc_counters", sourceId: id)])
         _ = try await client.ingest(nowMs: now + 1)
         let replay = try await client.todaySnapshot(tz: "UTC", nowMs: now)
-        XCTAssertEqual(replay.sourceReported, snapshot.sourceReported)
+        XCTAssertEqual(replay.sourceReported.map(Support.acquired), snapshot.sourceReported.map(Support.acquired))
+        // Judged at `now`, before the replay's success at `now + 1`: never current.
+        XCTAssertEqual(lifecycle(replay.sourceReported.first), Array(repeating: "stale \(now + 1)", count: 6))
         await client.close()
     }
 
@@ -98,12 +100,22 @@ final class CancelTokenTests: XCTestCase {
                 XCTAssertEqual(converged.sourceReported.first?.input.value, total)
                 _ = try await client.ingest(nowMs: base + 100)
                 let replay = try await client.todaySnapshot(tz: "UTC", nowMs: base)
-                XCTAssertEqual(replay.sourceReported, converged.sourceReported, "replay adds zero")
+                XCTAssertEqual(replay.sourceReported.map(Support.acquired), converged.sourceReported.map(Support.acquired), "replay adds zero")
+                // Re-proving 5,100 rows exceeds the 5,000-row pass budget, so the replay pass
+                // leaves the source catching up; its success at `base + 100` is the last good.
+                XCTAssertEqual(lifecycle(replay.sourceReported.first), Array(repeating: "catchingUp \(base + 100)", count: 6))
             }
             await client.close()
         }
         XCTAssertEqual(receipts, 1, "no attempt of 20 fresh worlds gave a mid-pass cancelled receipt: \(outcomes)")
         let after = FFICounters.shared.current
         XCTAssertEqual(after.tokensNew - before.tokensNew, after.tokensFree - before.tokensFree, "cancel new == free")
+    }
+
+    /// Rust's lifecycle of every observation: status and last-good instant.
+    private func lifecycle(_ reported: SourceReported?) -> [String] {
+        guard let reported else { return [] }
+        return [reported.input, reported.output, reported.reasoning, reported.cacheRead, reported.cacheWrite, reported.total]
+            .map { "\($0.status) \($0.lastGoodMs.map(String.init) ?? "null")" }
     }
 }

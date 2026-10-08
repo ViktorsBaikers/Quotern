@@ -1,0 +1,1492 @@
+{
+  "states": [
+    {
+      "name": "current_at_600000_ms",
+      "request": {
+        "now_ms": 1775124600000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124000000,
+              "last_error_code": null,
+              "last_success_ms": 1775124000000,
+              "outcome": "consistent",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "derived",
+                "status": "current",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "stale_at_600001_ms",
+      "request": {
+        "now_ms": 1775124600001,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124000000,
+              "last_error_code": null,
+              "last_success_ms": 1775124000000,
+              "outcome": "consistent",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "stale",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "stale",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "stale",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "stale",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "stale",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "derived",
+                "status": "stale",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "unavailable_empty_window",
+      "request": {
+        "now_ms": 1777636800000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124000000,
+              "last_error_code": null,
+              "last_success_ms": 1775124000000,
+              "outcome": "consistent",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": null,
+              "cache_read": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "cache_write": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "input": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "records": 0,
+              "source_convention": null,
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "total_mismatch": false
+            }
+          ],
+          "window": {
+            "end_ms": 1777680000000,
+            "start_ms": 1777593600000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "denied_retains_values",
+      "request": {
+        "now_ms": 1775124000000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "denied",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124000000,
+              "last_error_code": null,
+              "last_success_ms": 1775124000000,
+              "outcome": "consistent",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "denied",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "denied",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "denied",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "denied",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "denied",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "derived",
+                "status": "denied",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "error_attached_newer_attempt",
+      "request": {
+        "now_ms": 1775124001000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124001000,
+              "last_error_code": "invalid_record",
+              "last_success_ms": 1775124000000,
+              "outcome": "partial",
+              "pending_partial": false,
+              "rejected_count": 1,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "derived",
+                "status": "error",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "error_attached_equal_attempt",
+      "request": {
+        "now_ms": 1775124000000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124000000,
+              "last_error_code": "invalid_record",
+              "last_success_ms": 1775124000000,
+              "outcome": "partial",
+              "pending_partial": false,
+              "rejected_count": 1,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "derived",
+                "status": "error",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "error_attached_earlier_attempt",
+      "request": {
+        "now_ms": 1775124000000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775123999999,
+              "last_error_code": "invalid_record",
+              "last_success_ms": 1775124000000,
+              "outcome": "partial",
+              "pending_partial": false,
+              "rejected_count": 1,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "derived",
+                "status": "error",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "current_after_attached_recovery",
+      "request": {
+        "now_ms": 1775124010000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124010000,
+              "last_error_code": null,
+              "last_success_ms": 1775124010000,
+              "outcome": "consistent",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124010000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124010000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124010000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124010000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124010000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124010000,
+                "provenance": "derived",
+                "status": "current",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "error_unattached_null_attempt",
+      "request": {
+        "now_ms": 1775124000000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": null,
+              "last_error_code": "root_invalid",
+              "last_success_ms": 1775124000000,
+              "outcome": "unavailable",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "derived",
+                "status": "error",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "error_unattached_equal_attempt",
+      "request": {
+        "now_ms": 1775124000000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124000000,
+              "last_error_code": "root_invalid",
+              "last_success_ms": 1775124000000,
+              "outcome": "unavailable",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "derived",
+                "status": "error",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "error_unattached_earlier_attempt",
+      "request": {
+        "now_ms": 1775124000000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775123999999,
+              "last_error_code": "root_invalid",
+              "last_success_ms": 1775124000000,
+              "outcome": "unavailable",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "derived",
+                "status": "error",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "current_after_reattach",
+      "request": {
+        "now_ms": 1775124010000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124010000,
+              "last_error_code": null,
+              "last_success_ms": 1775124010000,
+              "outcome": "consistent",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124010000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124010000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124010000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124010000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124010000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124010000,
+                "provenance": "derived",
+                "status": "current",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "catching_up_with_live_backlog",
+      "request": {
+        "now_ms": 1775124000000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124000000,
+              "last_error_code": null,
+              "last_success_ms": 1775124000000,
+              "outcome": "catching_up",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "catching_up",
+                "unit": "tokens",
+                "value": 0
+              },
+              "cache_write": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "catching_up",
+                "unit": "tokens",
+                "value": 0
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "catching_up",
+                "unit": "tokens",
+                "value": 4968
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "catching_up",
+                "unit": "tokens",
+                "value": 0
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "catching_up",
+                "unit": "tokens",
+                "value": 0
+              },
+              "records": 4968,
+              "source_convention": null,
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "catching_up",
+                "unit": "tokens",
+                "value": 4968
+              },
+              "total_mismatch": false
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "fresh_partial_completeness_is_current",
+      "request": {
+        "now_ms": 1775124000000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124000000,
+              "last_error_code": null,
+              "last_success_ms": 1775124000000,
+              "outcome": "consistent",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 8
+              },
+              "cache_write": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 10
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 27
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 41
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "current",
+                "unit": "tokens",
+                "value": 6
+              },
+              "records": 4,
+              "source_convention": "codexbar-3239175f-disjoint",
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": "partial",
+                "last_good_ms": 1775124000000,
+                "provenance": "derived",
+                "status": "current",
+                "unit": "tokens",
+                "value": 141
+              },
+              "total_mismatch": true
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "null_value_beside_error",
+      "request": {
+        "now_ms": 1775124001000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "enabled",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124001000,
+              "last_error_code": "invalid_record",
+              "last_success_ms": 1775124000000,
+              "outcome": "partial",
+              "pending_partial": false,
+              "rejected_count": 1,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "cache_write": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 7
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "error",
+                "unit": "tokens",
+                "value": 1
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "records": 1,
+              "source_convention": null,
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "total_mismatch": false
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    },
+    {
+      "name": "null_value_beside_denied",
+      "request": {
+        "now_ms": 1775124000000,
+        "tz": "UTC"
+      },
+      "response": {
+        "data": {
+          "by_source": [
+            {
+              "consent": "denied",
+              "harness": "opencode",
+              "kind": "custom",
+              "last_attempt_ms": 1775124000000,
+              "last_error_code": null,
+              "last_success_ms": 1775124000000,
+              "outcome": "consistent",
+              "pending_partial": false,
+              "rejected_count": 0,
+              "root_display": "source",
+              "source_id": "0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "source_reported": [
+            {
+              "acquisition_consistency": "sqlite_read_transaction",
+              "cache_read": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "cache_write": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "input": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "denied",
+                "unit": "tokens",
+                "value": 7
+              },
+              "mirror_conflict": false,
+              "origin_uncertainty": "unverified_origin",
+              "output": {
+                "completeness": "complete",
+                "last_good_ms": 1775124000000,
+                "provenance": "reported",
+                "status": "denied",
+                "unit": "tokens",
+                "value": 1
+              },
+              "pending_partial": false,
+              "reasoning": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "records": 1,
+              "source_convention": null,
+              "source_id": "0123456789abcdef0123456789abcdef",
+              "total": {
+                "completeness": null,
+                "last_good_ms": 1775124000000,
+                "provenance": null,
+                "status": "unavailable",
+                "unit": "tokens",
+                "value": null
+              },
+              "total_mismatch": false
+            }
+          ],
+          "window": {
+            "end_ms": 1775174400000,
+            "start_ms": 1775088000000,
+            "tz": "UTC"
+          }
+        },
+        "ok": true,
+        "v": 1
+      }
+    }
+  ]
+}

@@ -77,9 +77,10 @@ public actor EngineClient {
 
     // MARK: Lifecycle
 
+    /// Opens the engine. The config is kept even when the open fails, so `reopen()` can retry it.
     public func open(_ config: EngineConfig) async throws(BridgeError) {
-        try openEngine(Self.encode(config))
         self.config = config
+        try openEngine(Self.encode(config))
     }
 
     /// Opens a new handle from `request`. A NULL request (no earlier open, so no config) is
@@ -123,8 +124,8 @@ public actor EngineClient {
         handle = nil
     }
 
-    /// Close then open with the same config; the recovery for `engine_failed` and
-    /// `internal_panic`.
+    /// Close then open with the last attempted config; the recovery for `engine_failed`,
+    /// `internal_panic` and a failed open.
     public func reopen() async throws(BridgeError) {
         try openEngine(config.map { Self.encode($0) })
     }

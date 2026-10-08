@@ -1,0 +1,25 @@
+{
+  "comment": "Hand-written oracle for the SLICE-008 journey. One OpenCode JSON-layout step-finish part created 2026-09-30T09:00:00Z with input 10, output 20, reasoning 3, cache read 4, cache write 5 and no total: the total 10+20+3+4+5 = 42 is derived by the codexbar disjoint convention. Europe/Riga is UTC+3 on 2026-09-30, so the day is [2026-09-29T21:00Z, 2026-09-30T21:00Z). The launch pass at --now succeeds, so every present value is current and last good is --now.",
+  "tz": "Europe/Riga",
+  "now": "2026-09-30T12:00:00Z",
+  "now_ms": 1790769600000,
+  "window": {"start_ms": 1790715600000, "end_ms": 1790802000000, "tz": "Europe/Riga"},
+  "source": {"harness": "opencode", "root": ".local/share/opencode"},
+  "source_reported": {
+    "input": {"value": 10, "unit": "tokens", "provenance": "reported", "completeness": "complete", "status": "current", "last_good_ms": 1790769600000},
+    "output": {"value": 20, "unit": "tokens", "provenance": "reported", "completeness": "complete", "status": "current", "last_good_ms": 1790769600000},
+    "reasoning": {"value": 3, "unit": "tokens", "provenance": "reported", "completeness": "complete", "status": "current", "last_good_ms": 1790769600000},
+    "cache_read": {"value": 4, "unit": "tokens", "provenance": "reported", "completeness": "complete", "status": "current", "last_good_ms": 1790769600000},
+    "cache_write": {"value": 5, "unit": "tokens", "provenance": "reported", "completeness": "complete", "status": "current", "last_good_ms": 1790769600000},
+    "total": {"value": 42, "unit": "tokens", "provenance": "derived", "completeness": "complete", "status": "current", "last_good_ms": 1790769600000}
+  },
+  "displayed": {
+    "Total, OpenCode reported tokens": "42 tokens, Derived, Current, Updated just now",
+    "Input, OpenCode reported tokens": "10 tokens, Reported, Current, Updated just now",
+    "Output, OpenCode reported tokens": "20 tokens, Reported, Current, Updated just now",
+    "Reasoning, OpenCode reported tokens": "3 tokens, Reported, Current, Updated just now",
+    "Cache read, OpenCode reported tokens": "4 tokens, Reported, Current, Updated just now",
+    "Cache write, OpenCode reported tokens": "5 tokens, Reported, Current, Updated just now"
+  },
+  "status_item": {"title": "", "accessibility_label": "Quotern"}
+}

@@ -1,0 +1,1 @@
+{"id": "prt_journey", "sessionID": "ses_journey", "messageID": "msg_journey", "type": "step-finish", "tokens": {"input": 10, "output": 20, "reasoning": 3, "cache": {"read": 4, "write": 5}}}

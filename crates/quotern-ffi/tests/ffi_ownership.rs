@@ -95,6 +95,66 @@ fn without_id(mut reported: Value) -> Value {
     reported
 }
 
+const FIELDS: [&str; 6] = [
+    "input",
+    "output",
+    "reasoning",
+    "cache_read",
+    "cache_write",
+    "total",
+];
+
+/// A `source_reported` entry without the lifecycle: each observation keeps value, unit,
+/// provenance and completeness; `status` and `last_good_ms` are removed.
+fn acquired(reported: &Value) -> Value {
+    let mut reported = reported.clone();
+    for field in FIELDS {
+        let observation = reported[field].as_object_mut().expect(field);
+        observation.remove("status");
+        observation.remove("last_good_ms");
+    }
+    reported
+}
+
+/// A hand-written four-key oracle in the acquired shape: its acquired status becomes
+/// completeness (current → complete, partial → partial, unavailable → null).
+fn acquired_oracle(oracle: Value) -> Value {
+    let mut oracle = oracle;
+    for field in FIELDS {
+        let observation = oracle[field].as_object_mut().expect(field);
+        let completeness = match observation
+            .remove("status")
+            .as_ref()
+            .and_then(Value::as_str)
+        {
+            Some("current") => json!("complete"),
+            Some("partial") => json!("partial"),
+            Some("unavailable") => Value::Null,
+            other => panic!("{field}: oracle status {other:?}"),
+        };
+        observation.insert("completeness".into(), completeness);
+    }
+    oracle
+}
+
+/// `(status, last_good_ms)` of every observation, in `FIELDS` order.
+fn lifecycle(reported: &Value) -> Vec<(Value, Value)> {
+    FIELDS
+        .iter()
+        .map(|field| {
+            (
+                reported[field]["status"].clone(),
+                reported[field]["last_good_ms"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// The same hand-written lifecycle for every observation.
+fn uniform(status: &str, last_good_ms: i64) -> Vec<(Value, Value)> {
+    vec![(json!(status), json!(last_good_ms)); FIELDS.len()]
+}
+
 fn build_source(root: &Path, rows: &[Value]) -> TestResult {
     std::fs::create_dir_all(root)?;
     let connection = Connection::open(root.join("opencode.db"))?;
@@ -511,12 +571,13 @@ fn existing_history_reopen_reattaches_persisted_roots() -> TestResult {
     assert_eq!(entry["consent"], json!("enabled"));
     assert_eq!(entry["last_error_code"], Value::Null);
     assert_eq!(entry["last_success_ms"], json!(T));
-    // A new pass adds nothing: replay adds zero.
+    assert_eq!(lifecycle(&reported_of(&before, &id)), uniform("current", T));
+    // A new pass adds nothing: replay adds zero. Its success postdates the snapshot clock T,
+    // so the unchanged values are never current.
     live.ingest(T + 1_000_000);
-    assert_eq!(
-        reported_of(&live.snapshot(), &id),
-        reported_of(&before, &id)
-    );
+    let after = reported_of(&live.snapshot(), &id);
+    assert_eq!(acquired(&after), acquired(&reported_of(&before, &id)));
+    assert_eq!(lifecycle(&after), uniform("stale", T + 1_000_000));
     Ok(())
 }
 
@@ -782,14 +843,22 @@ fn missing_root_returns_and_reattaches() -> TestResult {
         (id_a, id_b, id_c) = (live.id_of("a"), live.id_of("b"), live.id_of("c"));
         let snapshot = live.snapshot();
         assert_eq!(
-            without_id(reported_of(&snapshot, &id_a)),
-            full_oracle_a(),
+            without_id(acquired(&reported_of(&snapshot, &id_a))),
+            acquired_oracle(full_oracle_a()),
             "A's hand oracle"
         );
         assert_eq!(
-            without_id(reported_of(&snapshot, &id_b)),
-            full_oracle_b(),
+            lifecycle(&reported_of(&snapshot, &id_a)),
+            uniform("current", T)
+        );
+        assert_eq!(
+            without_id(acquired(&reported_of(&snapshot, &id_b))),
+            acquired_oracle(full_oracle_b()),
             "B's hand oracle"
+        );
+        assert_eq!(
+            lifecycle(&reported_of(&snapshot, &id_b)),
+            uniform("current", T)
         );
         let entry_b = entry_of(&snapshot["data"]["by_source"], &id_b);
         last_success = entry_b["last_success_ms"].clone();
@@ -844,9 +913,14 @@ fn missing_root_returns_and_reattaches() -> TestResult {
         "A is attached and exact"
     );
     assert_eq!(
-        without_id(reported_of(&snapshot, &id_b)),
-        full_oracle_b(),
+        without_id(acquired(&reported_of(&snapshot, &id_b))),
+        acquired_oracle(full_oracle_b()),
         "B's durable oracle"
+    );
+    assert_eq!(
+        lifecycle(&reported_of(&snapshot, &id_b)),
+        uniform("error", T),
+        "B's unresolved root failure is never current"
     );
     assert_eq!(reported_of(&snapshot, &id_c), reported_c);
     let baseline = history_descriptors(&world.data());
@@ -881,14 +955,23 @@ fn missing_root_returns_and_reattaches() -> TestResult {
         project(&entry_of(&after["data"]["by_source"], &id_b)),
         expected_b(json!(t1), "root_invalid")
     );
-    assert_eq!(reported_of(&after, &id_a), reported_a, "replay adds zero");
+    assert_eq!(
+        acquired(&reported_of(&after, &id_a)),
+        acquired(&reported_a),
+        "replay adds zero"
+    );
+    assert_eq!(lifecycle(&reported_of(&after, &id_a)), uniform("stale", t1));
     assert_eq!(
         entry_of(&after["data"]["by_source"], &id_c),
         entry_c,
         "C's SourceEntry is byte-equal"
     );
     assert_eq!(reported_of(&after, &id_c), reported_c);
-    assert_eq!(without_id(reported_of(&after, &id_b)), full_oracle_b());
+    assert_eq!(
+        without_id(acquired(&reported_of(&after, &id_b))),
+        acquired_oracle(full_oracle_b())
+    );
+    assert_eq!(lifecycle(&reported_of(&after, &id_b)), uniform("error", T));
     quotern_core::ingest::sqlite_ro::set_open_hook(None);
     assert_eq!(c_opens.get(), 0, "no source open under C's path");
     assert_eq!(
@@ -914,9 +997,13 @@ fn missing_root_returns_and_reattaches() -> TestResult {
         expected_b(json!(t2), "source_overlap_conflict")
     );
     assert_eq!(
-        without_id(reported_of(&swapped, &id_b)),
-        full_oracle_b(),
+        without_id(acquired(&reported_of(&swapped, &id_b))),
+        acquired_oracle(full_oracle_b()),
         "the extra record is never counted"
+    );
+    assert_eq!(
+        lifecycle(&reported_of(&swapped, &id_b)),
+        uniform("error", T)
     );
     assert_eq!(status_row(&world.data(), &id_b)?, status_before);
 
@@ -935,11 +1022,22 @@ fn missing_root_returns_and_reattaches() -> TestResult {
     assert_eq!(entry_b["last_attempt_ms"], json!(t3));
     assert_ne!(entry_b["outcome"], json!("unavailable"));
     assert_eq!(
-        without_id(reported_of(&restored, &id_b)),
-        full_oracle_b(),
+        without_id(acquired(&reported_of(&restored, &id_b))),
+        acquired_oracle(full_oracle_b()),
         "B equals its oracle, replay adds zero"
     );
-    assert_eq!(reported_of(&restored, &id_a), reported_a);
+    assert_eq!(
+        lifecycle(&reported_of(&restored, &id_b)),
+        uniform("stale", t3)
+    );
+    assert_eq!(
+        acquired(&reported_of(&restored, &id_a)),
+        acquired(&reported_a)
+    );
+    assert_eq!(
+        lifecycle(&reported_of(&restored, &id_a)),
+        uniform("stale", t3)
+    );
     assert_eq!(
         durable_rows(&world.data(), &id_c)?,
         rows_c_before,
@@ -1182,9 +1280,21 @@ fn two_root_panic_rollback_queued_failure_reopen() -> TestResult {
     let reopened = world.live();
     let after = reopened.snapshot();
     assert_eq!(
-        reported_of(&after, &id_a),
-        reported_of(&before, &id_a),
+        acquired(&reported_of(&after, &id_a)),
+        acquired(&reported_of(&before, &id_a)),
         "A is unchanged by the panic"
+    );
+    // A pass visits sources in source-id order, so A's pass at T + 3,000 committed its success
+    // before B's panic only when A's minted id sorts first; otherwise A was never reached.
+    let a_lifecycle = if id_a < id_b {
+        uniform("stale", T + 3_000)
+    } else {
+        uniform("current", T)
+    };
+    assert_eq!(
+        lifecycle(&reported_of(&after, &id_a)),
+        a_lifecycle,
+        "A's lifecycle after the panicked pass"
     );
     assert_eq!(
         reported_of(&after, &id_b),
@@ -1193,18 +1303,27 @@ fn two_root_panic_rollback_queued_failure_reopen() -> TestResult {
     );
     reopened.ingest(T + 4_000);
     let converged = reopened.snapshot();
-    assert_eq!(reported_of(&converged, &id_a), reported_of(&before, &id_a));
+    assert_eq!(
+        acquired(&reported_of(&converged, &id_a)),
+        acquired(&reported_of(&before, &id_a))
+    );
+    assert_eq!(
+        lifecycle(&reported_of(&converged, &id_a)),
+        uniform("stale", T + 4_000)
+    );
     assert_eq!(
         reported_of(&converged, &id_b)["input"]["value"],
         json!(ORACLE_B + 7),
         "the new record counts once"
     );
     reopened.ingest(T + 5_000);
+    let replayed = reported_of(&reopened.snapshot(), &id_b);
     assert_eq!(
-        reported_of(&reopened.snapshot(), &id_b),
-        reported_of(&converged, &id_b),
+        acquired(&replayed),
+        acquired(&reported_of(&converged, &id_b)),
         "replay adds zero"
     );
+    assert_eq!(lifecycle(&replayed), uniform("stale", T + 5_000));
     Ok(())
 }
 

@@ -2,7 +2,7 @@
 
 Quotern is a Rust workspace. The current `quotern-core` crate reads selected, consented OpenCode SQLite/WAL and JSON sources and stores source-reported token observations locally. These observations do not establish verified consumption or provider quota.
 
-The `quotern-ffi` crate builds the core as a static library behind a versioned C ABI (`Sources/CQuotern/include/quotern.h`, eight exports, JSON envelopes defined by `Contracts/bridge-v1`), and the Swift package `Quotern` wraps it in a headless `EngineClient` (library, client and tests only; there is no native application executable yet). The Rust source acquisition, history and bridge tests use temporary fixtures and do not require provider credentials or a live OpenCode account.
+The `quotern-ffi` crate builds the core as a static library behind a versioned C ABI (`Sources/CQuotern/include/quotern.h`, eight exports, JSON envelopes defined by `Contracts/bridge-v1`), and the Swift package `Quotern` wraps it in an `EngineClient` and a native menu-bar executable, `Quotern` (unsigned, macOS 14+, Apple Silicon). The menu-bar item shows its symbol only: reported values never enter it, and a measured total does not exist yet. Its 360 pt popover shows today's source-reported OpenCode observations. The Rust source acquisition, history and bridge tests use temporary fixtures and do not require provider credentials or a live OpenCode account.
 
 ## Source behavior
 
@@ -97,11 +97,38 @@ swift test
 swift test --sanitize=thread --filter CancelTokenTests
 ```
 
+Every numeric observation in a snapshot is `{value, unit, provenance, completeness, status, last_good_ms}`. `value`, `unit` and `provenance` are as acquired; `completeness` says whether every contributing record carried the value (`complete`) or only some (`partial`); `provenance` and `completeness` are null exactly when `value` is. `status` is Rust's lifecycle judgement at the request's `now_ms`, first match wins: null value → `unavailable`; consent denied → `denied`; the latest pass failed, or a persisted root could not be reattached, whatever the attempt time → `error`; a live backlog → `catching_up`; a success at most 600,000 ms before `now_ms` → `current`; otherwise `stale`. `last_good_ms` is the source's last success. The popover formats these and never derives them; null is shown as "Unavailable", never 0, and a partial value says "Partial". A current value shows its age at the present instant ("Updated 3 minutes ago"); any other status shows the absolute last good time ("Updated at 10:00 AM") in the request zone. While the app holds any error over a last good snapshot, the last good values keep their unit, provenance and completeness but read Error instead of their status (denied and unavailable values keep theirs) until a call succeeds. A failed ingest is still followed by a snapshot read, so Rust judges freshness at that instant. After `engine_failed`, `internal_panic`, `malformed_response` or a failed launch open, no call is made until Retry reopens the engine with the attempted config; a failed reopen keeps its own error.
+
+Run the app with `swift run -c release Quotern`. Its history lives in `~/Library/Application Support/Quotern/`. Nothing is read until a folder is chosen with **Add folder…**, which offers only harness kinds with an implemented adapter (OpenCode). One coalesced reconcile pass runs on launch, on enabling a source, on Refresh, on a watcher (re)start and on file events (FSEvents, 2 s latency), and every 300 s (30 s leeway) while a source is enabled; passes start at least 5 s apart, with at most one in flight and one pending. Writes inside the data directory never trigger a pass. With no enabled source there is no watcher, no timer and no pass. Known limitation: the app keeps its own list of chosen folders (`watchedRoots` in its user defaults, full folder paths) to know where to watch; Rust keeps the sources themselves, and the two lists are not reconciled yet.
+
+The self-test journey drives the real status item, popover, watcher and engine over the sanitized `Fixtures/journey-home` and an explicit data directory, and refuses the production one. It writes `journey.json` (expected, actual and displayed values, and its checks) and exits 0 only if every check passed:
+
+```sh
+swift run -c release Quotern --selftest-journey --selftest-home Fixtures/journey-home --data-dir build/proof/journey-008/data --now 2026-09-30T12:00:00Z --phase first --out build/proof/journey-008
+```
+
+The startup probe launches the app over an explicit data directory (refusing the production one, anything inside it and anything containing it), opens the engine, builds the popover's hosting view in a window and writes `<out>/startup.json` with `appkit_hosting_view` (bool), `tcp_listeners` (listening TCP sockets of the process), `forbidden_images` (loaded web, JavaScript, Electron, Node, Bun or Python images) and `startup_ms` (process start to the first rendered popover). It exits 0 once the file is written and 1, without writing it, when a fact cannot be measured:
+
+```sh
+.build/release/Quotern --selftest-startup --data-dir <scratch>/data --out <scratch>/out
+```
+
+The native release proof relinks the executable with a linker map and checks its dynamic links, static inputs and delivered files:
+
+```sh
+MACOSX_DEPLOYMENT_TARGET=14.0 cargo build -p quotern-ffi --release --locked
+mkdir -p build/proof && shasum -a 256 target/aarch64-apple-darwin/release/libquotern_ffi.a > build/proof/ffi-archive.sha256
+rm -f build/proof/Quotern-link-map.txt && swift package clean
+swift build -c release -Xlinker -map -Xlinker build/proof/Quotern-link-map.txt
+otool -L .build/release/Quotern > build/proof/otool-release.txt
+cargo test -p quotern-ffi --locked --test repo_policy -- --ignored --exact forbidden_runtime_in_release_artifacts --nocapture
+```
+
 The bridge proofs on the Rust side:
 
 ```sh
-cargo test -p quotern-core --locked --test reported_today
+cargo test -p quotern-core --locked --test reported_today --test status
 cargo test -p quotern-ffi --locked --test contract_v1 --test ffi_ownership --test sentinel_sinks --test repo_policy
 ```
 
-`repo_policy` also holds `forbidden_runtime_in_release_artifacts`, which stays ignored until a native executable is relinked and is then run explicitly with `-- --ignored --exact forbidden_runtime_in_release_artifacts`. The release static library never enables the `test-faults` feature; the test seams reach `quotern-ffi` only through its dev-dependency. The Swift live tests start `/usr/bin/sqlite3` as a fixture writer child.
+`repo_policy` also holds `forbidden_runtime_in_release_artifacts`, which is ignored by default and run explicitly after the native relink above. It requires the map to describe the actual executable (output path and a symbol address), every linked input to be an approved Swift object, a member of the one recorded Rust archive (`target/aarch64-apple-darwin/release/libquotern_ffi.a`, SHA-256 equal to `build/proof/ffi-archive.sha256`) from a `cargo tree` or sysroot crate, or an SDK stub, and the delivered files to be exactly the `Package.swift` executable products. It rejects mutants of each kind and prints `AC001_NATIVE_POLICY_PASS` only after every assertion. The release static library never enables the `test-faults` feature; the test seams reach `quotern-ffi` only through its dev-dependency. The Swift live tests start `/usr/bin/sqlite3` as a fixture writer child.

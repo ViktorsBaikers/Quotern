@@ -13,6 +13,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "QuoternCore", targets: ["QuoternCore"]),
+        .executable(name: "Quotern", targets: ["Quotern"]),
     ],
     targets: [
         .target(name: "CQuotern", path: "Sources/CQuotern"),
@@ -30,6 +31,12 @@ let package = Package(
                 .linkedLibrary("c"),
                 .linkedLibrary("m"),
             ]
+        ),
+        .executableTarget(
+            name: "Quotern",
+            dependencies: ["QuoternCore"],
+            path: "Sources/Quotern",
+            swiftSettings: typedThrows
         ),
         .testTarget(
             name: "QuoternCoreTests",

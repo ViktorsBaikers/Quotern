@@ -48,11 +48,47 @@ public struct SourceSelection: Codable, Equatable, Sendable {
     }
 }
 
+/// One numeric value as Rust presents it. Swift never derives any of these fields: `status`
+/// and `lastGoodMs` are Rust's lifecycle judgement at the request instant.
 public struct Observation: Codable, Equatable, Sendable {
+    public enum Unit: String, Codable, Sendable { case tokens }
+    public enum Provenance: String, Codable, Sendable { case reported, derived }
+    public enum Completeness: String, Codable, Sendable { case complete, partial }
+    public enum Status: String, Codable, Sendable {
+        case current, stale, unavailable, error, denied
+        case catchingUp = "catching_up"
+    }
+
     public let value: UInt64?
-    public let unit: String
-    public let provenance: String?
-    public let status: String
+    public let unit: Unit
+    public let provenance: Provenance?
+    public let completeness: Completeness?
+    public let status: Status
+    public let lastGoodMs: Int64?
+
+    private enum CodingKeys: String, CodingKey {
+        case value, unit, provenance, completeness, status, lastGoodMs
+    }
+
+    /// Every key is required, nullable ones included, and provenance and completeness are null
+    /// exactly when the value is; anything else is not this shape.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        for key in [CodingKeys.value, .provenance, .completeness, .lastGoodMs] where !container.contains(key) {
+            throw DecodingError.keyNotFound(key, .init(codingPath: container.codingPath, debugDescription: "required"))
+        }
+        value = try container.decodeIfPresent(UInt64.self, forKey: .value)
+        unit = try container.decode(Unit.self, forKey: .unit)
+        provenance = try container.decodeIfPresent(Provenance.self, forKey: .provenance)
+        completeness = try container.decodeIfPresent(Completeness.self, forKey: .completeness)
+        status = try container.decode(Status.self, forKey: .status)
+        lastGoodMs = try container.decodeIfPresent(Int64.self, forKey: .lastGoodMs)
+        guard (value == nil) == (provenance == nil), (value == nil) == (completeness == nil),
+              value != nil || status == .unavailable
+        else {
+            throw DecodingError.dataCorrupted(.init(codingPath: container.codingPath, debugDescription: "null value mixes present fields"))
+        }
+    }
 }
 
 public struct SourceReported: Codable, Equatable, Sendable {

@@ -19,35 +19,45 @@
       {
         "acquisition_consistency": "sqlite_read_transaction",
         "cache_read": {
+          "completeness": "partial",
+          "last_good_ms": 1775124000000,
           "provenance": "reported",
-          "status": "partial",
+          "status": "error",
           "unit": "tokens",
           "value": 8
         },
         "cache_write": {
+          "completeness": "partial",
+          "last_good_ms": 1775124000000,
           "provenance": "reported",
-          "status": "partial",
+          "status": "error",
           "unit": "tokens",
           "value": 10
         },
         "input": {
+          "completeness": "partial",
+          "last_good_ms": 1775124000000,
           "provenance": "reported",
-          "status": "partial",
+          "status": "error",
           "unit": "tokens",
           "value": 27
         },
         "mirror_conflict": false,
         "origin_uncertainty": "unverified_origin",
         "output": {
+          "completeness": "partial",
+          "last_good_ms": 1775124000000,
           "provenance": "reported",
-          "status": "partial",
+          "status": "error",
           "unit": "tokens",
           "value": 41
         },
         "pending_partial": true,
         "reasoning": {
+          "completeness": "partial",
+          "last_good_ms": 1775124000000,
           "provenance": "reported",
-          "status": "partial",
+          "status": "error",
           "unit": "tokens",
           "value": 6
         },
@@ -55,8 +65,10 @@
         "source_convention": "codexbar-3239175f-disjoint",
         "source_id": "0123456789abcdef0123456789abcdef",
         "total": {
+          "completeness": "partial",
+          "last_good_ms": 1775124000000,
           "provenance": "derived",
-          "status": "partial",
+          "status": "error",
           "unit": "tokens",
           "value": 141
         },
