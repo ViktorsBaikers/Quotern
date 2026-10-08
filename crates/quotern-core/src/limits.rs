@@ -42,3 +42,9 @@ pub const SQLITE_PASS_DEADLINE_MS: u64 = 1_000;
 pub const SOURCE_CHANGING_RETRIES: u8 = 3;
 pub const RETRY_INITIAL_MS: u64 = 5_000;
 pub const RETRY_MAX_MS: u64 = 5 * 60 * 1_000;
+/// Largest `-wal` an existing history may carry for admission; longer is refused unread.
+pub const ADMISSION_WAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Most bytes the one admission read transaction may read from the main file and log frames.
+pub const ADMISSION_READ_BYTES: u64 = 8 * 1024 * 1024;
+/// Most enabled `sources` rows admission reads; a further row is refused.
+pub const ADMISSION_ENABLED_SOURCES: usize = 64;

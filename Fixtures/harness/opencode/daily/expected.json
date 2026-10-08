@@ -1,0 +1,182 @@
+{
+  "total_records": 12,
+  "cases": [
+    {
+      "name": "utc_counters",
+      "tz": "UTC",
+      "now_ms": 1775124000000,
+      "window": {"start_ms": 1775088000000, "end_ms": 1775174400000},
+      "source_reported": {
+        "records": 4,
+        "input": {"value": 27, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "output": {"value": 41, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "reasoning": {"value": 6, "unit": "tokens", "provenance": "reported", "status": "partial"},
+        "cache_read": {"value": 8, "unit": "tokens", "provenance": "reported", "status": "partial"},
+        "cache_write": {"value": 10, "unit": "tokens", "provenance": "reported", "status": "partial"},
+        "total": {"value": 141, "unit": "tokens", "provenance": "derived", "status": "partial"},
+        "source_convention": "codexbar-3239175f-disjoint",
+        "acquisition_consistency": "sqlite_read_transaction",
+        "origin_uncertainty": "unverified_origin",
+        "total_mismatch": true,
+        "mirror_conflict": false,
+        "pending_partial": false
+      }
+    },
+    {
+      "name": "riga_spring_23h",
+      "tz": "Europe/Riga",
+      "now_ms": 1774764000000,
+      "window": {"start_ms": 1774735200000, "end_ms": 1774818000000},
+      "source_reported": {
+        "records": 2,
+        "input": {"value": 12, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "output": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "reasoning": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "cache_read": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "cache_write": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "total": {"value": 12, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "source_convention": null,
+        "acquisition_consistency": "sqlite_read_transaction",
+        "origin_uncertainty": "unverified_origin",
+        "total_mismatch": false,
+        "mirror_conflict": false,
+        "pending_partial": false
+      }
+    },
+    {
+      "name": "riga_fall_25h",
+      "tz": "Europe/Riga",
+      "now_ms": 1792908000000,
+      "window": {"start_ms": 1792875600000, "end_ms": 1792965600000},
+      "source_reported": {
+        "records": 2,
+        "input": {"value": 36, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "output": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "reasoning": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "cache_read": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "cache_write": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "total": {"value": 36, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "source_convention": null,
+        "acquisition_consistency": "sqlite_read_transaction",
+        "origin_uncertainty": "unverified_origin",
+        "total_mismatch": false,
+        "mirror_conflict": false,
+        "pending_partial": false
+      }
+    },
+    {
+      "name": "kolkata_24h",
+      "tz": "Asia/Kolkata",
+      "now_ms": 1774764000000,
+      "window": {"start_ms": 1774722600000, "end_ms": 1774809000000},
+      "source_reported": {
+        "records": 2,
+        "input": {"value": 8, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "output": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "reasoning": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "cache_read": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "cache_write": {"value": 0, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "total": {"value": 8, "unit": "tokens", "provenance": "reported", "status": "current"},
+        "source_convention": null,
+        "acquisition_consistency": "sqlite_read_transaction",
+        "origin_uncertainty": "unverified_origin",
+        "total_mismatch": false,
+        "mirror_conflict": false,
+        "pending_partial": false
+      }
+    },
+    {
+      "name": "utc_empty_day",
+      "tz": "UTC",
+      "now_ms": 1777636800000,
+      "window": {"start_ms": 1777593600000, "end_ms": 1777680000000},
+      "source_reported": {
+        "records": 0,
+        "input": {"value": null, "unit": "tokens", "provenance": null, "status": "unavailable"},
+        "output": {"value": null, "unit": "tokens", "provenance": null, "status": "unavailable"},
+        "reasoning": {"value": null, "unit": "tokens", "provenance": null, "status": "unavailable"},
+        "cache_read": {"value": null, "unit": "tokens", "provenance": null, "status": "unavailable"},
+        "cache_write": {"value": null, "unit": "tokens", "provenance": null, "status": "unavailable"},
+        "total": {"value": null, "unit": "tokens", "provenance": null, "status": "unavailable"},
+        "source_convention": null,
+        "acquisition_consistency": null,
+        "origin_uncertainty": "unverified_origin",
+        "total_mismatch": false,
+        "mirror_conflict": false,
+        "pending_partial": false
+      }
+    }
+  ],
+  "validation_cases": [
+    {"name": "utc_epoch_day", "tz": "UTC", "now_ms": 0,
+     "window": {"start_ms": 0, "end_ms": 86400000, "tz": "UTC"}},
+    {"name": "kolkata_first_day_with_a_representable_start", "tz": "Asia/Kolkata", "now_ms": 66600000,
+     "window": {"start_ms": 66600000, "end_ms": 153000000, "tz": "Asia/Kolkata"}},
+    {"name": "kolkata_start_before_epoch_at_zero", "tz": "Asia/Kolkata", "now_ms": 0,
+     "error": {"field": "now_ms", "code": "invalid_request", "message": "invalid request: now_ms", "retryable": false}},
+    {"name": "kolkata_start_before_epoch_just_before_first_day", "tz": "Asia/Kolkata", "now_ms": 66599999,
+     "error": {"field": "now_ms", "code": "invalid_request", "message": "invalid request: now_ms", "retryable": false}},
+    {"name": "riga_start_before_epoch_at_zero", "tz": "Europe/Riga", "now_ms": 0,
+     "error": {"field": "now_ms", "code": "invalid_request", "message": "invalid request: now_ms", "retryable": false}},
+    {"name": "utc_at_source_maximum", "tz": "UTC", "now_ms": 253402300799999,
+     "error": {"field": "now_ms", "code": "invalid_request", "message": "invalid request: now_ms", "retryable": false}},
+    {"name": "utc_one_day_below_source_maximum", "tz": "UTC", "now_ms": 253402214399999,
+     "error": {"field": "now_ms", "code": "invalid_request", "message": "invalid request: now_ms", "retryable": false}},
+    {"name": "unknown_zone_in_range_is_tz", "tz": "Not/AZone", "now_ms": 1775124000000,
+     "error": {"field": "tz", "code": "invalid_request", "message": "invalid request: tz", "retryable": false}},
+    {"name": "unknown_zone_at_source_maximum_is_tz", "tz": "Not/AZone", "now_ms": 253402300799999,
+     "error": {"field": "tz", "code": "invalid_request", "message": "invalid request: tz", "retryable": false}},
+    {"name": "unknown_zone_above_source_maximum_is_now_ms", "tz": "Not/AZone", "now_ms": 253402300800000,
+     "error": {"field": "now_ms", "code": "invalid_request", "message": "invalid request: now_ms", "retryable": false}},
+    {"name": "unknown_zone_below_zero_is_now_ms", "tz": "Not/AZone", "now_ms": -1,
+     "error": {"field": "now_ms", "code": "invalid_request", "message": "invalid request: now_ms", "retryable": false}},
+    {"name": "sao_paulo_midnight_gap_day", "tz": "America/Sao_Paulo", "now_ms": 1445176800000,
+     "window": {"start_ms": 1445137200000, "end_ms": 1445220000000, "tz": "America/Sao_Paulo"}},
+    {"name": "sao_paulo_day_after_midnight_gap", "tz": "America/Sao_Paulo", "now_ms": 1445263200000,
+     "window": {"start_ms": 1445220000000, "end_ms": 1445306400000, "tz": "America/Sao_Paulo"}}
+  ],
+  "midnight_gap": {
+    "tz": "America/Sao_Paulo",
+    "message": {"id": "midnight-gap", "session_id": "session-day", "time_created": 1445221800000, "input": 9},
+    "gap_day": {
+      "now_ms": 1445176800000,
+      "window": {"start_ms": 1445137200000, "end_ms": 1445220000000},
+      "records": 0, "input": null
+    },
+    "following_day": {
+      "now_ms": 1445263200000,
+      "window": {"start_ms": 1445220000000, "end_ms": 1445306400000},
+      "records": 1, "input": 9
+    }
+  },
+  "json_part_scan": {
+    "tz": "UTC",
+    "now_ms": 1775124000000,
+    "inputs": {"json-a": 3, "json-b": 12},
+    "records": 2,
+    "input": 15
+  },
+  "revision": {
+    "tz": "Europe/Riga",
+    "message": {"id": "moving", "session_id": "session-day", "input": 2},
+    "from_ms": 1774733400000,
+    "to_ms": 1774737000000,
+    "day_before": {
+      "now_ms": 1774733400000,
+      "window": {"start_ms": 1774648800000, "end_ms": 1774735200000},
+      "records_before_revision": 2, "input_before_revision": 5,
+      "records_after_revision": 1, "input_after_revision": 3
+    },
+    "day_after": {
+      "now_ms": 1774737000000,
+      "window": {"start_ms": 1774735200000, "end_ms": 1774818000000},
+      "records_before_revision": 2, "input_before_revision": 12,
+      "records_after_revision": 3, "input_after_revision": 14
+    }
+  },
+  "pending": {
+    "case": "utc_counters",
+    "failure": "not_sqlite",
+    "statuses": {"input": "partial", "output": "partial", "reasoning": "partial", "cache_read": "partial", "cache_write": "partial", "total": "partial"}
+  }
+}

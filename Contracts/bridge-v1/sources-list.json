@@ -1,0 +1,21 @@
+{
+  "data": {
+    "sources": [
+      {
+        "consent": "enabled",
+        "harness": "opencode",
+        "kind": "custom",
+        "last_attempt_ms": 1775124000000,
+        "last_error_code": null,
+        "last_success_ms": 1775124000000,
+        "outcome": "consistent",
+        "pending_partial": false,
+        "rejected_count": 0,
+        "root_display": "source",
+        "source_id": "0123456789abcdef0123456789abcdef"
+      }
+    ]
+  },
+  "ok": true,
+  "v": 1
+}

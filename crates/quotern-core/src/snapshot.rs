@@ -118,6 +118,108 @@ impl Snapshot {
     }
 }
 
+/// Why a `today_snapshot` request is refused before any store read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowError {
+    /// `now_ms` is outside `0..=MAX_SOURCE_TIMESTAMP_MS`, or its local day cannot be bounded or
+    /// has an endpoint outside that range (the first hours of the epoch in an eastern zone and
+    /// the last days before year 10000).
+    NowOutOfRange,
+    /// The zone is not a known IANA name.
+    UnknownZone,
+}
+
+/// The local-day window a daily snapshot covers, in the zone it was requested in.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Window {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub tz: String,
+}
+
+impl Window {
+    /// `[local midnight, next local midnight)` of `now_ms` in `tz`, from `time::local_day_bounds`.
+    pub fn local_day(now_ms: i64, tz: &str) -> Result<Self, WindowError> {
+        if !(0..=MAX_SOURCE_TIMESTAMP_MS).contains(&now_ms) {
+            return Err(WindowError::NowOutOfRange);
+        }
+        // A name that is not a zone is the request's fault whatever the instant; a known zone
+        // whose day cannot be bounded leaves only the instant at fault.
+        jiff::tz::TimeZone::get(tz).map_err(|_| WindowError::UnknownZone)?;
+        let bounds =
+            crate::time::local_day_bounds(now_ms, tz).map_err(|_| WindowError::NowOutOfRange)?;
+        // The wire carries unsigned endpoints: a day that starts before the epoch (an eastern
+        // zone just after 1970-01-01T00:00Z) or ends past the source ceiling is refused, never
+        // clamped.
+        if ![bounds.start_ms, bounds.end_ms]
+            .iter()
+            .all(|endpoint| (0..=MAX_SOURCE_TIMESTAMP_MS).contains(endpoint))
+        {
+            return Err(WindowError::NowOutOfRange);
+        }
+        Ok(Self {
+            start_ms: bounds.start_ms,
+            end_ms: bounds.end_ms,
+            tz: tz.to_owned(),
+        })
+    }
+
+    pub fn bounds(&self) -> crate::time::DayBounds {
+        crate::time::DayBounds {
+            start_ms: self.start_ms,
+            end_ms: self.end_ms,
+        }
+    }
+}
+
+/// One registered source as a snapshot shows it: durable identity, consent and last pass status,
+/// overlaid with the Engine's current unattached failure when the source has no runtime.
+/// `root_display` is the last path component only, never the full path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SourceEntry {
+    pub source_id: String,
+    pub harness: String,
+    pub root_display: String,
+    pub kind: crate::domain::SourceKind,
+    pub consent: crate::domain::ConsentState,
+    pub outcome: Option<PassOutcome>,
+    pub last_attempt_ms: Option<i64>,
+    pub last_success_ms: Option<i64>,
+    #[serde(serialize_with = "failure_wire")]
+    pub last_error_code: Option<FailureCode>,
+    pub rejected_count: u32,
+    pub pending_partial: bool,
+}
+
+/// The wire spelling of a failure code is `FailureCode::as_str`, which differs from the derived
+/// serde spelling for `RootOverlap` (`source_overlap_conflict`).
+fn failure_wire<S: serde::Serializer>(
+    code: &Option<FailureCode>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match code {
+        Some(code) => serializer.serialize_str(code.as_str()),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// One source's daily projection: only source-reported numbers, never measured.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DailyReported {
+    pub source_id: String,
+    #[serde(flatten)]
+    pub projection: SourceProjection,
+}
+
+/// The v1 `today_snapshot` response. A store-less Engine yields the window with empty arrays,
+/// a genuinely empty inventory and never measurements.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TodaySnapshot {
+    pub window: Window,
+    pub by_source: Vec<SourceEntry>,
+    pub source_reported: Vec<DailyReported>,
+}
+
 impl SourceSnapshot {
     pub fn new(
         source_id: String,

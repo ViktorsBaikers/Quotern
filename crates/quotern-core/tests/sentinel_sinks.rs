@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use quotern_core::domain::{ConsentState, PassOutcome, SourceAuthorization, SourceKind};
-use quotern_core::ingest::OpenCodeEngine;
+use quotern_core::ingest::Engine;
 use quotern_core::ingest::fs::RealSourceFs;
 use quotern_core::store::FaultPoint;
 use rusqlite::types::ValueRef;
@@ -159,14 +159,15 @@ fn declared(files_present: &[Sink]) -> BTreeSet<String> {
 }
 
 fn serialized_sinks(
-    engine: &OpenCodeEngine<RealSourceFs>,
+    engine: &Engine<RealSourceFs>,
+    engine_id: &str,
     report: &quotern_core::domain::PassReport,
     data: &Path,
 ) -> TestResult<Vec<Sink>> {
     Ok(vec![
         Sink {
             name: "snapshot-json".to_owned(),
-            bytes: serde_json::to_vec(&engine.snapshot(report)?)?,
+            bytes: serde_json::to_vec(&engine.snapshot(engine_id, report)?)?,
         },
         Sink {
             name: "pass-report-json".to_owned(),
@@ -174,7 +175,7 @@ fn serialized_sinks(
         },
         Sink {
             name: "observations-json".to_owned(),
-            bytes: serde_json::to_vec(&engine.observations_page(None, 1_000)?)?,
+            bytes: serde_json::to_vec(&engine.observations_page(engine_id, None, 1_000)?)?,
         },
         Sink {
             name: "history-table-dump".to_owned(),
@@ -185,13 +186,14 @@ fn serialized_sinks(
 
 /// Scans every sink of the current state and asserts a clean, fully inventoried result.
 fn assert_clean(
-    engine: &OpenCodeEngine<RealSourceFs>,
+    engine: &Engine<RealSourceFs>,
+    engine_id: &str,
     report: &quotern_core::domain::PassReport,
     data: &Path,
 ) -> TestResult<usize> {
     let mut sinks = file_sinks(data)?;
     let present = declared(&sinks);
-    sinks.extend(serialized_sinks(engine, report, data)?);
+    sinks.extend(serialized_sinks(engine, engine_id, report, data)?);
     let findings = scan(&sinks, &present);
     assert_eq!(findings, Findings::default(), "sink inventory");
     assert!(
@@ -312,16 +314,12 @@ fn build_source_with(roots: &Roots, bulk_rows: u64, pad_dirs: u32) -> TestResult
     Ok(())
 }
 
-fn open(roots: &Roots) -> TestResult<OpenCodeEngine<RealSourceFs>> {
-    OpenCodeEngine::open(
-        RealSourceFs,
-        &roots.source,
-        &roots.data,
-        &roots.home,
-        enabled(),
-        SourceKind::Custom,
-    )
-    .map_err(|report| format!("open failed: {report:?}").into())
+fn open(roots: &Roots) -> TestResult<(Engine<RealSourceFs>, String)> {
+    let mut engine = Engine::open(&roots.data, &roots.home);
+    let source_id = engine
+        .attach_opencode(RealSourceFs, &roots.source, enabled(), SourceKind::Custom)
+        .map_err(|report| format!("open failed: {report:?}"))?;
+    Ok((engine, source_id))
 }
 
 /// Sentinel text in source records never reaches an application sink in any state: while the
@@ -341,7 +339,7 @@ fn opencode_reported_text_never_reaches_application_sinks() -> TestResult {
         "the source really carries the sentinel"
     );
 
-    let mut engine = open(&roots)?;
+    let (mut engine, engine_id) = open(&roots)?;
     let mut scanned = 0;
     let mut now = 1_700_000_100_000_i64;
     let mut step = || {
@@ -349,7 +347,7 @@ fn opencode_reported_text_never_reaches_application_sinks() -> TestResult {
         now
     };
 
-    let first = engine.pass(enabled(), step());
+    let first = engine.pass(&engine_id, enabled(), step());
     assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
     assert!(
         count(&roots.data, "opencode_candidate_spool")? > 0,
@@ -357,38 +355,38 @@ fn opencode_reported_text_never_reaches_application_sinks() -> TestResult {
     );
     assert!(count(&roots.data, "metadata_spool")? > 0);
     assert!(count(&roots.data, "frontier_directories")? > 0);
-    scanned += assert_clean(&engine, &first, &roots.data)?;
+    scanned += assert_clean(&engine, &engine_id, &first, &roots.data)?;
 
     for point in [FaultPoint::BeforeCommit, FaultPoint::AfterCommit] {
         engine.inject_commit_fault(point);
-        let faulted = engine.pass(enabled(), step());
+        let faulted = engine.pass(&engine_id, enabled(), step());
         assert_eq!(
             faulted.outcome,
             PassOutcome::Partial,
             "{point:?}: {faulted:?}"
         );
-        scanned += assert_clean(&engine, &faulted, &roots.data)?;
+        scanned += assert_clean(&engine, &engine_id, &faulted, &roots.data)?;
     }
 
     let before_reopen = acquisition_state(&roots.data)?;
     assert!(before_reopen[0] > 0, "spool still active before the reopen");
     drop(engine);
-    let mut engine = open(&roots)?;
+    let (mut engine, engine_id) = open(&roots)?;
     assert_eq!(acquisition_state(&roots.data)?, before_reopen);
-    let mut last = engine.pass(enabled(), step());
-    scanned += assert_clean(&engine, &last, &roots.data)?;
+    let mut last = engine.pass(&engine_id, enabled(), step());
+    scanned += assert_clean(&engine, &engine_id, &last, &roots.data)?;
     for _ in 0..8 {
         if last.outcome == PassOutcome::Consistent {
             break;
         }
-        last = engine.pass(enabled(), step());
-        scanned += assert_clean(&engine, &last, &roots.data)?;
+        last = engine.pass(&engine_id, enabled(), step());
+        scanned += assert_clean(&engine, &engine_id, &last, &roots.data)?;
     }
     assert_eq!(last.outcome, PassOutcome::Consistent, "{last:?}");
     assert_eq!(count(&roots.data, "opencode_candidate_spool")?, 0);
     assert_eq!(count(&roots.data, "metadata_spool")?, 0);
 
-    let projection = engine.snapshot(&last)?.projection;
+    let projection = engine.snapshot(&engine_id, &last)?.projection;
     assert_eq!(projection.records, 4 + BULK_ROWS);
     assert_eq!(
         projection.total.value,
@@ -401,13 +399,13 @@ fn opencode_reported_text_never_reaches_application_sinks() -> TestResult {
         quotern_core::domain::OriginUncertainty::UnverifiedOrigin
     );
     assert!(
-        engine.observations().is_err(),
+        engine.observations(&engine_id).is_err(),
         "an unbounded read is refused"
     );
-    let first_page = engine.observations_page(None, 1_000)?;
+    let first_page = engine.observations_page(&engine_id, None, 1_000)?;
     assert_eq!(first_page.observations.len(), 1_000);
     assert!(first_page.next.is_some());
-    scanned += assert_clean(&engine, &last, &roots.data)?;
+    scanned += assert_clean(&engine, &engine_id, &last, &roots.data)?;
 
     let source_after = file_sinks(&roots.source)?
         .into_iter()
@@ -429,11 +427,11 @@ fn opencode_reported_text_never_reaches_application_sinks() -> TestResult {
 fn sink_inventory_rejects_extra_and_unscanned_sinks() -> TestResult {
     let roots = Roots::new()?;
     build_source(&roots)?;
-    let mut engine = open(&roots)?;
-    let report = engine.pass(enabled(), 1_700_000_100_000);
+    let (mut engine, engine_id) = open(&roots)?;
+    let report = engine.pass(&engine_id, enabled(), 1_700_000_100_000);
     let mut sinks = file_sinks(&roots.data)?;
     let declared_sinks = declared(&sinks);
-    sinks.extend(serialized_sinks(&engine, &report, &roots.data)?);
+    sinks.extend(serialized_sinks(&engine, &engine_id, &report, &roots.data)?);
     assert_eq!(scan(&sinks, &declared_sinks), Findings::default());
 
     // A sink holding the sentinel is a leak, and, being undeclared, also an unexpected sink.
@@ -442,7 +440,7 @@ fn sink_inventory_rejects_extra_and_unscanned_sinks() -> TestResult {
         name: "file:diagnostics.log".to_owned(),
         bytes: SENTINEL.to_vec(),
     });
-    leaking.extend(serialized_sinks(&engine, &report, &roots.data)?);
+    leaking.extend(serialized_sinks(&engine, &engine_id, &report, &roots.data)?);
     let found = scan(&leaking, &declared_sinks);
     assert_eq!(
         found.leaks,
@@ -459,7 +457,7 @@ fn sink_inventory_rejects_extra_and_unscanned_sinks() -> TestResult {
         name: "file:spill.tmp".to_owned(),
         bytes: b"clean".to_vec(),
     });
-    extra.extend(serialized_sinks(&engine, &report, &roots.data)?);
+    extra.extend(serialized_sinks(&engine, &engine_id, &report, &roots.data)?);
     let found = scan(&extra, &declared_sinks);
     assert!(found.leaks.is_empty());
     assert_eq!(
@@ -470,7 +468,7 @@ fn sink_inventory_rejects_extra_and_unscanned_sinks() -> TestResult {
     // A declared sink that the scan never reached is rejected.
     let mut partial = file_sinks(&roots.data)?;
     partial.extend(
-        serialized_sinks(&engine, &report, &roots.data)?
+        serialized_sinks(&engine, &engine_id, &report, &roots.data)?
             .into_iter()
             .filter(|sink| sink.name != "history-table-dump"),
     );
@@ -512,7 +510,7 @@ fn acquisition_state(data: &Path) -> TestResult<[i64; 3]> {
 fn every_layout_stays_clean_in_every_active_spool_state_across_faults_and_reopen() -> TestResult {
     let roots = Roots::new()?;
     build_source_with(&roots, 0, 200)?;
-    let mut engine = open(&roots)?;
+    let (mut engine, mut engine_id) = open(&roots)?;
     let mut ranks = BTreeSet::new();
     let mut active_states = 0;
     let mut reopened_scans = 0;
@@ -526,7 +524,7 @@ fn every_layout_stays_clean_in_every_active_spool_state_across_faults_and_reopen
             2 => engine.inject_commit_fault(FaultPoint::AfterCommit),
             _ => {}
         }
-        let report = engine.pass(enabled(), now);
+        let report = engine.pass(&engine_id, enabled(), now);
         if report.outcome == PassOutcome::Consistent {
             last = Some(report);
             break;
@@ -539,15 +537,15 @@ fn every_layout_stays_clean_in_every_active_spool_state_across_faults_and_reopen
         );
         active_states += 1;
         ranks.extend(spool_ranks(&roots.data)?);
-        sinks_scanned += assert_clean(&engine, &report, &roots.data)?;
+        sinks_scanned += assert_clean(&engine, &engine_id, &report, &roots.data)?;
         drop(engine);
-        engine = open(&roots)?;
+        (engine, engine_id) = open(&roots)?;
         assert_eq!(
             acquisition_state(&roots.data)?,
             state,
             "reopening changed the durable acquisition state"
         );
-        sinks_scanned += assert_clean(&engine, &report, &roots.data)?;
+        sinks_scanned += assert_clean(&engine, &engine_id, &report, &roots.data)?;
         reopened_scans += 1;
     }
     let last = last.ok_or("the sweep never completed")?;
@@ -559,14 +557,21 @@ fn every_layout_stays_clean_in_every_active_spool_state_across_faults_and_reopen
         "legacy 0, v2 1 and JSON 2 were each in the spool"
     );
     assert_eq!(acquisition_state(&roots.data)?[..2], [0, 0]);
-    let projection = engine.snapshot(&last)?.projection;
+    let projection = engine.snapshot(&engine_id, &last)?.projection;
     assert_eq!(projection.records, 4);
     assert_eq!(projection.total.value, Some(99 + 100 + 15 + 7));
-    sinks_scanned += assert_clean(&engine, &last, &roots.data)?;
+    sinks_scanned += assert_clean(&engine, &engine_id, &last, &roots.data)?;
     drop(engine);
-    let reopened = open(&roots)?;
-    sinks_scanned += assert_clean(&reopened, &last, &roots.data)?;
-    assert_eq!(reopened.snapshot(&last)?.projection.total.value, Some(221));
+    let (reopened, reopened_id) = open(&roots)?;
+    sinks_scanned += assert_clean(&reopened, &reopened_id, &last, &roots.data)?;
+    assert_eq!(
+        reopened
+            .snapshot(&reopened_id, &last)?
+            .projection
+            .total
+            .value,
+        Some(221)
+    );
     assert!(
         sinks_scanned >= 2 * (active_states + 1) * 5,
         "{sinks_scanned}"
@@ -583,22 +588,22 @@ fn planted_leaks_undeclared_and_skipped_sinks_are_rejected_in_an_active_spool_st
 {
     let roots = Roots::new()?;
     build_source_with(&roots, 0, 200)?;
-    let mut engine = open(&roots)?;
-    let report = engine.pass(enabled(), 1_700_000_100_000);
+    let (mut engine, engine_id) = open(&roots)?;
+    let report = engine.pass(&engine_id, enabled(), 1_700_000_100_000);
     assert_eq!(report.outcome, PassOutcome::CatchingUp, "{report:?}");
     assert!(count(&roots.data, "opencode_candidate_spool")? > 0);
-    assert_clean(&engine, &report, &roots.data)?;
+    assert_clean(&engine, &engine_id, &report, &roots.data)?;
     let declared_sinks = declared(&file_sinks(&roots.data)?);
-    let everything = |engine: &OpenCodeEngine<RealSourceFs>| -> TestResult<Vec<Sink>> {
+    let everything = |engine: &Engine<RealSourceFs>, engine_id: &str| -> TestResult<Vec<Sink>> {
         let mut sinks = file_sinks(&roots.data)?;
-        sinks.extend(serialized_sinks(engine, &report, &roots.data)?);
+        sinks.extend(serialized_sinks(engine, engine_id, &report, &roots.data)?);
         Ok(sinks)
     };
 
     fs::write(roots.data.join("diagnostics.log"), SENTINEL)?;
     fs::create_dir(roots.data.join("tmp"))?;
     fs::write(roots.data.join("tmp/spill.part"), b"clean")?;
-    let found = scan(&everything(&engine)?, &declared_sinks);
+    let found = scan(&everything(&engine, &engine_id)?, &declared_sinks);
     assert_eq!(
         found.leaks,
         BTreeSet::from(["file:diagnostics.log".to_owned()])
@@ -614,7 +619,7 @@ fn planted_leaks_undeclared_and_skipped_sinks_are_rejected_in_an_active_spool_st
     fs::remove_file(roots.data.join("diagnostics.log"))?;
     fs::remove_dir_all(roots.data.join("tmp"))?;
     assert_eq!(
-        scan(&everything(&engine)?, &declared_sinks),
+        scan(&everything(&engine, &engine_id)?, &declared_sinks),
         Findings::default()
     );
 
@@ -625,7 +630,7 @@ fn planted_leaks_undeclared_and_skipped_sinks_are_rejected_in_an_active_spool_st
         [SENTINEL_TEXT],
     )?;
     drop(writer);
-    let found = scan(&everything(&engine)?, &declared_sinks);
+    let found = scan(&everything(&engine, &engine_id)?, &declared_sinks);
     assert!(found.leaks.contains("history-table-dump"), "{found:?}");
     assert!(
         found.unexpected.is_empty() && found.unscanned.is_empty(),
@@ -633,7 +638,7 @@ fn planted_leaks_undeclared_and_skipped_sinks_are_rejected_in_an_active_spool_st
     );
 
     // A declared file sink that the scan never reached.
-    let skipped: Vec<Sink> = everything(&engine)?
+    let skipped: Vec<Sink> = everything(&engine, &engine_id)?
         .into_iter()
         .filter(|sink| sink.name != "file:history.sqlite")
         .collect();
@@ -673,7 +678,7 @@ fn live_wal_only_sentinel_records_never_reach_application_sinks() -> TestResult 
     for index in 0..200 {
         fs::create_dir_all(roots.source.join(format!("pads/pad-{index:03}")))?;
     }
-    let mut engine = open(&roots)?;
+    let (mut engine, mut engine_id) = open(&roots)?;
     let mut now = 1_700_000_100_000_i64;
     let mut scanned = 0;
     let mut active = 0;
@@ -683,7 +688,7 @@ fn live_wal_only_sentinel_records_never_reach_application_sinks() -> TestResult 
         if pass == 1 {
             engine.inject_commit_fault(FaultPoint::BeforeCommit);
         }
-        let report = engine.pass(enabled(), now);
+        let report = engine.pass(&engine_id, enabled(), now);
         if report.outcome == PassOutcome::Consistent {
             last = Some(report);
             break;
@@ -691,19 +696,19 @@ fn live_wal_only_sentinel_records_never_reach_application_sinks() -> TestResult 
         if count(&roots.data, "opencode_candidate_spool")? > 0 {
             active += 1;
         }
-        scanned += assert_clean(&engine, &report, &roots.data)?;
+        scanned += assert_clean(&engine, &engine_id, &report, &roots.data)?;
         drop(engine);
-        engine = open(&roots)?;
-        scanned += assert_clean(&engine, &report, &roots.data)?;
+        (engine, engine_id) = open(&roots)?;
+        scanned += assert_clean(&engine, &engine_id, &report, &roots.data)?;
     }
     let last = last.ok_or("the sweep never completed")?;
     assert!(
         active >= 1,
         "an active spool state held the WAL-only candidate"
     );
-    let projection = engine.snapshot(&last)?.projection;
+    let projection = engine.snapshot(&engine_id, &last)?.projection;
     assert_eq!((projection.records, projection.total.value), (1, Some(40)));
-    scanned += assert_clean(&engine, &last, &roots.data)?;
+    scanned += assert_clean(&engine, &engine_id, &last, &roots.data)?;
     assert!(scanned >= 10, "{scanned}");
     // The live writer was only read: the WAL still holds what the writer put there.
     assert_eq!(fs::read(roots.source.join("opencode.db-wal"))?, wal);

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use quotern_core::domain::{
     ConsentState, FailureCode, PassOutcome, PassReport, SourceAuthorization, SourceKind,
 };
-use quotern_core::ingest::OpenCodeEngine;
+use quotern_core::ingest::Engine;
 use quotern_core::ingest::fs::{OpenKind, RecordingFs};
 use quotern_core::limits::{
     MAX_DIRECTORY_ENTRIES, MAX_DIRECTORY_OPENS, MAX_HEADER_READS, MAX_METADATA_CALLS,
@@ -45,15 +45,11 @@ impl Roots {
         &self,
         fs: RecordingFs,
         authorization: SourceAuthorization,
-    ) -> Result<OpenCodeEngine<RecordingFs>, PassReport> {
-        OpenCodeEngine::open(
-            fs,
-            &self.source,
-            &self.data,
-            &self.home,
-            authorization,
-            SourceKind::Custom,
-        )
+    ) -> Result<(Engine<RecordingFs>, String), PassReport> {
+        let mut engine = Engine::open(&self.data, &self.home);
+        let source_id =
+            engine.attach_opencode(fs, &self.source, authorization, SourceKind::Custom)?;
+        Ok((engine, source_id))
     }
 }
 
@@ -149,11 +145,10 @@ fn root_containment_rejects_equality_and_both_ancestor_directions() -> TestResul
         }
         let fs = RecordingFs::new();
         let observed = fs.clone();
-        let report = match OpenCodeEngine::open(
+        let mut overlap_engine = Engine::open(&roots.data, &roots.home);
+        let report = match overlap_engine.attach_opencode(
             fs,
             &roots.source,
-            &roots.data,
-            &roots.home,
             enabled(),
             SourceKind::Custom,
         ) {
@@ -178,12 +173,12 @@ fn root_containment_rejects_equality_and_both_ancestor_directions() -> TestResul
 fn rejected_and_unchanged_passes_keep_bounded_counters() -> TestResult {
     let roots = Roots::new()?;
     fs::write(roots.source.join("opencode-not-sqlite.db"), b"not sqlite")?;
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(RecordingFs::new(), enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
 
     for now_ms in [1, 2] {
-        let report = engine.pass(enabled(), now_ms);
+        let report = engine.pass(&engine_id, enabled(), now_ms);
         assert_eq!(report.outcome, PassOutcome::Unavailable);
         assert_eq!(report.failure, Some(FailureCode::NotSqlite));
         assert_eq!(report.counters.header_reads, 1);
@@ -201,24 +196,24 @@ fn cap_and_restart_passes_keep_frontier_counters_bounded() -> TestResult {
         fs::create_dir(roots.source.join(format!("directory-{index:03}")))?;
     }
 
-    let mut engine = roots
+    let (mut engine, mut engine_id) = roots
         .open(RecordingFs::new(), enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let first = engine.pass(enabled(), 10);
+    let first = engine.pass(&engine_id, enabled(), 10);
     assert_eq!(first.outcome, PassOutcome::CatchingUp);
     assert_bounded(&first);
     assert_eq!(first.counters.directory_opens, MAX_DIRECTORY_OPENS);
     drop(engine);
 
-    engine = roots
+    (engine, engine_id) = roots
         .open(RecordingFs::new(), enabled())
         .map_err(|report| format!("reopen failed: {report:?}"))?;
-    let restarted = engine.pass(enabled(), 20);
+    let restarted = engine.pass(&engine_id, enabled(), 20);
     assert_eq!(restarted.outcome, PassOutcome::Consistent, "{restarted:?}");
     assert!(restarted.counters.entries > 0);
     assert_bounded(&restarted);
 
-    let unchanged = engine.pass(enabled(), 30);
+    let unchanged = engine.pass(&engine_id, enabled(), 30);
     assert_eq!(unchanged.outcome, PassOutcome::CatchingUp, "{unchanged:?}");
     assert_eq!(unchanged.counters.directory_opens, MAX_DIRECTORY_OPENS);
     assert_bounded(&unchanged);
@@ -229,12 +224,12 @@ fn cap_and_restart_passes_keep_frontier_counters_bounded() -> TestResult {
 fn unchanged_small_source_pass_is_consistent() -> TestResult {
     let roots = Roots::new()?;
     let _writer = live_database(&roots.source.join("opencode.db"), &[])?;
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(RecordingFs::new(), enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
 
     for now_ms in [10, 20] {
-        let report = engine.pass(enabled(), now_ms);
+        let report = engine.pass(&engine_id, enabled(), now_ms);
         assert_eq!(report.outcome, PassOutcome::Consistent);
         assert_bounded(&report);
     }
@@ -251,12 +246,12 @@ fn over_budget_directory_restart_is_partial_and_keeps_history() -> TestResult {
            VALUES ('message', 'session', 'assistant', 1, 1700000000000, \
            '{\"tokens\":{\"input\":10,\"output\":20,\"reasoning\":3,\"cache\":{\"read\":4,\"write\":5}}}')"],
     )?;
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(RecordingFs::new(), enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let initial = engine.pass(enabled(), 1);
+    let initial = engine.pass(&engine_id, enabled(), 1);
     assert_eq!(initial.outcome, PassOutcome::Consistent);
-    assert_eq!(engine.observations()?[0].total.value, Some(42));
+    assert_eq!(engine.observations(&engine_id)?[0].total.value, Some(42));
 
     let crowded = roots.source.join("crowded");
     fs::create_dir(&crowded)?;
@@ -281,41 +276,44 @@ fn over_budget_directory_restart_is_partial_and_keeps_history() -> TestResult {
             .iter()
             .any(|name| name.to_str() == Some("opencode.db"))
     );
-    let capped = engine.pass(enabled(), 2);
+    let capped = engine.pass(&engine_id, enabled(), 2);
     assert_eq!(capped.outcome, PassOutcome::CatchingUp);
     assert_eq!(capped.counters.entries, MAX_DIRECTORY_ENTRIES);
     assert_bounded(&capped);
-    assert_eq!(engine.observations()?[0].total.value, Some(42));
+    assert_eq!(engine.observations(&engine_id)?[0].total.value, Some(42));
 
-    let drained = engine.pass(enabled(), 3);
+    let drained = engine.pass(&engine_id, enabled(), 3);
     assert_eq!(drained.outcome, PassOutcome::Consistent, "{drained:?}");
     assert!(drained.counters.entries < MAX_DIRECTORY_ENTRIES);
     assert_bounded(&drained);
-    assert_eq!(engine.observations()?[0].total.value, Some(42));
+    assert_eq!(engine.observations(&engine_id)?[0].total.value, Some(42));
 
-    let capped_again = engine.pass(enabled(), 4);
+    let capped_again = engine.pass(&engine_id, enabled(), 4);
     assert_eq!(capped_again.outcome, PassOutcome::CatchingUp);
     assert_eq!(capped_again.counters.entries, MAX_DIRECTORY_ENTRIES);
     assert_bounded(&capped_again);
     drop(engine);
 
-    let mut reopened = roots
+    let (mut reopened, reopened_id) = roots
         .open(RecordingFs::new(), enabled())
         .map_err(|report| format!("reopen failed: {report:?}"))?;
-    let restart = reopened.pass(enabled(), 5);
+    let restart = reopened.pass(&reopened_id, enabled(), 5);
     assert_eq!(restart.outcome, PassOutcome::Partial, "{restart:?}");
     assert_eq!(restart.failure, Some(FailureCode::LimitExceeded));
     assert_eq!(restart.records_committed, 0);
     assert_eq!(restart.last_good_ms, Some(4));
     assert_eq!(restart.counters.entries, 0);
     assert_bounded(&restart);
-    assert_eq!(reopened.observations()?[0].total.value, Some(42));
+    assert_eq!(
+        reopened.observations(&reopened_id)?[0].total.value,
+        Some(42)
+    );
 
-    let resumed = reopened.pass(enabled(), 6);
+    let resumed = reopened.pass(&reopened_id, enabled(), 6);
     assert_eq!(resumed.outcome, PassOutcome::CatchingUp);
     assert_eq!(resumed.counters.entries, MAX_DIRECTORY_ENTRIES);
     assert_bounded(&resumed);
-    let final_pass = reopened.pass(enabled(), 7);
+    let final_pass = reopened.pass(&reopened_id, enabled(), 7);
     assert_eq!(
         final_pass.outcome,
         PassOutcome::Consistent,
@@ -323,7 +321,10 @@ fn over_budget_directory_restart_is_partial_and_keeps_history() -> TestResult {
     );
     assert!(final_pass.counters.entries < MAX_DIRECTORY_ENTRIES);
     assert_bounded(&final_pass);
-    assert_eq!(reopened.observations()?[0].total.value, Some(42));
+    assert_eq!(
+        reopened.observations(&reopened_id)?[0].total.value,
+        Some(42)
+    );
     Ok(())
 }
 
@@ -335,12 +336,13 @@ fn over_budget_directory_restart_is_partial_and_keeps_history() -> TestResult {
 
 /// One pass whose reported counters must equal the filesystem work physically observed.
 fn measured_pass(
-    engine: &mut OpenCodeEngine<RecordingFs>,
+    engine: &mut Engine<RecordingFs>,
+    engine_id: &str,
     observed: &RecordingFs,
     now_ms: i64,
 ) -> PassReport {
     let before = observed.metrics();
-    let report = engine.pass(enabled(), now_ms);
+    let report = engine.pass(engine_id, enabled(), now_ms);
     let after = observed.metrics();
     let counters = report.counters;
     assert_eq!(
@@ -427,13 +429,13 @@ fn json_part_scans_share_the_eight_iterator_ceiling_across_passes() -> TestResul
     }
     let fs = RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(fs, enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
 
     let mut reports = Vec::new();
     for step in 0..40 {
-        let report = measured_pass(&mut engine, &observed, 1 + step);
+        let report = measured_pass(&mut engine, &engine_id, &observed, 1 + step);
         assert!(
             observed.metrics().open_directories <= 7,
             "only frontier iterators survive a pass: {:?}",
@@ -462,7 +464,7 @@ fn json_part_scans_share_the_eight_iterator_ceiling_across_passes() -> TestResul
     assert_eq!(metrics.max_open_directories, 8, "{metrics:?}");
     assert_eq!(metrics.open_directories, 0, "{metrics:?}");
 
-    let records = engine.observations()?;
+    let records = engine.observations(&engine_id)?;
     assert_eq!(records.len() as u64, GROUPS);
     for index in 0..GROUPS {
         let id = format!("m{index:04}");
@@ -475,7 +477,7 @@ fn json_part_scans_share_the_eight_iterator_ceiling_across_passes() -> TestResul
         assert_eq!(record.total.value, Some(index + 3), "{id}");
         assert_eq!(record.selected_part_ids, ["p1"], "{id}");
     }
-    let projection = engine.snapshot(last)?.projection;
+    let projection = engine.snapshot(&engine_id, last)?.projection;
     assert_eq!(projection.input.value, Some(GROUPS * (GROUPS + 1) / 2));
     assert_eq!(
         projection.total.value,
@@ -499,21 +501,21 @@ fn part_directory_scan_drains_across_passes_and_restart_without_half_publication
         }
         let fs = RecordingFs::new();
         let observed = fs.clone();
-        let mut engine = roots
+        let (mut engine, mut engine_id) = roots
             .open(fs, enabled())
             .map_err(|report| format!("open failed: {report:?}"))?;
-        let first = measured_pass(&mut engine, &observed, 1);
+        let first = measured_pass(&mut engine, &engine_id, &observed, 1);
         assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
         assert_eq!(first.counters.entries, 20_000, "the entry ceiling, exactly");
         assert_eq!(first.records_committed, 0);
         assert!(
-            engine.observations()?.is_empty(),
+            engine.observations(&engine_id)?.is_empty(),
             "half-read group published"
         );
         let mut yielded = u64::from(first.counters.entries);
         if restart {
             drop(engine);
-            engine = roots
+            (engine, engine_id) = roots
                 .open(RecordingFs::new(), enabled())
                 .map_err(|report| format!("reopen failed: {report:?}"))?;
         }
@@ -523,17 +525,18 @@ fn part_directory_scan_drains_across_passes_and_restart_without_half_publication
                 break;
             }
             last = if restart {
-                let report = engine.pass(enabled(), 2 + step);
+                let report = engine.pass(&engine_id, enabled(), 2 + step);
                 yielded += u64::from(report.counters.entries);
                 report
             } else {
-                let report = measured_pass(&mut engine, &observed, 2 + step);
+                let report = measured_pass(&mut engine, &engine_id, &observed, 2 + step);
                 yielded += u64::from(report.counters.entries);
                 report
             };
             assert_ne!(last.outcome, PassOutcome::Unavailable, "{last:?}");
             assert!(
-                engine.observations()?.is_empty() || last.outcome == PassOutcome::Consistent,
+                engine.observations(&engine_id)?.is_empty()
+                    || last.outcome == PassOutcome::Consistent,
                 "{restart}: half-read group published: {last:?}"
             );
         }
@@ -543,7 +546,7 @@ fn part_directory_scan_drains_across_passes_and_restart_without_half_publication
             // (20,010 noise files, the part file, and the root/storage listings around it).
             assert!(yielded < 2 * 20_000, "{yielded} entries across the drain");
         }
-        let records = engine.observations()?;
+        let records = engine.observations(&engine_id)?;
         assert_eq!(records.len(), 1, "{restart}");
         assert_eq!(records[0].input.value, Some(1));
         assert_eq!(records[0].output.value, Some(2));
@@ -575,10 +578,10 @@ fn metadata_ceiling_ends_a_pass_exactly_and_the_sweep_drains() -> TestResult {
     }
     let fs = RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(fs, enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let first = measured_pass(&mut engine, &observed, 1);
+    let first = measured_pass(&mut engine, &engine_id, &observed, 1);
     assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
     assert_eq!(first.counters.stat_calls, 40_000, "{first:?}");
     assert_eq!(first.failure, None, "{first:?}");
@@ -587,10 +590,10 @@ fn metadata_ceiling_ends_a_pass_exactly_and_the_sweep_drains() -> TestResult {
         if last.outcome == PassOutcome::Consistent {
             break;
         }
-        last = measured_pass(&mut engine, &observed, 2 + step);
+        last = measured_pass(&mut engine, &engine_id, &observed, 2 + step);
     }
     assert_eq!(last.outcome, PassOutcome::Consistent, "{last:?}");
-    let projection = engine.snapshot(&last)?.projection;
+    let projection = engine.snapshot(&engine_id, &last)?.projection;
     assert_eq!(projection.records, MESSAGES);
     let expected_input: u64 = (0..MESSAGES).map(|index| index % 5 + 1).sum();
     assert_eq!(projection.input.value, Some(expected_input));
@@ -664,18 +667,18 @@ fn entry_ceiling_ends_a_pass_at_twenty_thousand_and_drains_without_loss() -> Tes
     }
     let fs = RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(fs, enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let first = measured_pass(&mut engine, &observed, 1);
+    let first = measured_pass(&mut engine, &engine_id, &observed, 1);
     assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
     assert_eq!(first.failure, None);
     assert_eq!(first.counters.entries, 20_000);
-    let second = measured_pass(&mut engine, &observed, 2);
+    let second = measured_pass(&mut engine, &engine_id, &observed, 2);
     assert_eq!(second.outcome, PassOutcome::Consistent, "{second:?}");
     // root: storage + crowded; storage: message; message: session-a; session-a: m1.json.
     assert_eq!(second.counters.entries, 2 + 1 + 1 + 1 + 20_002 - 20_000);
-    let records = engine.observations()?;
+    let records = engine.observations(&engine_id)?;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].input.value, Some(3));
     assert_eq!(records[0].total.value, Some(4));
@@ -711,15 +714,15 @@ fn directory_depth_boundary_reads_level_eight_and_rejects_level_nine() -> TestRe
 
         let fs = RecordingFs::new();
         let log = directory_log(&fs);
-        let mut engine = roots
+        let (mut engine, engine_id) = roots
             .open(fs, enabled())
             .map_err(|report| format!("open failed: {report:?}"))?;
-        let mut report = engine.pass(enabled(), 1);
+        let mut report = engine.pass(&engine_id, enabled(), 1);
         for step in 0..4 {
             if report.outcome != PassOutcome::CatchingUp {
                 break;
             }
-            report = engine.pass(enabled(), 2 + step);
+            report = engine.pass(&engine_id, enabled(), 2 + step);
         }
         let canonical = roots.source.canonicalize()?;
         let mut opened = log
@@ -736,7 +739,7 @@ fn directory_depth_boundary_reads_level_eight_and_rejects_level_nine() -> TestRe
             .max()
             .unwrap_or(0);
         let totals: Vec<_> = engine
-            .observations()?
+            .observations(&engine_id)?
             .iter()
             .map(|record| (record.message_id.clone(), record.total.value))
             .collect();
@@ -777,23 +780,23 @@ fn pending_directory_queue_stops_at_4096_across_passes_and_restart() -> TestResu
     }
     let fs = RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(fs, enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let first = measured_pass(&mut engine, &observed, 1);
+    let first = measured_pass(&mut engine, &engine_id, &observed, 1);
     assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
     assert_eq!(first.failure, Some(FailureCode::LimitExceeded), "{first:?}");
     assert_eq!(frontier_rows(&roots.data)?, 4_096);
     for step in 0..3 {
-        let report = measured_pass(&mut engine, &observed, 2 + step);
+        let report = measured_pass(&mut engine, &engine_id, &observed, 2 + step);
         assert_ne!(report.outcome, PassOutcome::Consistent, "{report:?}");
         assert!(frontier_rows(&roots.data)? <= 4_096);
     }
     drop(engine);
-    let mut reopened = roots
+    let (mut reopened, reopened_id) = roots
         .open(RecordingFs::new(), enabled())
         .map_err(|report| format!("reopen failed: {report:?}"))?;
-    let restarted = reopened.pass(enabled(), 10);
+    let restarted = reopened.pass(&reopened_id, enabled(), 10);
     assert_ne!(restarted.outcome, PassOutcome::Consistent, "{restarted:?}");
     assert!(frontier_rows(&roots.data)? <= 4_096);
     Ok(())
@@ -824,14 +827,9 @@ fn root_path_length_boundary_is_4096_bytes() -> TestResult {
         );
         let fs = RecordingFs::new();
         let observed = fs.clone();
-        let report = match OpenCodeEngine::open(
-            fs,
-            &source,
-            &data,
-            &roots.home,
-            enabled(),
-            SourceKind::Custom,
-        ) {
+        let mut length_engine = Engine::open(&data, &roots.home);
+        let report = match length_engine.attach_opencode(fs, &source, enabled(), SourceKind::Custom)
+        {
             Err(report) => report,
             Ok(_) => panic!("{which} path of {bytes} bytes was accepted"),
         };
@@ -883,41 +881,44 @@ fn unreadable_directory_message_and_database_keep_history_and_recover() -> TestR
     let locked = roots.source.join("locked");
     fs::create_dir(&locked)?;
     let guard = Unreadable::new(&locked)?;
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(RecordingFs::new(), enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let blocked = engine.pass(enabled(), 1);
+    let blocked = engine.pass(&engine_id, enabled(), 1);
     assert_eq!(blocked.outcome, PassOutcome::Partial, "{blocked:?}");
     assert_eq!(blocked.failure, Some(FailureCode::Io), "{blocked:?}");
-    assert_eq!(engine.observations()?[0].total.value, Some(4));
+    assert_eq!(engine.observations(&engine_id)?[0].total.value, Some(4));
     drop(guard);
-    let recovered = engine.pass(enabled(), 2);
+    let recovered = engine.pass(&engine_id, enabled(), 2);
     assert_eq!(recovered.outcome, PassOutcome::Consistent, "{recovered:?}");
-    assert_eq!(engine.observations()?.len(), 1);
+    assert_eq!(engine.observations(&engine_id)?.len(), 1);
 
     // Unreadable message after a published one.
     let roots = Roots::new()?;
     message_file(&roots.source, "m1", 3)?;
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(RecordingFs::new(), enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
-    assert_eq!(engine.pass(enabled(), 1).outcome, PassOutcome::Consistent);
+    assert_eq!(
+        engine.pass(&engine_id, enabled(), 1).outcome,
+        PassOutcome::Consistent
+    );
     let second = message_file(&roots.source, "m2", 5)?;
     let guard = Unreadable::new(&second)?;
-    let blocked = engine.pass(enabled(), 2);
+    let blocked = engine.pass(&engine_id, enabled(), 2);
     assert_eq!(blocked.outcome, PassOutcome::Partial, "{blocked:?}");
     assert_eq!(blocked.failure, Some(FailureCode::Io), "{blocked:?}");
     let kept: Vec<_> = engine
-        .observations()?
+        .observations(&engine_id)?
         .iter()
         .map(|record| (record.message_id.clone(), record.total.value))
         .collect();
     assert_eq!(kept, [("m1".to_owned(), Some(4))]);
     drop(guard);
-    let recovered = engine.pass(enabled(), 3);
+    let recovered = engine.pass(&engine_id, enabled(), 3);
     assert_eq!(recovered.outcome, PassOutcome::Consistent, "{recovered:?}");
     let totals: Vec<_> = engine
-        .observations()?
+        .observations(&engine_id)?
         .iter()
         .map(|record| (record.message_id.clone(), record.total.value))
         .collect();
@@ -931,17 +932,17 @@ fn unreadable_directory_message_and_database_keep_history_and_recover() -> TestR
     let database = roots.source.join("opencode.db");
     let _writer = live_database(&database, &[&v2_row("db-row", 9)])?;
     let guard = Unreadable::new(&database)?;
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(RecordingFs::new(), enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let blocked = engine.pass(enabled(), 1);
+    let blocked = engine.pass(&engine_id, enabled(), 1);
     assert_eq!(blocked.outcome, PassOutcome::Unavailable, "{blocked:?}");
     assert_eq!(blocked.failure, Some(FailureCode::Io), "{blocked:?}");
-    assert!(engine.observations()?.is_empty());
+    assert!(engine.observations(&engine_id)?.is_empty());
     drop(guard);
-    let recovered = engine.pass(enabled(), 2);
+    let recovered = engine.pass(&engine_id, enabled(), 2);
     assert_eq!(recovered.outcome, PassOutcome::Consistent, "{recovered:?}");
-    assert_eq!(engine.observations()?[0].total.value, Some(9));
+    assert_eq!(engine.observations(&engine_id)?[0].total.value, Some(9));
     Ok(())
 }
 
@@ -953,10 +954,13 @@ fn only_a_terminal_sweep_marks_a_vanished_file_missing() -> TestResult {
     let first = message_file(&roots.source, "m1", 3)?;
     let second = message_file(&roots.source, "m2", 5)?;
     let relative = |name: &str| format!("storage/message/session-a/{name}.json");
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(RecordingFs::new(), enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
-    assert_eq!(engine.pass(enabled(), 1).outcome, PassOutcome::Consistent);
+    assert_eq!(
+        engine.pass(&engine_id, enabled(), 1).outcome,
+        PassOutcome::Consistent
+    );
     for name in ["m1", "m2"] {
         assert_eq!(
             file_state(&roots.data, &relative(name))?.as_deref(),
@@ -971,13 +975,13 @@ fn only_a_terminal_sweep_marks_a_vanished_file_missing() -> TestResult {
     for index in 0..20_002 {
         fs::write(crowded.join(format!("entry-{index:05}")), [])?;
     }
-    let capped = engine.pass(enabled(), 2);
+    let capped = engine.pass(&engine_id, enabled(), 2);
     assert_eq!(capped.outcome, PassOutcome::CatchingUp, "{capped:?}");
     assert_eq!(
         file_state(&roots.data, &relative("m1"))?.as_deref(),
         Some("present")
     );
-    let terminal = engine.pass(enabled(), 3);
+    let terminal = engine.pass(&engine_id, enabled(), 3);
     assert_eq!(terminal.outcome, PassOutcome::Consistent, "{terminal:?}");
     assert_eq!(
         file_state(&roots.data, &relative("m1"))?.as_deref(),
@@ -987,7 +991,11 @@ fn only_a_terminal_sweep_marks_a_vanished_file_missing() -> TestResult {
         file_state(&roots.data, &relative("m2"))?.as_deref(),
         Some("present")
     );
-    assert_eq!(engine.observations()?.len(), 2, "absence is not removal");
+    assert_eq!(
+        engine.observations(&engine_id)?.len(),
+        2,
+        "absence is not removal"
+    );
 
     // m2 vanishes during a sweep that ends with an unresolved error: still not missing.
     fs::remove_file(&second)?;
@@ -996,20 +1004,20 @@ fn only_a_terminal_sweep_marks_a_vanished_file_missing() -> TestResult {
     let locked = roots.source.join("locked");
     fs::create_dir(&locked)?;
     let guard = Unreadable::new(&locked)?;
-    let blocked = engine.pass(enabled(), 4);
+    let blocked = engine.pass(&engine_id, enabled(), 4);
     assert_eq!(blocked.outcome, PassOutcome::Partial, "{blocked:?}");
     assert_eq!(
         file_state(&roots.data, &relative("m2"))?.as_deref(),
         Some("present")
     );
     drop(guard);
-    let clean = engine.pass(enabled(), 5);
+    let clean = engine.pass(&engine_id, enabled(), 5);
     assert_eq!(clean.outcome, PassOutcome::Consistent, "{clean:?}");
     assert_eq!(
         file_state(&roots.data, &relative("m2"))?.as_deref(),
         Some("missing")
     );
-    assert_eq!(engine.observations()?.len(), 3);
+    assert_eq!(engine.observations(&engine_id)?.len(), 3);
     Ok(())
 }
 
@@ -1060,9 +1068,12 @@ fn every_authorization_state_is_gated_at_open_before_any_source_work() -> TestRe
         let observed = fs.clone();
         let outcome = roots.open(fs, SourceAuthorization { selected, consent });
         match (expected, outcome) {
-            (None, Ok(mut engine)) => {
+            (None, Ok((mut engine, engine_id))) => {
                 assert!(roots.data.join("history.sqlite").exists());
-                assert_eq!(engine.pass(enabled(), 1).outcome, PassOutcome::Consistent);
+                assert_eq!(
+                    engine.pass(&engine_id, enabled(), 1).outcome,
+                    PassOutcome::Consistent
+                );
             }
             (Some(code), Err(report)) => {
                 assert_eq!(
@@ -1098,14 +1109,17 @@ fn authorization_withdrawn_after_open_stops_every_pass_without_effects() -> Test
     message_file(&roots.source, "m1", 3)?;
     let fs = RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(fs, enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
-    assert_eq!(engine.pass(enabled(), 1).outcome, PassOutcome::Consistent);
+    assert_eq!(
+        engine.pass(&engine_id, enabled(), 1).outcome,
+        PassOutcome::Consistent
+    );
     let durable = data_tree(&roots.data)?;
-    let totals = |engine: &OpenCodeEngine<RecordingFs>| -> TestResult<Vec<Option<u64>>> {
+    let totals = |engine: &Engine<RecordingFs>| -> TestResult<Vec<Option<u64>>> {
         Ok(engine
-            .observations()?
+            .observations(&engine_id)?
             .iter()
             .map(|record| record.total.value)
             .collect())
@@ -1115,7 +1129,7 @@ fn authorization_withdrawn_after_open_stops_every_pass_without_effects() -> Test
     for (selected, consent, expected) in AUTHORIZATIONS {
         let Some(code) = expected else { continue };
         let before = observed.metrics();
-        let report = engine.pass(SourceAuthorization { selected, consent }, 10);
+        let report = engine.pass(&engine_id, SourceAuthorization { selected, consent }, 10);
         assert_eq!(
             report.outcome,
             PassOutcome::Unavailable,
@@ -1135,7 +1149,7 @@ fn authorization_withdrawn_after_open_stops_every_pass_without_effects() -> Test
         );
         assert_eq!(totals(&engine)?, [Some(4)]);
     }
-    let resumed = engine.pass(enabled(), 20);
+    let resumed = engine.pass(&engine_id, enabled(), 20);
     assert_eq!(resumed.outcome, PassOutcome::Consistent, "{resumed:?}");
     assert_eq!(totals(&engine)?, [Some(4)]);
     Ok(())
@@ -1345,14 +1359,10 @@ fn root_matrix_covers_home_future_parent_and_alias_controls() -> TestResult {
     for case in cases {
         let fs = RecordingFs::new();
         let observed = fs.clone();
-        let outcome = OpenCodeEngine::open(
-            fs,
-            &case.source,
-            &case.data,
-            &case.home,
-            enabled(),
-            SourceKind::Custom,
-        );
+        let mut case_engine = Engine::open(&case.data, &case.home);
+        let outcome = case_engine
+            .attach_opencode(fs, &case.source, enabled(), SourceKind::Custom)
+            .map(|source_id| (case_engine, source_id));
         match (case.expected, outcome) {
             (None, Ok(_)) => assert!(case.data.is_dir(), "{}: no data directory", case.name),
             (Some(code), Err(report)) => {
@@ -1389,20 +1399,23 @@ fn roots_replaced_after_open_fail_closed_and_recover_when_restored() -> TestResu
     message_file(&source, "m1", 3)?;
     let fs = RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(fs, enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
-    assert_eq!(engine.pass(enabled(), 1).outcome, PassOutcome::Consistent);
-    let totals = |engine: &OpenCodeEngine<RecordingFs>| -> TestResult<Vec<Option<u64>>> {
+    assert_eq!(
+        engine.pass(&engine_id, enabled(), 1).outcome,
+        PassOutcome::Consistent
+    );
+    let totals = |engine: &Engine<RecordingFs>| -> TestResult<Vec<Option<u64>>> {
         Ok(engine
-            .observations()?
+            .observations(&engine_id)?
             .iter()
             .map(|record| record.total.value)
             .collect())
     };
-    let fenced = |engine: &mut OpenCodeEngine<RecordingFs>, now_ms: i64, what: &str| {
+    let fenced = |engine: &mut Engine<RecordingFs>, now_ms: i64, what: &str| {
         let before = observed.metrics();
-        let report = engine.pass(enabled(), now_ms);
+        let report = engine.pass(&engine_id, enabled(), now_ms);
         let after = observed.metrics();
         assert_eq!(
             report.outcome,
@@ -1446,7 +1459,7 @@ fn roots_replaced_after_open_fail_closed_and_recover_when_restored() -> TestResu
     fs::remove_dir(&data)?;
     fs::rename(&parked_data, &data)?;
 
-    let resumed = engine.pass(enabled(), 5);
+    let resumed = engine.pass(&engine_id, enabled(), 5);
     assert_eq!(resumed.outcome, PassOutcome::Consistent, "{resumed:?}");
     assert_eq!(totals(&engine)?, [Some(4)]);
     Ok(())
@@ -1468,14 +1481,14 @@ fn part_scan_metadata_ceiling_is_exact_and_resumes_without_reyielding() -> TestR
     }
     let fs = RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(fs, enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
     let mut rejected = 0_u64;
     let mut last = None;
     for pass in 1..=60 {
         let before = observed.metrics();
-        let report = engine.pass(enabled(), pass);
+        let report = engine.pass(&engine_id, enabled(), pass);
         let after = observed.metrics();
         assert!(report.counters.stat_calls <= 40_000, "{report:?}");
         assert_eq!(
@@ -1484,7 +1497,7 @@ fn part_scan_metadata_ceiling_is_exact_and_resumes_without_reyielding() -> TestR
             "charged equals physically performed: {report:?}"
         );
         assert!(
-            engine.observations()?.is_empty(),
+            engine.observations(&engine_id)?.is_empty(),
             "a half-read or unreadable group is never published"
         );
         rejected += u64::from(report.counters.rejected_records);
@@ -1517,21 +1530,24 @@ fn known_groups_beyond_the_open_budget_still_discover_a_late_file_and_reach_cons
         json_group(&roots.source, index)?;
     }
     let fs = RecordingFs::new();
-    let mut engine = roots
+    let (mut engine, engine_id) = roots
         .open(fs, enabled())
         .map_err(|report| format!("open failed: {report:?}"))?;
     let mut now = 1;
-    let mut first = engine.pass(enabled(), now);
+    let mut first = engine.pass(&engine_id, enabled(), now);
     for _ in 0..40 {
         if first.outcome == PassOutcome::Consistent {
             break;
         }
         now += 1;
-        first = engine.pass(enabled(), now);
+        first = engine.pass(&engine_id, enabled(), now);
     }
     assert_eq!(first.outcome, PassOutcome::Consistent, "{first:?}");
     assert_eq!(
-        engine.observations_page(None, 1_000)?.observations.len() as u64,
+        engine
+            .observations_page(&engine_id, None, 1_000)?
+            .observations
+            .len() as u64,
         GROUPS
     );
     // A new file in a directory the sweep has not visited, and a revision of the last known group.
@@ -1545,12 +1561,14 @@ fn known_groups_beyond_the_open_budget_still_discover_a_late_file_and_reach_cons
     let (mut saw_new, mut saw_revision, mut consistent) = (false, false, false);
     for _ in 0..40 {
         now += 1;
-        let report = engine.pass(enabled(), now);
+        let report = engine.pass(&engine_id, enabled(), now);
         assert!(
             report.counters.directory_opens <= MAX_DIRECTORY_OPENS,
             "{report:?}"
         );
-        let records = engine.observations_page(None, 1_000)?.observations;
+        let records = engine
+            .observations_page(&engine_id, None, 1_000)?
+            .observations;
         saw_new |= records.iter().any(|record| record.message_id == "m9999");
         saw_revision |= records.iter().any(|record| {
             record.message_id == format!("m{:04}", GROUPS - 1) && record.input.value == Some(77)
@@ -1563,7 +1581,9 @@ fn known_groups_beyond_the_open_budget_still_discover_a_late_file_and_reach_cons
     assert!(saw_new, "the late new file was never discovered");
     assert!(saw_revision, "the late revision was never seen");
     assert!(consistent, "the sweep never reached Consistent");
-    let records = engine.observations_page(None, 1_000)?.observations;
+    let records = engine
+        .observations_page(&engine_id, None, 1_000)?
+        .observations;
     assert_eq!(records.len() as u64, GROUPS + 1, "each group exactly once");
     Ok(())
 }
@@ -1648,18 +1668,19 @@ mod native {
         }
     }
 
-    type Engine = OpenCodeEngine<ObservedFs<RecordingFs>>;
+    type ObservedEngine = quotern_core::ingest::Engine<ObservedFs<RecordingFs>>;
 
-    fn open_observed(roots: &Roots) -> TestResult<Engine> {
-        OpenCodeEngine::open(
-            ObservedFs(RecordingFs::new()),
-            &roots.source,
-            &roots.data,
-            &roots.home,
-            enabled(),
-            SourceKind::Custom,
-        )
-        .map_err(|report| format!("open failed: {report:?}").into())
+    fn open_observed(roots: &Roots) -> TestResult<(ObservedEngine, String)> {
+        let mut engine = quotern_core::ingest::Engine::open(&roots.data, &roots.home);
+        let source_id = engine
+            .attach_opencode(
+                ObservedFs(RecordingFs::new()),
+                &roots.source,
+                enabled(),
+                SourceKind::Custom,
+            )
+            .map_err(|report| format!("open failed: {report:?}"))?;
+        Ok((engine, source_id))
     }
 
     /// The independent detector: physical work must stay within the literal ceilings common to
@@ -1700,13 +1721,14 @@ mod native {
     }
 
     fn driven(
-        engine: &mut Engine,
+        engine: &mut ObservedEngine,
+        engine_id: &str,
         observer: &Observer,
         json_only: bool,
         now_ms: i64,
     ) -> (PassReport, Counts) {
         observer.begin_pass();
-        let report = engine.pass(enabled(), now_ms);
+        let report = engine.pass(engine_id, enabled(), now_ms);
         let seen = observer.snapshot();
         if let Err(error) = reconcile(&report.counters, seen, json_only) {
             panic!("independent physical detector rejected the pass: {error}\n{report:?}");
@@ -2909,7 +2931,7 @@ mod native {
         let probe = SyscallProbe::start_fstat_only()?;
         let parked = roots.source.join("opencode.db.parked");
         let (hook_database, hook_parked) = (canonical.clone(), parked.clone());
-        set_open_hook(Some(Box::new(move |path| {
+        set_open_hook(Some(Box::new(move |path, _flags| {
             if path == hook_database {
                 let _ = fs::rename(&hook_database, &hook_parked);
             }
@@ -2963,18 +2985,13 @@ mod native {
                 shared: Rc::clone(&shared),
             };
             let data = roots._directory.path().join(format!("data-{index}"));
-            let mut engine = OpenCodeEngine::open(
-                fs,
-                &roots.source,
-                &data,
-                &roots.home,
-                enabled(),
-                SourceKind::Custom,
-            )
-            .map_err(|report| format!("open failed: {report:?}"))?;
-            let first = engine.pass(enabled(), 1);
+            let mut engine = Engine::open(&data, &roots.home);
+            let engine_id = engine
+                .attach_opencode(fs, &roots.source, enabled(), SourceKind::Custom)
+                .map_err(|report| format!("open failed: {report:?}"))?;
+            let first = engine.pass(&engine_id, enabled(), 1);
             assert_eq!(first.outcome, PassOutcome::Consistent, "{first:?}");
-            let history = engine.observations()?;
+            let history = engine.observations(&engine_id)?;
             assert!(!history.is_empty());
             writer.exec(&v2_row(&format!("later-{index}"), 5))?;
 
@@ -2982,7 +2999,7 @@ mod native {
             shared.started.set(None);
             shared.native.set(None);
             let receipts_before = probe.events().fstat_failures.len();
-            let second = engine.pass(enabled(), 2);
+            let second = engine.pass(&engine_id, enabled(), 2);
             let events = probe.events();
             events.checked()?;
             let receipts = &events.fstat_failures[receipts_before..];
@@ -2990,7 +3007,7 @@ mod native {
                 None => {
                     assert_eq!(second.outcome, PassOutcome::Consistent, "{second:?}");
                     assert!(receipts.is_empty(), "{receipts:?}");
-                    assert_eq!(engine.observations()?.len(), history.len() + 1);
+                    assert_eq!(engine.observations(&engine_id)?.len(), history.len() + 1);
                     stage_total = Some(u32::try_from(
                         shared
                             .native
@@ -3036,15 +3053,15 @@ mod native {
                         );
                     }
                     assert_eq!(
-                        engine.observations()?,
+                        engine.observations(&engine_id)?,
                         history,
                         "history changed by a refused stage ({allowance})"
                     );
                     assert_eq!(second.last_good_ms, first.last_good_ms, "{second:?}");
                     // The retry, with the normal budget, reads the same rows exactly once.
-                    let retry = engine.pass(enabled(), 3);
+                    let retry = engine.pass(&engine_id, enabled(), 3);
                     assert_eq!(retry.outcome, PassOutcome::Consistent, "{retry:?}");
-                    assert_eq!(engine.observations()?.len(), history.len() + 1);
+                    assert_eq!(engine.observations(&engine_id)?.len(), history.len() + 1);
                 }
             }
             drop(engine);
@@ -3086,11 +3103,11 @@ mod native {
             for index in 0..GROUPS {
                 json_group(&roots.source, index)?;
             }
-            let mut engine = open_observed(&roots)?;
+            let (mut engine, engine_id) = open_observed(&roots)?;
             let observer = Observer::start(&roots.source);
             let (mut peak, mut opens, mut last) = (0, 0, None);
             for step in 0..40 {
-                let (report, seen) = driven(&mut engine, &observer, true, 1 + step);
+                let (report, seen) = driven(&mut engine, &engine_id, &observer, true, 1 + step);
                 peak = peak.max(seen.peak);
                 opens += seen.opens;
                 let done = report.outcome == PassOutcome::Consistent;
@@ -3129,9 +3146,9 @@ mod native {
                     }),
                 )?;
             }
-            let mut engine = open_observed(&roots)?;
+            let (mut engine, engine_id) = open_observed(&roots)?;
             let observer = Observer::start(&roots.source);
-            let (first, seen) = driven(&mut engine, &observer, true, 1);
+            let (first, seen) = driven(&mut engine, &engine_id, &observer, true, 1);
             assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
             assert_eq!(seen.metadata, 40_000, "{seen:?}");
             let mut last = first;
@@ -3139,7 +3156,7 @@ mod native {
                 if last.outcome == PassOutcome::Consistent {
                     break;
                 }
-                last = driven(&mut engine, &observer, true, 2 + step).0;
+                last = driven(&mut engine, &engine_id, &observer, true, 2 + step).0;
             }
             assert_eq!(last.outcome, PassOutcome::Consistent, "{last:?}");
             println!(
@@ -3159,12 +3176,12 @@ mod native {
             for index in 0..20_002 {
                 fs::write(crowded.join(format!("entry-{index:05}")), [])?;
             }
-            let mut engine = open_observed(&roots)?;
+            let (mut engine, engine_id) = open_observed(&roots)?;
             let observer = Observer::start(&roots.source);
-            let (first, seen) = driven(&mut engine, &observer, true, 1);
+            let (first, seen) = driven(&mut engine, &engine_id, &observer, true, 1);
             assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
             assert_eq!(seen.yields, 20_000, "{seen:?}");
-            let (second, _) = driven(&mut engine, &observer, true, 2);
+            let (second, _) = driven(&mut engine, &engine_id, &observer, true, 2);
             assert_eq!(second.outcome, PassOutcome::Consistent, "{second:?}");
             println!(
                 "PHYSICAL entry-ceiling: first pass native yields={}",
@@ -3182,16 +3199,16 @@ mod native {
             for index in 0..20_010 {
                 fs::write(noise.join(format!("noise-{index:05}.txt")), [])?;
             }
-            let mut engine = open_observed(&roots)?;
+            let (mut engine, engine_id) = open_observed(&roots)?;
             let observer = Observer::start(&roots.source);
-            let (mut last, first) = driven(&mut engine, &observer, true, 1);
+            let (mut last, first) = driven(&mut engine, &engine_id, &observer, true, 1);
             assert_eq!(first.yields, 20_000, "{first:?}");
             let mut yields = first.yields;
             for step in 0..10 {
                 if last.outcome == PassOutcome::Consistent {
                     break;
                 }
-                let (report, seen) = driven(&mut engine, &observer, true, 2 + step);
+                let (report, seen) = driven(&mut engine, &engine_id, &observer, true, 2 + step);
                 yields += seen.yields;
                 last = report;
             }
@@ -3214,12 +3231,12 @@ mod native {
                 let file = fs::File::create(part_directory.join(format!("big-{index:05}.json")))?;
                 file.set_len(262_145)?;
             }
-            let mut engine = open_observed(&roots)?;
+            let (mut engine, engine_id) = open_observed(&roots)?;
             let observer = Observer::start(&roots.source);
             let (mut rejected, mut peak_metadata) = (0_u64, 0_u64);
             let mut last = None;
             for pass in 1..=60 {
-                let (report, seen) = driven(&mut engine, &observer, true, pass);
+                let (report, seen) = driven(&mut engine, &engine_id, &observer, true, pass);
                 rejected += u64::from(report.counters.rejected_records);
                 peak_metadata = peak_metadata.max(seen.metadata);
                 let done = report.outcome != PassOutcome::CatchingUp;
@@ -3247,9 +3264,9 @@ mod native {
                 fs::create_dir_all(path.parent().ok_or("parent")?)?;
                 fs::File::create(path)?.set_len(262_144)?;
             }
-            let mut engine = open_observed(&roots)?;
+            let (mut engine, engine_id) = open_observed(&roots)?;
             let observer = Observer::start(&roots.source);
-            let (first, seen) = driven(&mut engine, &observer, true, 1);
+            let (first, seen) = driven(&mut engine, &engine_id, &observer, true, 1);
             assert!(
                 seen.bytes <= 67_108_864 && seen.bytes > 33_554_432,
                 "{seen:?}"
@@ -3268,9 +3285,9 @@ mod native {
             for index in 0..70 {
                 fs::create_dir(roots.source.join(format!("directory-{index:03}")))?;
             }
-            let mut engine = open_observed(&roots)?;
+            let (mut engine, engine_id) = open_observed(&roots)?;
             let observer = Observer::start(&roots.source);
-            let (first, seen) = driven(&mut engine, &observer, true, 1);
+            let (first, seen) = driven(&mut engine, &engine_id, &observer, true, 1);
             assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
             assert_eq!(seen.opens, 64, "{seen:?}");
             drop(engine);
@@ -3284,9 +3301,9 @@ mod native {
             let roots = Roots::new()?;
             let mut writer =
                 live_database(&roots.source.join("opencode.db"), &[&v2_row("live", 10)])?;
-            let mut engine = open_observed(&roots)?;
+            let (mut engine, engine_id) = open_observed(&roots)?;
             let observer = Observer::start(&roots.source);
-            let (report, seen) = driven(&mut engine, &observer, false, 1);
+            let (report, seen) = driven(&mut engine, &engine_id, &observer, false, 1);
             assert_eq!(report.outcome, PassOutcome::Consistent, "{report:?}");
             assert_eq!(report.records_committed, 1);
             assert!(seen.bytes >= 4096, "{seen:?}");
@@ -3307,9 +3324,9 @@ mod native {
             let roots = Roots::new()?;
             let database = roots.source.join("opencode.db");
             let mut writer = start_writer(&database)?;
-            let mut engine = open_observed(&roots)?;
+            let (mut engine, engine_id) = open_observed(&roots)?;
             let observer = Observer::start(&roots.source);
-            let (report, seen) = driven(&mut engine, &observer, false, 1);
+            let (report, seen) = driven(&mut engine, &engine_id, &observer, false, 1);
             assert_eq!(report.outcome, PassOutcome::Consistent, "{report:?}");
             assert_eq!(report.records_committed, 1, "{report:?}");
             let reach = observer.reach();
@@ -3360,9 +3377,9 @@ mod native {
                 connection.execute_batch("COMMIT")?;
             }
             let mut writer = start_existing_writer(&database)?;
-            let mut engine = open_observed(&roots)?;
+            let (mut engine, engine_id) = open_observed(&roots)?;
             let observer = Observer::start(&roots.source);
-            let (report, seen) = driven(&mut engine, &observer, false, 1);
+            let (report, seen) = driven(&mut engine, &engine_id, &observer, false, 1);
             assert!(
                 seen.bytes > 67_108_864,
                 "premise: SQLite read {} raw bytes",

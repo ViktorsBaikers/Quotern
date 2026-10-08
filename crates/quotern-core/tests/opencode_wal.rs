@@ -282,19 +282,21 @@ fn open_engine(
     source: &Path,
     data: &Path,
     home: &Path,
-) -> TestResult<quotern_core::ingest::OpenCodeEngine<quotern_core::ingest::fs::RealSourceFs>> {
-    match quotern_core::ingest::OpenCodeEngine::open(
+) -> TestResult<(
+    quotern_core::ingest::Engine<quotern_core::ingest::fs::RealSourceFs>,
+    String,
+)> {
+    let mut engine = quotern_core::ingest::Engine::open(data, home);
+    match engine.attach_opencode(
         quotern_core::ingest::fs::RealSourceFs,
         source,
-        data,
-        home,
         quotern_core::domain::SourceAuthorization {
             selected: true,
             consent: quotern_core::domain::ConsentState::Enabled,
         },
         quotern_core::domain::SourceKind::Custom,
     ) {
-        Ok(engine) => Ok(engine),
+        Ok(source_id) => Ok((engine, source_id)),
         Err(report) => Err(format!("OpenCode engine failed: {report:?}").into()),
     }
 }
@@ -408,8 +410,9 @@ fn spike_s1_live_child_reads_wal_only_reported_usage() -> TestResult {
         );
         sweeps
     };
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
     let report = engine.pass(
+        &engine_id,
         quotern_core::domain::SourceAuthorization {
             selected: true,
             consent: quotern_core::domain::ConsentState::Enabled,
@@ -421,7 +424,7 @@ fn spike_s1_live_child_reads_wal_only_reported_usage() -> TestResult {
         quotern_core::domain::PassOutcome::Consistent
     );
     assert_eq!(report.records_committed, 1);
-    let observations = engine.observations()?;
+    let observations = engine.observations(&engine_id)?;
     assert_eq!(observations.len(), 1);
     let expected = expected_peer_case("named_convention_derives_42")?;
     assert_peer_observation(&observations[0], &expected);
@@ -500,7 +503,7 @@ type Sweep = fn(&kernel::SourceKeys) -> Result<Vec<kernel::FdSample>, String>;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn sweep_on_shm_open(keys: kernel::SourceKeys, shm: PathBuf, sweeps: Sweeps, sweep: Sweep) {
     let next = Sweeps::clone(&sweeps);
-    quotern_core::ingest::sqlite_ro::set_open_hook(Some(Box::new(move |path| {
+    quotern_core::ingest::sqlite_ro::set_open_hook(Some(Box::new(move |path, _flags| {
         if path == shm {
             match sweep(&keys) {
                 Ok(samples) => next.borrow_mut().samples.push(samples),
@@ -578,8 +581,9 @@ fn peer_reported_records() -> TestResult {
     let before = source_image(&database)?;
     reset_vfs_metrics()?;
 
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
     let report = engine.pass(
+        &engine_id,
         quotern_core::domain::SourceAuthorization {
             selected: true,
             consent: quotern_core::domain::ConsentState::Enabled,
@@ -593,7 +597,7 @@ fn peer_reported_records() -> TestResult {
     );
     assert_eq!(report.counters.rejected_records, 4);
     assert_eq!(report.records_committed, 7);
-    let observations = engine.observations()?;
+    let observations = engine.observations(&engine_id)?;
     assert_eq!(observations.len(), 7);
     for expected_case in expected.iter().filter(|case| case["accepted"] == true) {
         let id = expected_case["record_id"]
@@ -649,17 +653,20 @@ fn open_recording_engine(
     data: &Path,
     home: &Path,
 ) -> Result<
-    quotern_core::ingest::OpenCodeEngine<quotern_core::ingest::fs::RecordingFs>,
+    (
+        quotern_core::ingest::Engine<quotern_core::ingest::fs::RecordingFs>,
+        String,
+    ),
     quotern_core::domain::PassReport,
 > {
-    quotern_core::ingest::OpenCodeEngine::open(
+    let mut engine = quotern_core::ingest::Engine::open(data, home);
+    let source_id = engine.attach_opencode(
         fs,
         source,
-        data,
-        home,
         consented(),
         quotern_core::domain::SourceKind::Custom,
-    )
+    )?;
+    Ok((engine, source_id))
 }
 
 fn assert_vfs_no_mutations() -> TestResult {
@@ -686,9 +693,9 @@ fn spike_s2_clean_close_without_sidecars_is_idle() -> TestResult {
 
     let fs = quotern_core::ingest::fs::RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = open_recording_engine(fs, &source, &data, &home)
+    let (mut engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
         .map_err(|report| format!("OpenCode engine failed: {report:?}"))?;
-    let report = engine.pass(consented(), 2);
+    let report = engine.pass(&engine_id, consented(), 2);
     assert_eq!(
         report.outcome,
         quotern_core::domain::PassOutcome::Unavailable
@@ -716,11 +723,11 @@ fn spike_s3_crashed_writer_is_oracle_or_unavailable_without_effects() -> TestRes
     assert!(before[2].1.is_some());
     reset_vfs_metrics()?;
 
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 3);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 3);
     match report.outcome {
         quotern_core::domain::PassOutcome::Consistent => {
-            let observations = engine.observations()?;
+            let observations = engine.observations(&engine_id)?;
             assert_eq!(observations.len(), 1);
             assert_peer_observation(
                 &observations[0],
@@ -729,7 +736,7 @@ fn spike_s3_crashed_writer_is_oracle_or_unavailable_without_effects() -> TestRes
         }
         quotern_core::domain::PassOutcome::Unavailable => {
             assert!(report.failure.is_some());
-            assert!(engine.observations()?.is_empty());
+            assert!(engine.observations(&engine_id)?.is_empty());
             assert_eq!(report.records_committed, 0);
         }
         outcome => panic!("crashed writer produced an unsafe {outcome:?} outcome: {report:?}"),
@@ -776,13 +783,13 @@ fn spike_s5_exclusive_writer_lock_is_bounded_busy() -> TestResult {
     let (source, data, home) = source_roots(directory.path())?;
     let database = source.join("opencode.db");
     let mut writer = start_writer(&database)?;
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
     writer.command("exclusive", "LOCKED")?;
     reset_vfs_metrics()?;
 
     let (sender, receiver) = std::sync::mpsc::channel();
     let reader_thread = std::thread::spawn(move || {
-        let report = engine.pass(consented(), 4);
+        let report = engine.pass(&engine_id, consented(), 4);
         sender
             .send(report)
             .expect("test receiver remains connected");
@@ -871,9 +878,9 @@ fn spike_s6_hot_journal_is_refused_before_sqlite_open() -> TestResult {
     );
     let fs = quotern_core::ingest::fs::RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = open_recording_engine(fs, &source, &data, &home)
+    let (mut engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
         .map_err(|report| format!("OpenCode engine failed: {report:?}"))?;
-    let report = engine.pass(consented(), 6);
+    let report = engine.pass(&engine_id, consented(), 6);
     assert_eq!(
         report.outcome,
         quotern_core::domain::PassOutcome::Unavailable
@@ -932,9 +939,9 @@ fn spike_s7_readonly_directory_without_sidecars_creates_none() -> TestResult {
     let run_result: TestResult<_> = (|| {
         let fs = quotern_core::ingest::fs::RecordingFs::new();
         let observed = fs.clone();
-        let mut engine = open_recording_engine(fs, &source, &data, &home)
+        let (mut engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
             .map_err(|report| format!("OpenCode engine failed: {report:?}"))?;
-        let report = engine.pass(consented(), 7);
+        let report = engine.pass(&engine_id, consented(), 7);
         Ok((report, observed.metrics(), source_image(&database)?))
     })();
     std::fs::set_permissions(&source, original_permissions)?;
@@ -1232,8 +1239,8 @@ fn part_group_replaces_parent() -> TestResult {
     let database = source.join("opencode.db");
     let writer = open_fixture(&database)?;
     seed_wal_fixture(&writer)?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(
         report.outcome,
         quotern_core::domain::PassOutcome::Consistent
@@ -1241,7 +1248,7 @@ fn part_group_replaces_parent() -> TestResult {
     assert_eq!(report.records_committed, 6);
 
     let expected = wal_expected()?;
-    let observations = engine.observations()?;
+    let observations = engine.observations(&engine_id)?;
     assert_eq!(
         observations.len(),
         expected["counts"]["initial_records"].as_u64().unwrap() as usize
@@ -1271,15 +1278,15 @@ fn reported_revision_restart_prune() -> TestResult {
     let database = source.join("opencode.db");
     let writer = open_fixture(&database)?;
     seed_wal_fixture(&writer)?;
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
 
-    let initial = engine.pass(consented(), 1);
+    let initial = engine.pass(&engine_id, consented(), 1);
     assert_eq!(
         initial.outcome,
         quotern_core::domain::PassOutcome::Consistent
     );
     let original = engine
-        .observations()?
+        .observations(&engine_id)?
         .into_iter()
         .find(|record| record.message_id == "same-id")
         .expect("fixture record acquired");
@@ -1300,13 +1307,13 @@ fn reported_revision_restart_prune() -> TestResult {
         "UPDATE message SET data = ?1 WHERE id = 'same-id' AND session_id = 'session-a'",
         [revised_payload],
     )?;
-    let revised = engine.pass(consented(), 2);
+    let revised = engine.pass(&engine_id, consented(), 2);
     assert_eq!(
         revised.outcome,
         quotern_core::domain::PassOutcome::Consistent
     );
     let revised_record = engine
-        .observations()?
+        .observations(&engine_id)?
         .into_iter()
         .find(|record| record.message_id == "same-id")
         .expect("revised record retained");
@@ -1314,14 +1321,14 @@ fn reported_revision_restart_prune() -> TestResult {
     assert_eq!(revised_record.revision, 2);
     drop(engine);
 
-    let mut engine = open_engine(&source, &data, &home)?;
-    let reopened = engine.pass(consented(), 3);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let reopened = engine.pass(&engine_id, consented(), 3);
     assert_eq!(
         reopened.outcome,
         quotern_core::domain::PassOutcome::Consistent
     );
     let stable_record = engine
-        .observations()?
+        .observations(&engine_id)?
         .into_iter()
         .find(|record| record.message_id == "same-id")
         .expect("reopened record retained");
@@ -1332,12 +1339,12 @@ fn reported_revision_restart_prune() -> TestResult {
         "DELETE FROM message WHERE id = 'legacy-derived' AND session_id = 'session-a'",
         [],
     )?;
-    let pruned_source = engine.pass(consented(), 4);
+    let pruned_source = engine.pass(&engine_id, consented(), 4);
     assert_eq!(
         pruned_source.outcome,
         quotern_core::domain::PassOutcome::Consistent
     );
-    let history = engine.observations()?;
+    let history = engine.observations(&engine_id)?;
     assert_eq!(history.len(), 6);
     let revised_history = history
         .iter()
@@ -1365,19 +1372,19 @@ fn pruned_part_retains_complete_group() -> TestResult {
     let steps: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../Fixtures/harness/opencode/wal/steps.json"
     ))?;
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
 
     assert_eq!(
-        engine.pass(consented(), 1).outcome,
+        engine.pass(&engine_id, consented(), 1).outcome,
         quotern_core::domain::PassOutcome::Consistent
     );
     writer.execute(
         "DELETE FROM part WHERE id = 'p2' AND message_id = 'part-parent'",
         [],
     )?;
-    let report = engine.pass(consented(), 2);
+    let report = engine.pass(&engine_id, consented(), 2);
     assert_eq!(report.outcome, quotern_core::domain::PassOutcome::Partial);
-    let observations = engine.observations()?;
+    let observations = engine.observations(&engine_id)?;
     assert_eq!(observations.len(), 6);
     let group = observations
         .iter()
@@ -1405,10 +1412,10 @@ fn explicit_zero_part_corrects_group() -> TestResult {
     let steps: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../Fixtures/harness/opencode/wal/steps.json"
     ))?;
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
 
     assert_eq!(
-        engine.pass(consented(), 1).outcome,
+        engine.pass(&engine_id, consented(), 1).outcome,
         quotern_core::domain::PassOutcome::Consistent
     );
     let zero_part = serde_json::to_vec(&serde_json::json!({
@@ -1426,13 +1433,13 @@ fn explicit_zero_part_corrects_group() -> TestResult {
         "UPDATE part SET data = ?1 WHERE id = 'p2' AND message_id = 'part-parent'",
         [zero_part],
     )?;
-    let corrected = engine.pass(consented(), 2);
+    let corrected = engine.pass(&engine_id, consented(), 2);
     assert_eq!(
         corrected.outcome,
         quotern_core::domain::PassOutcome::Consistent
     );
     let group = engine
-        .observations()?
+        .observations(&engine_id)?
         .into_iter()
         .find(|record| record.message_id == "part-parent")
         .expect("corrected part group");
@@ -1478,15 +1485,15 @@ fn json_message_part_only_mutation() -> TestResult {
         }))
     };
     std::fs::write(&part, part_payload(10_u64, 20_u64)?)?;
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
 
-    let initial = engine.pass(consented(), 1);
+    let initial = engine.pass(&engine_id, consented(), 1);
     assert_eq!(
         initial.outcome,
         quotern_core::domain::PassOutcome::Consistent
     );
     let first = engine
-        .observations()?
+        .observations(&engine_id)?
         .into_iter()
         .find(|record| record.message_id == "part-only")
         .expect("parts-only JSON record acquired");
@@ -1497,13 +1504,13 @@ fn json_message_part_only_mutation() -> TestResult {
     assert_eq!(first.revision, 1);
 
     std::fs::write(&part, part_payload(0_u64, 0_u64)?)?;
-    let revised = engine.pass(consented(), 2);
+    let revised = engine.pass(&engine_id, consented(), 2);
     assert_eq!(
         revised.outcome,
         quotern_core::domain::PassOutcome::Consistent
     );
     let updated = engine
-        .observations()?
+        .observations(&engine_id)?
         .into_iter()
         .find(|record| record.message_id == "part-only")
         .expect("revised parts-only record");
@@ -1530,8 +1537,8 @@ fn malformed_schema_is_not_empty_success() -> TestResult {
         );",
     )?;
     drop(writer);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(
         report.outcome,
         quotern_core::domain::PassOutcome::Unavailable
@@ -1541,7 +1548,7 @@ fn malformed_schema_is_not_empty_success() -> TestResult {
         Some(quotern_core::domain::FailureCode::UnsupportedSchema)
     );
     assert_eq!(report.records_committed, 0);
-    assert_eq!(engine.observations()?.len(), 0);
+    assert_eq!(engine.observations(&engine_id)?.len(), 0);
     assert!(report.counters.source_opens > 0);
     assert!(report.counters.header_reads > 0);
     Ok(())
@@ -1613,10 +1620,11 @@ fn write_json_mirror(source: &Path) -> TestResult {
 }
 
 fn assert_mirror_observations(
-    engine: &quotern_core::ingest::OpenCodeEngine<quotern_core::ingest::fs::RealSourceFs>,
+    engine: &quotern_core::ingest::Engine<quotern_core::ingest::fs::RealSourceFs>,
+    engine_id: &str,
     expected_total: u64,
 ) -> TestResult {
-    let records = engine.observations()?;
+    let records = engine.observations(engine_id)?;
     assert_eq!(records.len(), 2);
     let same_id = records
         .iter()
@@ -1664,25 +1672,26 @@ fn run_mirror_scenario(base: &Path, creation_order: &[&str]) -> TestResult<Vec<M
     );
     assert!(expected["verified_consumption"].is_null());
 
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, mut engine_id) = open_engine(&source, &data, &home)?;
     for now_ms in [1, 2] {
-        let report = engine.pass(consented(), now_ms);
+        let report = engine.pass(&engine_id, consented(), now_ms);
         assert_eq!(
             report.outcome,
             quotern_core::domain::PassOutcome::Consistent
         );
         assert_mirror_observations(
             &engine,
+            &engine_id,
             expected["regenerated_id_copy_reported_total"]
                 .as_u64()
                 .expect("reported total oracle"),
         )?;
         if now_ms == 1 {
             drop(engine);
-            engine = open_engine(&source, &data, &home)?;
+            (engine, engine_id) = open_engine(&source, &data, &home)?;
         }
     }
-    let records = engine.observations()?;
+    let records = engine.observations(&engine_id)?;
     let mut summary = records
         .into_iter()
         .map(|record| {
@@ -1768,7 +1777,7 @@ fn mirror_rank_path_restart_and_tie() -> TestResult {
 // ---------------------------------------------------------------------------------------------
 
 use quotern_core::domain::{FailureCode, PassOutcome, PassReport};
-use quotern_core::ingest::OpenCodeEngine;
+use quotern_core::ingest::Engine;
 use quotern_core::ingest::fs::{OpenKind, RecordingFs};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::time::Duration;
@@ -1812,17 +1821,18 @@ fn live_fixture(database: &Path) -> TestResult<WriterChild> {
 
 /// Runs one pass on a worker thread and fails the test if it does not finish in time.
 fn pass_within<F>(
-    engine: OpenCodeEngine<F>,
+    engine: Engine<F>,
+    engine_id: String,
     now_ms: i64,
     seconds: u64,
-) -> TestResult<(OpenCodeEngine<F>, PassReport)>
+) -> TestResult<(Engine<F>, PassReport)>
 where
     F: quotern_core::ingest::fs::SourceFs + Send + 'static,
 {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut engine = engine;
-        let report = engine.pass(consented(), now_ms);
+        let report = engine.pass(&engine_id, consented(), now_ms);
         let _ = sender.send((engine, report));
     });
     receiver
@@ -1831,13 +1841,14 @@ where
 }
 
 fn run_until_consistent<F: quotern_core::ingest::fs::SourceFs>(
-    engine: &mut OpenCodeEngine<F>,
+    engine: &mut Engine<F>,
+    engine_id: &str,
     first_ms: i64,
     limit: usize,
 ) -> Vec<PassReport> {
     let mut reports = Vec::new();
     for step in 0..limit {
-        let report = engine.pass(consented(), first_ms + step as i64 * 60_000);
+        let report = engine.pass(engine_id, consented(), first_ms + step as i64 * 60_000);
         let done = report.outcome == PassOutcome::Consistent;
         reports.push(report);
         if done {
@@ -1905,8 +1916,8 @@ fn empty_wal_mode_mismatch_is_not_changed_by_acquisition() -> TestResult {
         .collect::<Result<Vec<_>, _>>()?;
     let image = source_image(&database)?;
     reset_vfs_metrics()?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1_700_000_001_000);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1_700_000_001_000);
     assert_eq!(report.outcome, PassOutcome::Consistent, "{report:?}");
     assert_eq!(report.records_committed, 6);
     let after = files
@@ -1986,12 +1997,12 @@ fn same_process_writable_shared_memory_fails_closed() -> TestResult {
 
     // The engine reports the state as unavailable and keeps its history empty: no fallback.
     reset_vfs_metrics()?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(report.outcome, PassOutcome::Unavailable, "{report:?}");
     assert_eq!(report.failure, Some(FailureCode::Sqlite));
     assert_eq!(report.records_committed, 0);
-    assert!(engine.observations()?.is_empty());
+    assert!(engine.observations(&engine_id)?.is_empty());
     assert_source_unchanged(&database, &image)?;
     drop(writer);
     Ok(())
@@ -2018,9 +2029,9 @@ fn nonregular_sidecars_are_refused_without_blocking() -> TestResult {
         mkfifo(&sidecar(&database, suffix))?;
         let fs = RecordingFs::new();
         let observed = fs.clone();
-        let engine = open_recording_engine(fs, &source, &data, &home)
+        let (engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
             .map_err(|report| format!("open failed: {report:?}"))?;
-        let (_engine, report) = pass_within(engine, 1, 10)?;
+        let (_engine, report) = pass_within(engine, engine_id.clone(), 1, 10)?;
         assert_eq!(
             report.outcome,
             PassOutcome::Unavailable,
@@ -2061,9 +2072,9 @@ fn sidecar_replaced_by_fifo_after_preflight_is_refused_without_blocking() -> Tes
             assert!(status.success());
         }
     });
-    let engine = open_recording_engine(fs, &source, &data, &home)
+    let (engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let (_engine, report) = pass_within(engine, 1, 10)?;
+    let (_engine, report) = pass_within(engine, engine_id.clone(), 1, 10)?;
     assert_eq!(report.outcome, PassOutcome::Unavailable, "{report:?}");
     assert_eq!(report.records_committed, 0);
     std::fs::remove_file(&shm)?;
@@ -2114,13 +2125,13 @@ fn replaced_json_file_is_never_read_through_a_link_or_fifo() -> TestResult {
                 }
             }
         });
-        let engine = open_recording_engine(fs, &source, &data, &home)
+        let (engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
             .map_err(|report| format!("open failed: {report:?}"))?;
-        let (engine, report) = pass_within(engine, 1, 10)?;
+        let (engine, report) = pass_within(engine, engine_id.clone(), 1, 10)?;
         assert!(report.records_committed == 0, "{replacement}: {report:?}");
         assert!(
             engine
-                .observations()?
+                .observations(&engine_id)?
                 .iter()
                 .all(|record| record.input.value != Some(77_777)),
             "{replacement}: outside data was read"
@@ -2158,12 +2169,12 @@ fn ancestor_swapped_for_a_link_never_leaves_the_source_root() -> TestResult {
             std::os::unix::fs::symlink(&decoy, &storage).expect("symlink storage");
         }
     });
-    let engine = open_recording_engine(fs, &source, &data, &home)
+    let (engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let (engine, report) = pass_within(engine, 1, 10)?;
+    let (engine, report) = pass_within(engine, engine_id.clone(), 1, 10)?;
     assert!(
         engine
-            .observations()?
+            .observations(&engine_id)?
             .iter()
             .all(|record| record.input.value != Some(77_777)),
         "{report:?}"
@@ -2214,14 +2225,17 @@ fn application_store_replaced_after_open_is_not_written() -> TestResult {
     let _guard = vfs_test_guard();
     let directory = tempdir()?;
     let (source, data, home, _message) = json_source(directory.path())?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    assert_eq!(engine.pass(consented(), 1).outcome, PassOutcome::Consistent);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    assert_eq!(
+        engine.pass(&engine_id, consented(), 1).outcome,
+        PassOutcome::Consistent
+    );
     let victim = directory.path().join("victim.sqlite");
     std::fs::write(&victim, b"not a store")?;
     let history = data.join("history.sqlite");
     std::fs::rename(&history, directory.path().join("history.moved"))?;
     std::os::unix::fs::symlink(&victim, &history)?;
-    let report = engine.pass(consented(), 2);
+    let report = engine.pass(&engine_id, consented(), 2);
     assert_eq!(report.failure, Some(FailureCode::Store), "{report:?}");
     assert_eq!(std::fs::read(&victim)?, b"not a store");
     Ok(())
@@ -2438,11 +2452,11 @@ fn partial_counters_survive_without_an_aggregate_in_every_layout() -> TestResult
     let json_second = counts(Some(6), Some(7), None, None, None, None);
     write_json_part(&source, "json-group", "p1", &step_finish(json_first))?;
     write_json_part(&source, "json-group", "p2", &step_finish(json_second))?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(report.outcome, PassOutcome::Consistent, "{report:?}");
     assert_eq!(report.records_committed, 6);
-    let records = engine.observations()?;
+    let records = engine.observations(&engine_id)?;
 
     for id in ["legacy-partial", "v2-partial", "json-partial"] {
         let record = find(&records, id);
@@ -2476,7 +2490,7 @@ fn partial_counters_survive_without_an_aggregate_in_every_layout() -> TestResult
     assert_eq!(values(json_group), [Some(11), None, None, None, None, None]);
     assert_eq!(json_group.selected_part_ids, ["p1", "p2"]);
 
-    let projection = engine.snapshot(&report)?.projection;
+    let projection = engine.snapshot(&engine_id, &report)?.projection;
     assert_eq!(projection.records, 6);
     assert_eq!(projection.input.value, Some(10 + 10 + 4 + 10 + 11));
     assert_eq!(projection.input.status, ObservationStatus::Current);
@@ -2520,9 +2534,12 @@ fn part_totals_resolve_explicit_or_permitted_derived_before_aggregation() -> Tes
     put_part(&c, "p1", "unresolved", "s", &step_finish(full))?;
     let short = counts(Some(2), Some(2), Some(2), Some(2), None, None);
     put_part(&c, "p2", "unresolved", "s", &step_finish(short))?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    assert_eq!(engine.pass(consented(), 1).outcome, PassOutcome::Consistent);
-    let records = engine.observations()?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    assert_eq!(
+        engine.pass(&engine_id, consented(), 1).outcome,
+        PassOutcome::Consistent
+    );
+    let records = engine.observations(&engine_id)?;
 
     let mixed = find(&records, "mixed");
     assert_eq!(mixed.total.value, Some(47), "explicit 40 + derived 7");
@@ -2578,12 +2595,12 @@ fn parent_envelope_is_validated_independently_of_parent_usage() -> TestResult {
     // The valid control: a usage-free assistant parent with a part is a group.
     put_message(&c, "valid", "s", T0, &json!({"role": "assistant"}))?;
     put_part(&c, "p1", "valid", "s", &part)?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(report.outcome, PassOutcome::Partial, "{report:?}");
     assert_eq!(report.failure, Some(FailureCode::InvalidRecord));
     assert_eq!(report.counters.rejected_records, 3);
-    let records = engine.observations()?;
+    let records = engine.observations(&engine_id)?;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].message_id, "valid");
     assert_eq!(records[0].total.value, Some(3));
@@ -2639,8 +2656,8 @@ fn incomplete_or_malformed_schemas_are_unsupported_not_empty_success() -> TestRe
         let directory = tempdir()?;
         let (source, data, home) = source_roots(directory.path())?;
         Connection::open(source.join("opencode.db"))?.execute_batch(&ddl)?;
-        let mut engine = open_engine(&source, &data, &home)?;
-        let report = engine.pass(consented(), 1);
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+        let report = engine.pass(&engine_id, consented(), 1);
         assert_eq!(
             report.outcome,
             PassOutcome::Unavailable,
@@ -2652,7 +2669,7 @@ fn incomplete_or_malformed_schemas_are_unsupported_not_empty_success() -> TestRe
             "{name}"
         );
         assert_eq!(report.records_committed, 0, "{name}");
-        assert!(engine.observations()?.is_empty(), "{name}");
+        assert!(engine.observations(&engine_id)?.is_empty(), "{name}");
     }
     // Controls: each complete layout alone is supported.
     for layout in ["legacy", "v2"] {
@@ -2674,8 +2691,8 @@ fn incomplete_or_malformed_schemas_are_unsupported_not_empty_success() -> TestRe
             c.execute_batch("DROP TABLE part; DROP TABLE message; DROP TABLE session;")?;
         }
         drop(c);
-        let mut engine = open_engine(&source, &data, &home)?;
-        let report = engine.pass(consented(), 1);
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+        let report = engine.pass(&engine_id, consented(), 1);
         assert_eq!(
             report.outcome,
             PassOutcome::Consistent,
@@ -2725,20 +2742,20 @@ fn timestamps_are_pinned_epoch_milliseconds_inside_the_calendar() -> TestResult 
     )?;
     let one = counts(Some(1), None, None, None, None, None);
     write_json_message(&source, "sj", "json-seconds", 1_700_000_000, Some(one))?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(report.outcome, PassOutcome::Partial, "{report:?}");
     assert_eq!(
         report.counters.rejected_records,
         5,
         "{report:?} accepted={:?}",
         engine
-            .observations()?
+            .observations(&engine_id)?
             .iter()
             .map(|r| r.message_id.clone())
             .collect::<Vec<_>>()
     );
-    let records = engine.observations()?;
+    let records = engine.observations(&engine_id)?;
     let ids = records
         .iter()
         .map(|record| record.message_id.as_str())
@@ -2855,8 +2872,8 @@ fn multibyte_text_payloads_are_accounted_in_bytes_before_materialization() -> Te
     )?;
     tx.commit()?;
     drop(c);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let first = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let first = engine.pass(&engine_id, consented(), 1);
     assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
     let fit = (64 * 1024 * 1024) / valid_bytes;
     assert_eq!(
@@ -2870,11 +2887,11 @@ fn multibyte_text_payloads_are_accounted_in_bytes_before_materialization() -> Te
         "exact byte accounting"
     );
     assert_eq!(
-        engine.snapshot(&first)?.projection.records,
+        engine.snapshot(&engine_id, &first)?.projection.records,
         fit,
         "finished groups publish"
     );
-    let last = engine.pass(consented(), 2);
+    let last = engine.pass(&engine_id, consented(), 2);
     assert_eq!(last.outcome, PassOutcome::Partial, "{last:?}");
     assert_eq!(last.failure, Some(FailureCode::RecordTooLarge));
     assert_eq!(
@@ -2891,7 +2908,7 @@ fn multibyte_text_payloads_are_accounted_in_bytes_before_materialization() -> Te
         (700 - fit) * valid_bytes + 256 * 1024,
         "rejected payloads are never counted or fetched"
     );
-    let records = engine.snapshot(&last)?.projection.records;
+    let records = engine.snapshot(&engine_id, &last)?.projection.records;
     assert_eq!(records, 701, "700 valid + the exact-cap record");
     Ok(())
 }
@@ -2941,12 +2958,12 @@ fn oversized_identity_and_type_columns_are_never_materialized_or_persisted() -> 
         &json!({"tokens": two}),
     )?;
     drop(c);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let reports = run_until_consistent(&mut engine, 1, 4);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let reports = run_until_consistent(&mut engine, &engine_id, 1, 4);
     let last = reports.last().ok_or("pass")?;
     assert_eq!(last.outcome, PassOutcome::Partial, "{last:?}");
     assert_eq!(last.failure, Some(FailureCode::InvalidRecord));
-    let records = engine.observations()?;
+    let records = engine.observations(&engine_id)?;
     let ids = records
         .iter()
         .map(|record| record.message_id.as_str())
@@ -3023,11 +3040,11 @@ fn legacy_and_v2_sources_drain_across_the_five_thousand_row_budget() -> TestResu
         }
         tx.commit()?;
         drop(c);
-        let mut engine = open_engine(&source, &data, &home)?;
+        let (mut engine, mut engine_id) = open_engine(&source, &data, &home)?;
         let groups = if with_parts { rows.div_ceil(1_000) } else { 0 };
         let mut passes = 0;
         let mut restarts = 0;
-        let mut last = engine.pass(consented(), 1);
+        let mut last = engine.pass(&engine_id, consented(), 1);
         loop {
             // After a reopen, one pass reconstructs partly read directories and reads nothing.
             let restart = last.outcome == PassOutcome::Partial
@@ -3037,7 +3054,7 @@ fn legacy_and_v2_sources_drain_across_the_five_thousand_row_budget() -> TestResu
             if restart {
                 restarts += 1;
                 assert_eq!(restarts, 1, "one restart, then bounded passes drain");
-                last = engine.pass(consented(), 100 + passes);
+                last = engine.pass(&engine_id, consented(), 100 + passes);
                 continue;
             }
             passes += 1;
@@ -3058,11 +3075,11 @@ fn legacy_and_v2_sources_drain_across_the_five_thousand_row_budget() -> TestResu
             if passes == 1 {
                 // A restart between passes resumes from the persisted cursor.
                 drop(engine);
-                engine = open_engine(&source, &data, &home)?;
+                (engine, engine_id) = open_engine(&source, &data, &home)?;
             }
-            last = engine.pass(consented(), 1 + passes);
+            last = engine.pass(&engine_id, consented(), 1 + passes);
         }
-        let projection = engine.snapshot(&last)?.projection;
+        let projection = engine.snapshot(&engine_id, &last)?.projection;
         assert_eq!(projection.records, u64::from(rows), "{rows}/{with_parts}");
         // Parts replace their parent: those records carry 10/10 instead of 1/2.
         let expected_input = u64::from(rows - groups) + u64::from(groups) * 10;
@@ -3101,18 +3118,18 @@ fn raw_history_is_paged_and_numeric_projection_is_bounded() -> TestResult {
     }
     tx.commit()?;
     drop(c);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(report.outcome, PassOutcome::Consistent);
     assert_eq!(
-        engine.observations().err(),
+        engine.observations(&engine_id).err(),
         Some(quotern_core::store::StoreError::LimitExceeded),
         "an unbounded raw read is refused, never truncated"
     );
     let mut cursor = None;
     let mut seen = Vec::new();
     loop {
-        let page = engine.observations_page(cursor.as_ref(), 400)?;
+        let page = engine.observations_page(&engine_id, cursor.as_ref(), 400)?;
         assert!(page.observations.len() <= 400);
         seen.extend(
             page.observations
@@ -3126,7 +3143,7 @@ fn raw_history_is_paged_and_numeric_projection_is_bounded() -> TestResult {
     }
     assert_eq!(seen.len(), 1_050);
     assert!(seen.windows(2).all(|pair| pair[0] < pair[1]));
-    let snapshot = engine.snapshot(&report)?;
+    let snapshot = engine.snapshot(&engine_id, &report)?;
     let projection = &snapshot.projection;
     assert_eq!(projection.records, 1_050);
     assert_eq!(projection.input.value, Some(525 * 2 + 525 * 3));
@@ -3177,11 +3194,11 @@ fn summed_part_components_are_revalidated_against_the_numeric_cap() -> TestResul
     put_message(&c, "exact", "s", T0, &json!({"role": "assistant"}))?;
     put_part(&c, "p1", "exact", "s", &part(cap / 2, 1))?;
     put_part(&c, "p2", "exact", "s", &part(cap / 2, 1))?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(report.outcome, PassOutcome::Partial, "{report:?}");
     assert_eq!(report.counters.rejected_records, 1);
-    let records = engine.observations()?;
+    let records = engine.observations(&engine_id)?;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].message_id, "exact");
     assert_eq!(records[0].input.value, Some(cap));
@@ -3392,7 +3409,7 @@ fn unindexed_source_work_stops_at_the_work_limit_and_keeps_whole_group_progress(
     )?;
     tx.commit()?;
     drop(c);
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
     // The work allowance is counted in SQLite progress callbacks (virtual-machine work), not time.
     quotern_core::adapters::opencode::set_progress_ticks(Some(450));
     let _ticks = Ticks;
@@ -3408,7 +3425,7 @@ fn unindexed_source_work_stops_at_the_work_limit_and_keeps_whole_group_progress(
             .enumerate()
             .all(|(index, id)| *id == format!("m-{index:05}"))
     };
-    let first = engine.pass(consented(), 1);
+    let first = engine.pass(&engine_id, consented(), 1);
     assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
     let after_first = published_ids(&data)?;
     assert!(
@@ -3427,7 +3444,7 @@ fn unindexed_source_work_stops_at_the_work_limit_and_keeps_whole_group_progress(
         Some(after_first.len() as i64),
         "the cursor is exactly after the last published group: {cursor}"
     );
-    let second = engine.pass(consented(), 2);
+    let second = engine.pass(&engine_id, consented(), 2);
     let after_second = published_ids(&data)?;
     assert!(
         after_second.len() > after_first.len() && contiguous(&after_second),
@@ -3476,10 +3493,15 @@ fn known_current_record_is_read_first_behind_a_large_historical_backlog() -> Tes
         T0,
         Some(counts(Some(1), Some(0), Some(0), Some(0), Some(0), None)),
     )?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    assert_eq!(engine.pass(consented(), 1).outcome, PassOutcome::Consistent);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
     assert_eq!(
-        find(&engine.observations()?, "current").input.value,
+        engine.pass(&engine_id, consented(), 1).outcome,
+        PassOutcome::Consistent
+    );
+    assert_eq!(
+        find(&engine.observations(&engine_id)?, "current")
+            .input
+            .value,
         Some(1)
     );
 
@@ -3498,22 +3520,27 @@ fn known_current_record_is_read_first_behind_a_large_historical_backlog() -> Tes
         T0,
         Some(counts(Some(2), Some(0), Some(0), Some(0), Some(0), None)),
     )?;
-    let first = engine.pass(consented(), 2);
+    let first = engine.pass(&engine_id, consented(), 2);
     assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
     assert_eq!(first.counters.entries, 20_000, "the entry ceiling is exact");
     assert_eq!(
-        find(&engine.observations()?, "current").input.value,
+        find(&engine.observations(&engine_id)?, "current")
+            .input
+            .value,
         Some(2),
         "the current record is counted in the first capped pass"
     );
-    assert_eq!(find(&engine.observations()?, "current").revision, 2);
-    let reports = run_until_consistent(&mut engine, 3, 8);
+    assert_eq!(
+        find(&engine.observations(&engine_id)?, "current").revision,
+        2
+    );
+    let reports = run_until_consistent(&mut engine, &engine_id, 3, 8);
     assert_eq!(
         reports.last().ok_or("pass")?.outcome,
         PassOutcome::Consistent
     );
     assert_eq!(
-        find(&engine.observations()?, "current").revision,
+        find(&engine.observations(&engine_id)?, "current").revision,
         2,
         "no duplicate revision"
     );
@@ -3531,8 +3558,8 @@ fn staging_failure_keeps_the_durable_frontier_and_never_completes_falsely() -> T
         let (source, data, home) = source_roots(directory.path())?;
         let _c = bulk_legacy(&source.join("opencode.db"), 5_001, 1)?;
         let admitted = i64::try_from(admission_rows(&source.join("opencode.db"))?)?;
-        let mut engine = open_engine(&source, &data, &home)?;
-        let first = engine.pass(consented(), 1);
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+        let first = engine.pass(&engine_id, consented(), 1);
         assert_eq!(first.outcome, PassOutcome::CatchingUp);
         assert_eq!(first.last_good_ms, Some(1));
         let spool: i64 = scalar(&data, "SELECT COUNT(*) FROM opencode_candidate_spool")?;
@@ -3543,7 +3570,7 @@ fn staging_failure_keeps_the_durable_frontier_and_never_completes_falsely() -> T
         );
 
         engine.inject_commit_fault(point);
-        let failed = engine.pass(consented(), 2);
+        let failed = engine.pass(&engine_id, consented(), 2);
         assert_eq!(
             failed.outcome,
             PassOutcome::Partial,
@@ -3575,13 +3602,13 @@ fn staging_failure_keeps_the_durable_frontier_and_never_completes_falsely() -> T
                 );
                 assert_eq!(scalar::<i64>(&data, "SELECT generation FROM sources")?, 0);
                 assert_eq!(
-                    engine.snapshot(&failed)?.projection.records,
+                    engine.snapshot(&engine_id, &failed)?.projection.records,
                     u64::try_from(4_999 - admitted)?
                 );
             }
             quotern_core::store::FaultPoint::AfterCommit => {
                 assert_eq!(
-                    engine.snapshot(&failed)?.projection.records,
+                    engine.snapshot(&engine_id, &failed)?.projection.records,
                     5_001,
                     "the commit did happen"
                 );
@@ -3589,14 +3616,16 @@ fn staging_failure_keeps_the_durable_frontier_and_never_completes_falsely() -> T
             }
         }
         drop(engine);
-        let mut engine = open_engine(&source, &data, &home)?;
-        let reports = run_until_consistent(&mut engine, 3, 6);
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+        let reports = run_until_consistent(&mut engine, &engine_id, 3, 6);
         assert_eq!(
             reports.last().ok_or("pass")?.outcome,
             PassOutcome::Consistent,
             "{point:?}"
         );
-        let projection = engine.snapshot(reports.last().ok_or("pass")?)?.projection;
+        let projection = engine
+            .snapshot(&engine_id, reports.last().ok_or("pass")?)?
+            .projection;
         assert_eq!(projection.records, 5_001, "{point:?}");
         assert_eq!(
             projection.input.value,
@@ -3731,8 +3760,8 @@ fn rejected_first_page_stays_unresolved_through_eof_and_reopen() -> TestResult {
     let (source, data, home) = source_roots(directory.path())?;
     let c = bulk_legacy(&source.join("opencode.db"), 5_001, 1)?;
     c.execute("UPDATE message SET data = x'7b' WHERE id = 'm-00000'", [])?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let first = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let first = engine.pass(&engine_id, consented(), 1);
     assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
     assert_eq!(first.counters.rejected_records, 1);
     assert_eq!(
@@ -3741,26 +3770,29 @@ fn rejected_first_page_stays_unresolved_through_eof_and_reopen() -> TestResult {
         "the rejection is persisted, not recreated per pass"
     );
     drop(engine);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let mut last = engine.pass(consented(), 2);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let mut last = engine.pass(&engine_id, consented(), 2);
     if last.counters.rows_read == 0 {
-        last = engine.pass(consented(), 3);
+        last = engine.pass(&engine_id, consented(), 3);
     }
     // The final page is clean, but the sweep as a whole had a rejection.
     assert_eq!(last.counters.rejected_records, 0, "{last:?}");
     assert_eq!(last.outcome, PassOutcome::Partial, "{last:?}");
     assert_eq!(last.failure, Some(FailureCode::InvalidRecord));
-    assert_eq!(engine.snapshot(&last)?.projection.records, 5_000);
+    assert_eq!(
+        engine.snapshot(&engine_id, &last)?.projection.records,
+        5_000
+    );
     // Repairing the row lets a later complete sweep resolve it.
     c.execute(
         "UPDATE message SET data = ?1 WHERE id = 'm-00000'",
         [serde_json::to_vec(&json!({"role": "assistant", "tokens": counts(Some(1), Some(0), Some(0), Some(0), Some(0), None)}))?],
     )?;
-    let reports = run_until_consistent(&mut engine, 10, 6);
+    let reports = run_until_consistent(&mut engine, &engine_id, 10, 6);
     let done = reports.last().ok_or("pass")?;
     assert_eq!(done.outcome, PassOutcome::Consistent, "{reports:?}");
     assert_eq!(done.failure, None);
-    assert_eq!(engine.snapshot(done)?.projection.records, 5_001);
+    assert_eq!(engine.snapshot(&engine_id, done)?.projection.records, 5_001);
     Ok(())
 }
 
@@ -3793,8 +3825,8 @@ fn failed_file_retry_is_separate_from_siblings_and_order_independent() -> TestRe
             T0,
             Some(counts(Some(3), None, None, None, None, None)),
         )?;
-        let mut engine = open_engine(&source, &data, &home)?;
-        let report = engine.pass(consented(), 1);
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+        let report = engine.pass(&engine_id, consented(), 1);
         outcomes.push((report.outcome, report.failure, report.records_committed));
         assert_eq!(
             report.outcome,
@@ -3805,7 +3837,7 @@ fn failed_file_retry_is_separate_from_siblings_and_order_independent() -> TestRe
         // The frozen outcome table: an unavailable pass publishes no rows, whatever siblings
         // were readable; their numbers arrive only with a pass that is not unavailable.
         assert_eq!(report.records_committed, 0);
-        let projection = engine.snapshot(&report)?.projection;
+        let projection = engine.snapshot(&engine_id, &report)?.projection;
         assert_eq!((projection.records, projection.input.value), (0, None));
         assert_eq!(
             report.last_good_ms, None,
@@ -3818,10 +3850,10 @@ fn failed_file_retry_is_separate_from_siblings_and_order_independent() -> TestRe
         drop(engine);
 
         // The failure survives a restart and is retried every pass without blocking siblings.
-        let mut engine = open_engine(&source, &data, &home)?;
-        let mut again = engine.pass(consented(), 2);
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+        let mut again = engine.pass(&engine_id, consented(), 2);
         if again.counters.entries == 0 {
-            again = engine.pass(consented(), 3);
+            again = engine.pass(&engine_id, consented(), 3);
         }
         assert_eq!(again.outcome, PassOutcome::Unavailable, "{again:?}");
         assert_eq!(
@@ -3839,7 +3871,7 @@ fn failed_file_retry_is_separate_from_siblings_and_order_independent() -> TestRe
             &json!({"role": "assistant", "tokens": counts(Some(1), None, None, None, None, None)}),
         )?;
         drop(replacement);
-        let reports = run_until_consistent(&mut engine, 10, 4);
+        let reports = run_until_consistent(&mut engine, &engine_id, 10, 4);
         assert_eq!(
             reports.last().ok_or("pass")?.outcome,
             PassOutcome::Consistent,
@@ -3851,7 +3883,7 @@ fn failed_file_retry_is_separate_from_siblings_and_order_independent() -> TestRe
         );
         assert_eq!(
             engine
-                .snapshot(reports.last().ok_or("pass")?)?
+                .snapshot(&engine_id, reports.last().ok_or("pass")?)?
                 .projection
                 .input
                 .value,
@@ -3881,25 +3913,28 @@ fn acquisition_failure_marks_retained_groups_pending_with_its_reason() -> TestRe
     )?;
     drop(c);
     let original = std::fs::read(&database)?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    assert_eq!(engine.pass(consented(), 1).outcome, PassOutcome::Consistent);
-    assert!(!find(&engine.observations()?, "kept").pending_partial);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    assert_eq!(
+        engine.pass(&engine_id, consented(), 1).outcome,
+        PassOutcome::Consistent
+    );
+    assert!(!find(&engine.observations(&engine_id)?, "kept").pending_partial);
 
     std::fs::write(&database, b"overwritten with junk")?;
-    let failed = engine.pass(consented(), 2);
+    let failed = engine.pass(&engine_id, consented(), 2);
     assert_eq!(failed.outcome, PassOutcome::Unavailable, "{failed:?}");
     assert_eq!(failed.failure, Some(FailureCode::NotSqlite));
     assert_eq!(failed.last_good_ms, Some(1), "last-good is retained");
-    let kept = engine.observations()?.remove(0);
+    let kept = engine.observations(&engine_id)?.remove(0);
     assert_eq!(kept.input.value, Some(5), "the prior value stays visible");
     assert!(kept.pending_partial);
     assert_eq!(kept.pending_reason, Some(FailureCode::NotSqlite));
     assert_eq!(kept.input.status, ObservationStatus::Partial);
 
     std::fs::write(&database, &original)?;
-    let healed = engine.pass(consented(), 3);
+    let healed = engine.pass(&engine_id, consented(), 3);
     assert_eq!(healed.outcome, PassOutcome::Consistent, "{healed:?}");
-    let kept = engine.observations()?.remove(0);
+    let kept = engine.observations(&engine_id)?.remove(0);
     assert!(!kept.pending_partial && kept.pending_reason.is_none());
     assert_eq!(kept.revision, 1);
     Ok(())
@@ -3953,9 +3988,9 @@ fn source_change_retries_back_off_then_become_unavailable_and_recover() -> TestR
     let swap = Arc::new(AtomicBool::new(false));
     let fs = swapping_fs(&database, &swap);
     let mut opens = fs.clone();
-    let mut engine = open_recording_engine(fs, &source, &data, &home)
+    let (mut engine, mut engine_id) = open_recording_engine(fs, &source, &data, &home)
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let baseline = engine.pass(consented(), 0);
+    let baseline = engine.pass(&engine_id, consented(), 0);
     assert_eq!(baseline.outcome, PassOutcome::Consistent, "{baseline:?}");
     assert_eq!(baseline.last_good_ms, Some(0));
     assert_eq!(opens.metrics().sqlite_opens, 1);
@@ -3972,7 +4007,7 @@ fn source_change_retries_back_off_then_become_unavailable_and_recover() -> TestR
         (35_999, PassOutcome::Unavailable, false),
     ];
     for (now, outcome, opened) in timeline {
-        let report = engine.pass(consented(), now);
+        let report = engine.pass(&engine_id, consented(), now);
         assert_eq!(report.outcome, outcome, "t={now}: {report:?}");
         assert_eq!(report.failure, Some(FailureCode::SourceChanging), "t={now}");
         assert_eq!(report.records_committed, 0, "t={now}");
@@ -3991,11 +4026,11 @@ fn source_change_retries_back_off_then_become_unavailable_and_recover() -> TestR
             // The retry state is durable: a reopened engine still waits out the deadline.
             let fs = swapping_fs(&database, &swap);
             let observed = fs.clone();
-            let reopened = open_recording_engine(fs, &source, &data, &home)
+            let (reopened, reopened_id) = open_recording_engine(fs, &source, &data, &home)
                 .map_err(|report| format!("reopen failed: {report:?}"))?;
             drop(engine);
-            engine = reopened;
-            let early = engine.pass(consented(), 15_999);
+            (engine, engine_id) = (reopened, reopened_id);
+            let early = engine.pass(&engine_id, consented(), 15_999);
             assert_eq!(early.counters, Default::default());
             assert_eq!(
                 observed.metrics().sqlite_opens,
@@ -4007,7 +4042,7 @@ fn source_change_retries_back_off_then_become_unavailable_and_recover() -> TestR
         }
     }
     assert_eq!(retry_state(&data)?, (3, Some(16_000 + 20_000), 1));
-    let kept = engine.observations()?.remove(0);
+    let kept = engine.observations(&engine_id)?.remove(0);
     assert_eq!(
         kept.input.value,
         Some(4),
@@ -4018,10 +4053,10 @@ fn source_change_retries_back_off_then_become_unavailable_and_recover() -> TestR
 
     // Stable again: the next attempt after the deadline succeeds and resets the counters.
     swap.store(false, Ordering::SeqCst);
-    let recovered = engine.pass(consented(), 36_000);
+    let recovered = engine.pass(&engine_id, consented(), 36_000);
     assert_eq!(recovered.outcome, PassOutcome::Consistent, "{recovered:?}");
     assert_eq!(retry_state(&data)?, (0, None, 0));
-    assert!(!engine.observations()?.remove(0).pending_partial);
+    assert!(!engine.observations(&engine_id)?.remove(0).pending_partial);
     Ok(())
 }
 
@@ -4042,12 +4077,12 @@ fn source_change_backoff_doubles_to_the_five_minute_cap() -> TestResult {
     drop(c);
     let swap = Arc::new(AtomicBool::new(true));
     let fs = swapping_fs(&database, &swap);
-    let mut engine = open_recording_engine(fs, &source, &data, &home)
+    let (mut engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
         .map_err(|report| format!("open failed: {report:?}"))?;
     let mut now = 0_i64;
     let mut delays = Vec::new();
     for _ in 0..9 {
-        engine.pass(consented(), now);
+        engine.pass(&engine_id, consented(), now);
         let (_, next, _) = retry_state(&data)?;
         let next = next.ok_or("a retry deadline is scheduled")?;
         delays.push(next - now);
@@ -4074,12 +4109,15 @@ fn stale_generation_cannot_mutate_durable_state() -> TestResult {
         T0,
         Some(counts(Some(1), Some(0), Some(0), Some(0), Some(0), None)),
     )?;
-    let mut first = open_engine(&source, &data, &home)?;
-    let mut second = open_engine(&source, &data, &home)?;
-    assert_eq!(first.pass(consented(), 1).outcome, PassOutcome::Consistent);
+    let (mut first, first_id) = open_engine(&source, &data, &home)?;
+    let (mut second, second_id) = open_engine(&source, &data, &home)?;
+    assert_eq!(
+        first.pass(&first_id, consented(), 1).outcome,
+        PassOutcome::Consistent
+    );
     let before = scalar::<i64>(&data, "SELECT MAX(revision) FROM usage_events")?;
     // The second engine still holds the pre-commit generation: its writes are refused.
-    let stale = second.pass(consented(), 2);
+    let stale = second.pass(&second_id, consented(), 2);
     assert_eq!(stale.outcome, PassOutcome::Partial, "{stale:?}");
     assert_eq!(stale.failure, Some(FailureCode::Store));
     assert_eq!(
@@ -4088,7 +4126,7 @@ fn stale_generation_cannot_mutate_durable_state() -> TestResult {
     );
     assert_eq!(scalar::<i64>(&data, "SELECT generation FROM sources")?, 1);
     // It reloads the durable generation and then proceeds normally.
-    let healed = second.pass(consented(), 3);
+    let healed = second.pass(&second_id, consented(), 3);
     assert_eq!(healed.outcome, PassOutcome::Consistent, "{healed:?}");
     assert_eq!(scalar::<i64>(&data, "SELECT generation FROM sources")?, 2);
     assert_eq!(
@@ -4174,9 +4212,15 @@ fn json_group_mutating_during_acquisition_is_not_published() -> TestResult {
         ))
     };
     write_json_part(&source, "group", "p1", &part(10))?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    assert_eq!(engine.pass(consented(), 1).outcome, PassOutcome::Consistent);
-    assert_eq!(find(&engine.observations()?, "group").total.value, Some(10));
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    assert_eq!(
+        engine.pass(&engine_id, consented(), 1).outcome,
+        PassOutcome::Consistent
+    );
+    assert_eq!(
+        find(&engine.observations(&engine_id)?, "group").total.value,
+        Some(10)
+    );
 
     // The parts change, and the message itself changes between its read and the part reads.
     write_json_part(&source, "group", "p1", &part(20))?;
@@ -4196,12 +4240,12 @@ fn json_group_mutating_during_acquisition_is_not_published() -> TestResult {
             .expect("rewrite message");
         }
     });
-    let engine = open_recording_engine(fs, &source, &data, &home)
+    let (engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let (mut engine, report) = pass_within(engine, 2, 10)?;
+    let (mut engine, report) = pass_within(engine, engine_id.clone(), 2, 10)?;
     assert_eq!(report.outcome, PassOutcome::Partial, "{report:?}");
     assert_eq!(report.failure, Some(FailureCode::SourceChanging));
-    let kept = find(&engine.observations()?, "group").clone();
+    let kept = find(&engine.observations(&engine_id)?, "group").clone();
     assert_eq!(
         kept.total.value,
         Some(10),
@@ -4215,13 +4259,13 @@ fn json_group_mutating_during_acquisition_is_not_published() -> TestResult {
     );
 
     // Once the files stop moving, the group is acquired whole and the failure clears.
-    let reports = run_until_consistent(&mut engine, 10, 4);
+    let reports = run_until_consistent(&mut engine, &engine_id, 10, 4);
     assert_eq!(
         reports.last().ok_or("pass")?.outcome,
         PassOutcome::Consistent,
         "{reports:?}"
     );
-    let settled = find(&engine.observations()?, "group").clone();
+    let settled = find(&engine.observations(&engine_id)?, "group").clone();
     assert_eq!(settled.total.value, Some(20));
     assert!(!settled.pending_partial);
     assert_eq!(
@@ -4248,9 +4292,12 @@ fn failed_discard_is_a_store_failure_not_a_pretended_invalidation() -> TestResul
     drop(c);
     let swap = Arc::new(AtomicBool::new(false));
     let fs = swapping_fs(&database, &swap);
-    let mut engine = open_recording_engine(fs, &source, &data, &home)
+    let (mut engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
         .map_err(|report| format!("open failed: {report:?}"))?;
-    assert_eq!(engine.pass(consented(), 0).outcome, PassOutcome::Consistent);
+    assert_eq!(
+        engine.pass(&engine_id, consented(), 0).outcome,
+        PassOutcome::Consistent
+    );
     let before = (
         scalar::<i64>(&data, "SELECT generation FROM sources")?,
         retry_state(&data)?,
@@ -4259,7 +4306,7 @@ fn failed_discard_is_a_store_failure_not_a_pretended_invalidation() -> TestResul
 
     swap.store(true, Ordering::SeqCst);
     engine.inject_commit_fault(quotern_core::store::FaultPoint::BeforeCommit);
-    let report = engine.pass(consented(), 1_000);
+    let report = engine.pass(&engine_id, consented(), 1_000);
     assert_eq!(report.failure, Some(FailureCode::Store), "{report:?}");
     assert_ne!(report.failure, Some(FailureCode::SourceChanging));
     let after = (
@@ -4270,7 +4317,7 @@ fn failed_discard_is_a_store_failure_not_a_pretended_invalidation() -> TestResul
     assert_eq!(before, after, "nothing was invalidated or scheduled");
 
     // The same change is then handled for real, with the cleanup committed.
-    let handled = engine.pass(consented(), 2_000);
+    let handled = engine.pass(&engine_id, consented(), 2_000);
     assert_eq!(
         handled.failure,
         Some(FailureCode::SourceChanging),
@@ -4317,8 +4364,8 @@ fn saved_cursor_keeps_exact_row_identities_and_resumes_the_consumer() -> TestRes
     drop(c);
 
     let admission = i64::try_from(admission_rows(&source.join("opencode.db"))?)?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let first = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let first = engine.pass(&engine_id, consented(), 1);
     assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
     assert_eq!(first.counters.rows_read, 5_000, "{first:?}");
     let saved: Vec<String> = {
@@ -4340,16 +4387,16 @@ fn saved_cursor_keeps_exact_row_identities_and_resumes_the_consumer() -> TestRes
 
     // A restart resumes from the saved keyset and the final totals are exact.
     drop(engine);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let mut last = engine.pass(consented(), 2);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let mut last = engine.pass(&engine_id, consented(), 2);
     for step in 0..4 {
         if last.outcome == PassOutcome::Consistent {
             break;
         }
-        last = engine.pass(consented(), 3 + step);
+        last = engine.pass(&engine_id, consented(), 3 + step);
     }
     assert_eq!(last.outcome, PassOutcome::Consistent, "{last:?}");
-    let projection = engine.snapshot(&last)?.projection;
+    let projection = engine.snapshot(&engine_id, &last)?.projection;
     assert_eq!(projection.records, 5_100);
     assert_eq!(projection.input.value, Some(5_100));
     assert_eq!(projection.output.value, Some(5_100 * 2));
@@ -4363,8 +4410,8 @@ fn an_undecodable_saved_cursor_is_an_explicit_failure_not_a_restart() -> TestRes
     let (source, data, home) = source_roots(directory.path())?;
     let c = bulk_legacy(&source.join("opencode.db"), 5_100, 1)?;
     drop(c);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let first = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let first = engine.pass(&engine_id, consented(), 1);
     assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
     drop(engine);
     // A fractional row identity is not a supported keyset.
@@ -4375,11 +4422,11 @@ fn an_undecodable_saved_cursor_is_an_explicit_failure_not_a_restart() -> TestRes
         [],
     )?;
     assert_eq!(changed, 1);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let mut report = engine.pass(consented(), 2);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let mut report = engine.pass(&engine_id, consented(), 2);
     // The first pass after a reopen only reconstructs unfinished directories.
     if report.counters.rows_read == 0 && report.outcome == PassOutcome::Partial {
-        report = engine.pass(consented(), 3);
+        report = engine.pass(&engine_id, consented(), 3);
     }
     assert_ne!(report.outcome, PassOutcome::Consistent, "{report:?}");
     assert!(report.failure.is_some(), "{report:?}");
@@ -4520,14 +4567,14 @@ fn selected_part_ids_round_trip_through_a_reopen_with_escapes_and_empty_lists() 
         )?;
     }
     drop(c);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(report.outcome, PassOutcome::Consistent, "{report:?}");
     drop(engine);
 
     // Reopen: the durable column is decoded again by the observation consumer.
-    let engine = open_engine(&source, &data, &home)?;
-    let records = engine.observations()?;
+    let (engine, engine_id) = open_engine(&source, &data, &home)?;
+    let records = engine.observations(&engine_id)?;
     let by_message = |name: &str| {
         records
             .iter()
@@ -4562,26 +4609,26 @@ fn next_pass_after_a_live_writer_commit_publishes_exact_new_totals() -> TestResu
     let database = source.join("opencode.db");
     let mut writer = start_writer(&database)?;
     reset_vfs_metrics()?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let first = engine.pass(consented(), 1_700_000_002_000);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let first = engine.pass(&engine_id, consented(), 1_700_000_002_000);
     assert_eq!(first.outcome, PassOutcome::Consistent, "{first:?}");
-    let before = engine.snapshot(&first)?.projection;
+    let before = engine.snapshot(&engine_id, &first)?.projection;
     assert_eq!(
         (before.records, before.input.value, before.output.value),
         (1, Some(10), Some(20))
     );
 
     writer.command("append", "COMMITTED")?;
-    let during = engine.snapshot(&first)?.projection;
+    let during = engine.snapshot(&engine_id, &first)?.projection;
     assert_eq!(
         during.input.value,
         Some(10),
         "no publication before the next pass"
     );
 
-    let second = engine.pass(consented(), 1_700_000_003_000);
+    let second = engine.pass(&engine_id, consented(), 1_700_000_003_000);
     assert_eq!(second.outcome, PassOutcome::Consistent, "{second:?}");
-    let after = engine.snapshot(&second)?.projection;
+    let after = engine.snapshot(&engine_id, &second)?.projection;
     assert_eq!(after.records, 2);
     // 10+1 input, 20+1 output, reasoning 3+0, cache 4+0 / 5+0, from the two committed rows.
     assert_eq!(after.input.value, Some(11));
@@ -4606,12 +4653,12 @@ fn acquire_twice(
     data: &Path,
     home: &Path,
 ) -> TestResult<(Vec<SourceReportedObservation>, PassReport)> {
-    let mut engine = open_engine(source, data, home)?;
-    engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(source, data, home)?;
+    engine.pass(&engine_id, consented(), 1);
     drop(engine);
-    let mut engine = open_engine(source, data, home)?;
-    let report = engine.pass(consented(), 2);
-    Ok((engine.observations()?, report))
+    let (mut engine, engine_id) = open_engine(source, data, home)?;
+    let report = engine.pass(&engine_id, consented(), 2);
+    Ok((engine.observations(&engine_id)?, report))
 }
 
 /// (message id, total, mirror conflict), ordered by message id.
@@ -5014,9 +5061,9 @@ fn lookalike_sibling_files_are_never_opened_as_sources() -> TestResult {
 
     let fs = RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = open_recording_engine(fs, &source, &data, &home)
+    let (mut engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
         .map_err(|report| format!("open failed: {report:?}"))?;
-    let report = engine.pass(consented(), 1);
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(report.outcome, PassOutcome::Consistent, "{report:?}");
     assert_eq!(
         report.counters.header_reads, 1,
@@ -5024,7 +5071,7 @@ fn lookalike_sibling_files_are_never_opened_as_sources() -> TestResult {
     );
     assert_eq!(observed.metrics().sqlite_opens, 1);
     assert_eq!(
-        winners(&engine.observations()?),
+        winners(&engine.observations(&engine_id)?),
         [
             ("json-real".to_owned(), Some(6), false),
             ("real".to_owned(), Some(5), false)
@@ -5135,9 +5182,9 @@ fn hostile_replacement_at_every_boundary_is_bounded_unpublished_and_recoverable(
                     }
                 }
             });
-            let engine = open_recording_engine(fs, &source, &data, &home)
+            let (engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
                 .map_err(|report| format!("{name}/{replacement}: open failed: {report:?}"))?;
-            let (mut engine, report) = pass_within(engine, 1, 10)?;
+            let (mut engine, report) = pass_within(engine, engine_id.clone(), 1, 10)?;
             assert!(
                 fired.load(Ordering::SeqCst),
                 "{name}/{replacement}: race never fired"
@@ -5148,7 +5195,7 @@ fn hostile_replacement_at_every_boundary_is_bounded_unpublished_and_recoverable(
                 "{name}/{replacement}: {report:?}"
             );
             assert!(
-                engine.observations()?.is_empty(),
+                engine.observations(&engine_id)?.is_empty(),
                 "{name}/{replacement}: hostile state published: {report:?}"
             );
             let store = history(&data)?;
@@ -5171,14 +5218,14 @@ fn hostile_replacement_at_every_boundary_is_bounded_unpublished_and_recoverable(
 
             std::fs::remove_file(&victim)?;
             std::fs::rename(&parked, &victim)?;
-            let reports = run_until_consistent(&mut engine, 100_000, 6);
+            let reports = run_until_consistent(&mut engine, &engine_id, 100_000, 6);
             let last = reports.last().ok_or("no recovery pass")?;
             assert_eq!(
                 last.outcome,
                 PassOutcome::Consistent,
                 "{name}/{replacement}: {reports:?}"
             );
-            let records = engine.observations()?;
+            let records = engine.observations(&engine_id)?;
             assert_eq!(records.len(), 1, "{name}/{replacement}");
             assert_eq!(
                 values(&records[0]),
@@ -5470,11 +5517,10 @@ fn data_root_swapped_after_validation_creates_no_source_file() -> TestResult {
             seen: Arc::new(AtomicUsize::new(0)),
             swap: Arc::new(swap),
         };
-        let opened = quotern_core::ingest::OpenCodeEngine::open(
+        let mut swapped_engine = quotern_core::ingest::Engine::open(&data, &home);
+        let opened = swapped_engine.attach_opencode(
             fs,
             &source,
-            &data,
-            &home,
             quotern_core::domain::SourceAuthorization {
                 selected: true,
                 consent: quotern_core::domain::ConsentState::Enabled,
@@ -5503,7 +5549,7 @@ fn data_root_swapped_after_validation_creates_no_source_file() -> TestResult {
         // Restoring the validated directory makes the same request succeed.
         std::fs::remove_dir_all(&swapped).or_else(|_| std::fs::remove_file(&swapped))?;
         std::fs::rename(base.join("parked"), &swapped)?;
-        let engine = open_engine(&source, &data, &home)?;
+        let (engine, _engine_id) = open_engine(&source, &data, &home)?;
         drop(engine);
         assert!(data.join("history.sqlite").exists(), "{label}: control");
     }
@@ -5654,18 +5700,19 @@ fn the_minimum_rowid_is_reachable_in_every_layout_initially_and_after_reopen() -
         )?;
     }
     drop(c);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let first = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let first = engine.pass(&engine_id, consented(), 1);
     assert_eq!(first.outcome, PassOutcome::Consistent, "{first:?}");
-    let seen = |engine: &quotern_core::ingest::OpenCodeEngine<_>| -> TestResult<Vec<(String, Option<u64>, u64)>> {
-        let mut seen: Vec<_> = engine
-            .observations()?
-            .into_iter()
-            .map(|record| (record.message_id, record.input.value, record.revision))
-            .collect();
-        seen.sort();
-        Ok(seen)
-    };
+    let seen =
+        |engine: &quotern_core::ingest::Engine<_>| -> TestResult<Vec<(String, Option<u64>, u64)>> {
+            let mut seen: Vec<_> = engine
+                .observations(&engine_id)?
+                .into_iter()
+                .map(|record| (record.message_id, record.input.value, record.revision))
+                .collect();
+            seen.sort();
+            Ok(seen)
+        };
     let expected = vec![
         ("legacy-min".to_owned(), Some(11), 1),
         ("legacy-next".to_owned(), Some(22), 1),
@@ -5675,8 +5722,8 @@ fn the_minimum_rowid_is_reachable_in_every_layout_initially_and_after_reopen() -
     assert_eq!(seen(&engine)?, expected, "each boundary row exactly once");
     // A fresh engine on the same store reads every row again without duplicating or revising.
     drop(engine);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let again = engine.pass(consented(), 2);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let again = engine.pass(&engine_id, consented(), 2);
     assert_eq!(again.outcome, PassOutcome::Consistent, "{again:?}");
     assert_eq!(seen(&engine)?, expected);
     // The cursor of a capped read stays exact at the boundary: rowid MIN is a value, not "none".
@@ -5734,12 +5781,12 @@ fn raw_non_usage_parts_resume_across_passes_and_do_not_hit_the_selected_part_cap
         &step_finish(counts(Some(60), Some(0), Some(0), Some(0), Some(0), None)),
     )?;
     drop(c);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let first = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let first = engine.pass(&engine_id, consented(), 1);
     assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
     assert!(first.counters.rows_read <= 5_000, "{first:?}");
     assert!(
-        engine.observations()?.is_empty(),
+        engine.observations(&engine_id)?.is_empty(),
         "a half-read group is never published"
     );
     let cursor: String = scalar(&data, "SELECT working_cursor_key FROM opencode_progress")?;
@@ -5756,11 +5803,11 @@ fn raw_non_usage_parts_resume_across_passes_and_do_not_hit_the_selected_part_cap
     );
     // A restart resumes the same group from the durable cursor.
     drop(engine);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let reports = run_until_consistent(&mut engine, 10, 6);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let reports = run_until_consistent(&mut engine, &engine_id, 10, 6);
     let last = reports.last().ok_or("pass")?;
     assert_eq!(last.outcome, PassOutcome::Consistent, "{reports:?}");
-    let records = engine.observations()?;
+    let records = engine.observations(&engine_id)?;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].input.value, Some(100));
     assert_eq!(records[0].selected_part_ids, ["z-1", "z-2"]);
@@ -5824,8 +5871,8 @@ fn rejected_rows_neither_copy_their_payload_nor_charge_bytes() -> TestResult {
         "the fixture really holds 500 cap-sized payloads behind invalid ids"
     );
     drop(c);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(
         u64::from(report.counters.rows_read),
         500 + admission_rows(&source.join("opencode.db"))?,
@@ -5836,7 +5883,7 @@ fn rejected_rows_neither_copy_their_payload_nor_charge_bytes() -> TestResult {
         report.counters.bytes_read, 0,
         "no rejected payload is fetched, so none is charged either: {report:?}"
     );
-    assert_eq!(engine.snapshot(&report)?.projection.records, 0);
+    assert_eq!(engine.snapshot(&engine_id, &report)?.projection.records, 0);
     Ok(())
 }
 
@@ -5881,53 +5928,52 @@ fn mixed_totals_keep_derivation_and_acquisition_label_through_reopen_and_the_enc
         Some(counts(Some(0), Some(0), Some(0), Some(0), Some(0), Some(0))),
     )?;
     drop(c);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = run_until_consistent(&mut engine, 1, 6)
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = run_until_consistent(&mut engine, &engine_id, 1, 6)
         .pop()
         .ok_or("pass")?;
     assert_eq!(report.outcome, PassOutcome::Consistent, "{report:?}");
-    let check =
-        |engine: &quotern_core::ingest::OpenCodeEngine<_>, report: &PassReport| -> TestResult {
-            let records = engine.observations()?;
-            let mix = find(&records, "mix");
-            assert_eq!(mix.total.value, Some(100), "99 explicit + 1 derived");
-            assert_eq!(mix.total.provenance, Some(Provenance::Derived));
-            assert_eq!(
-                mix.source_convention.as_deref(),
-                Some("codexbar-3239175f-disjoint")
-            );
-            assert!(mix.total_mismatch, "100 against components summing to 43");
-            assert_eq!(
-                mix.acquisition_consistency,
-                AcquisitionConsistency::SqliteReadTransaction
-            );
-            let json = find(&records, "jmsg");
-            assert_eq!(json.total.value, Some(0), "explicit zero is a value");
-            assert_eq!(json.total.provenance, Some(Provenance::Reported));
-            assert_eq!(json.source_convention, None);
-            assert_eq!(
-                json.acquisition_consistency,
-                AcquisitionConsistency::FileByFileBestEffort
-            );
-            let projection = engine.snapshot(report)?.projection;
-            assert_eq!(
-                projection.acquisition_consistency,
-                Some(ProjectionConsistency::Mixed)
-            );
-            assert_eq!(projection.total.value, Some(100));
-            assert_eq!(projection.total.provenance, Some(Provenance::Derived));
-            assert_eq!(
-                projection.source_convention.as_deref(),
-                Some("codexbar-3239175f-disjoint")
-            );
-            // The serialized envelope round-trips through the validated decoder with exact values.
-            let encoded = serde_json::to_vec(&engine.snapshot(report)?)?;
-            assert_eq!(SourceSnapshot::decode(&encoded)?.projection, projection);
-            let page = engine.observations_page(None, 10)?;
-            let decoded = ObservationPage::decode(&serde_json::to_vec(&page)?)?;
-            assert_eq!(decoded, page);
-            Ok(())
-        };
+    let check = |engine: &quotern_core::ingest::Engine<_>, report: &PassReport| -> TestResult {
+        let records = engine.observations(&engine_id)?;
+        let mix = find(&records, "mix");
+        assert_eq!(mix.total.value, Some(100), "99 explicit + 1 derived");
+        assert_eq!(mix.total.provenance, Some(Provenance::Derived));
+        assert_eq!(
+            mix.source_convention.as_deref(),
+            Some("codexbar-3239175f-disjoint")
+        );
+        assert!(mix.total_mismatch, "100 against components summing to 43");
+        assert_eq!(
+            mix.acquisition_consistency,
+            AcquisitionConsistency::SqliteReadTransaction
+        );
+        let json = find(&records, "jmsg");
+        assert_eq!(json.total.value, Some(0), "explicit zero is a value");
+        assert_eq!(json.total.provenance, Some(Provenance::Reported));
+        assert_eq!(json.source_convention, None);
+        assert_eq!(
+            json.acquisition_consistency,
+            AcquisitionConsistency::FileByFileBestEffort
+        );
+        let projection = engine.snapshot(&engine_id, report)?.projection;
+        assert_eq!(
+            projection.acquisition_consistency,
+            Some(ProjectionConsistency::Mixed)
+        );
+        assert_eq!(projection.total.value, Some(100));
+        assert_eq!(projection.total.provenance, Some(Provenance::Derived));
+        assert_eq!(
+            projection.source_convention.as_deref(),
+            Some("codexbar-3239175f-disjoint")
+        );
+        // The serialized envelope round-trips through the validated decoder with exact values.
+        let encoded = serde_json::to_vec(&engine.snapshot(&engine_id, report)?)?;
+        assert_eq!(SourceSnapshot::decode(&encoded)?.projection, projection);
+        let page = engine.observations_page(&engine_id, None, 10)?;
+        let decoded = ObservationPage::decode(&serde_json::to_vec(&page)?)?;
+        assert_eq!(decoded, page);
+        Ok(())
+    };
     check(&engine, &report)?;
     let persisted: (Option<String>, Option<String>, String) = history(&data)?.query_row(
         "SELECT total_provenance, source_convention, acquisition_consistency FROM usage_events WHERE message_id = 'mix'",
@@ -5943,12 +5989,12 @@ fn mixed_totals_keep_derivation_and_acquisition_label_through_reopen_and_the_enc
         )
     );
     drop(engine);
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 100);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 100);
     check(&engine, &report)?;
 
     // The decoder refuses relational contradictions the derive alone would accept.
-    let good = serde_json::to_value(engine.snapshot(&report)?)?;
+    let good = serde_json::to_value(engine.snapshot(&engine_id, &report)?)?;
     type Contradiction = (&'static str, fn(&mut Value));
     let contradictions: [Contradiction; 4] = [
         ("convention on a reported total", |v| {
@@ -6002,10 +6048,10 @@ fn reconciliation_is_dirty_from_the_first_incomplete_pass_until_a_clean_completi
         "s",
         &step_finish(counts(Some(60), Some(0), Some(0), Some(0), Some(0), None)),
     )?;
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
     let dirty = |data: &Path| scalar::<i64>(data, "SELECT dirty FROM sources");
     assert_eq!(dirty(&data)?, 0, "nothing read yet");
-    let clean = engine.pass(consented(), 1);
+    let clean = engine.pass(&engine_id, consented(), 1);
     assert_eq!(clean.outcome, PassOutcome::Consistent, "{clean:?}");
     assert_eq!(dirty(&data)?, 0, "a clean terminal completion clears it");
     // An unfinished catch-up generation is dirty and keeps its last good.
@@ -6019,18 +6065,18 @@ fn reconciliation_is_dirty_from_the_first_incomplete_pass_until_a_clean_completi
     bulk.commit()?;
     // The prune lands before the catch-up generation reads the group: its final outcome is partial.
     c.execute("DELETE FROM part WHERE id = 'p2'", [])?;
-    let catching = engine.pass(consented(), 2);
+    let catching = engine.pass(&engine_id, consented(), 2);
     assert_eq!(catching.outcome, PassOutcome::CatchingUp, "{catching:?}");
     assert_eq!(
         dirty(&data)?,
         1,
         "the open generation is reconciliation in progress"
     );
-    assert!(engine.snapshot(&catching)?.projection.records >= 1);
+    assert!(engine.snapshot(&engine_id, &catching)?.projection.records >= 1);
     // The pruned group makes the final generation partial: the pending group stays dirty.
     let mut last = catching;
     for step in 0..8 {
-        last = engine.pass(consented(), 3 + step * 60_000);
+        last = engine.pass(&engine_id, consented(), 3 + step * 60_000);
         if last.outcome != PassOutcome::CatchingUp {
             break;
         }
@@ -6039,9 +6085,14 @@ fn reconciliation_is_dirty_from_the_first_incomplete_pass_until_a_clean_completi
     assert_eq!(last.outcome, PassOutcome::Partial, "{last:?}");
     assert_eq!(dirty(&data)?, 1, "a pending group is never called clean");
     assert_eq!(
-        find(&engine.observations_page(None, 1_000)?.observations, "g")
-            .input
-            .value,
+        find(
+            &engine
+                .observations_page(&engine_id, None, 1_000)?
+                .observations,
+            "g"
+        )
+        .input
+        .value,
         Some(100)
     );
     Ok(())
@@ -6066,13 +6117,13 @@ fn an_oversized_or_malformed_json_parent_marks_the_retained_group_pending_with_i
         "p1",
         &step_finish(counts(Some(100), Some(0), Some(0), Some(0), Some(0), None)),
     )?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let first = run_until_consistent(&mut engine, 1, 5)
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let first = run_until_consistent(&mut engine, &engine_id, 1, 5)
         .pop()
         .ok_or("pass")?;
     assert_eq!(first.outcome, PassOutcome::Consistent, "{first:?}");
-    let state = |engine: &quotern_core::ingest::OpenCodeEngine<_>| -> TestResult<(Option<u64>, bool, Option<FailureCode>, u64)> {
-        let records = engine.observations()?;
+    let state = |engine: &quotern_core::ingest::Engine<_>| -> TestResult<(Option<u64>, bool, Option<FailureCode>, u64)> {
+        let records = engine.observations(&engine_id)?;
         let record = find(&records, "m");
         Ok((record.input.value, record.pending_partial, record.pending_reason, record.revision))
     };
@@ -6090,7 +6141,7 @@ fn an_oversized_or_malformed_json_parent_marks_the_retained_group_pending_with_i
         if let Some(bytes) = bytes {
             std::fs::write(&parent, bytes)?;
         }
-        engine.pass(consented(), 100 + index as i64 * 60_000);
+        engine.pass(&engine_id, consented(), 100 + index as i64 * 60_000);
         assert_eq!(
             state(&engine)?,
             (Some(100), true, Some(reason), 1),
@@ -6110,7 +6161,7 @@ fn an_oversized_or_malformed_json_parent_marks_the_retained_group_pending_with_i
         "p1",
         &step_finish(counts(Some(40), Some(0), Some(0), Some(0), Some(0), None)),
     )?;
-    let reports = run_until_consistent(&mut engine, 1_000_000, 6);
+    let reports = run_until_consistent(&mut engine, &engine_id, 1_000_000, 6);
     assert_eq!(
         reports.last().ok_or("pass")?.outcome,
         PassOutcome::Consistent,
@@ -6118,8 +6169,8 @@ fn an_oversized_or_malformed_json_parent_marks_the_retained_group_pending_with_i
     );
     assert_eq!(state(&engine)?, (Some(40), false, None, 2));
     drop(engine);
-    let mut engine = open_engine(&source, &data, &home)?;
-    engine.pass(consented(), 9_000_000);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    engine.pass(&engine_id, consented(), 9_000_000);
     assert_eq!(
         state(&engine)?,
         (Some(40), false, None, 2),
@@ -6139,7 +6190,7 @@ fn a_commit_during_the_production_read_transaction_stays_out_of_its_numbers_and_
     let database = source.join("opencode.db");
     let holder = Rc::new(RefCell::new(live_fixture(&database)?));
     let before = source_image(&database)?;
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
     let derived = |input: u64| {
         support::sql_blob(&serde_json::to_vec(&json!({"role": "assistant", "tokens": counts(Some(input), Some(20), Some(3), Some(4), Some(5), None)})).expect("payload"))
     };
@@ -6159,9 +6210,9 @@ fn a_commit_during_the_production_read_transaction_stays_out_of_its_numbers_and_
             .exec(&sql)
             .expect("the child writer commits during the read");
     })));
-    let first = engine.pass(consented(), 1);
+    let first = engine.pass(&engine_id, consented(), 1);
     assert_eq!(first.outcome, PassOutcome::Consistent, "{first:?}");
-    let snapshot = engine.observations()?;
+    let snapshot = engine.observations(&engine_id)?;
     assert_eq!(
         snapshot.len(),
         6,
@@ -6173,9 +6224,9 @@ fn a_commit_during_the_production_read_transaction_stays_out_of_its_numbers_and_
         "nor updated mid-read"
     );
     assert!(snapshot.iter().all(|record| record.message_id != "later"));
-    let second = engine.pass(consented(), 2);
+    let second = engine.pass(&engine_id, consented(), 2);
     assert_eq!(second.outcome, PassOutcome::Consistent, "{second:?}");
-    let records = engine.observations()?;
+    let records = engine.observations(&engine_id)?;
     assert_eq!(records.len(), 7);
     assert_eq!(
         records
@@ -6191,7 +6242,7 @@ fn a_commit_during_the_production_read_transaction_stays_out_of_its_numbers_and_
         (Some(11), Some(43), 2)
     );
     assert_eq!(find(&records, "later").revision, 1);
-    let projection = engine.snapshot(&second)?.projection;
+    let projection = engine.snapshot(&engine_id, &second)?.projection;
     assert_eq!(projection.records, 7);
     assert_eq!(projection.input.value, Some(11 + 10 + 30 + 100 + 1 + 2 + 7));
     holder.borrow_mut().stop()?;
@@ -6209,7 +6260,8 @@ fn known_a_then_large_b(
     source: &Path,
     engine_data: (&Path, &Path),
 ) -> TestResult<(
-    quotern_core::ingest::OpenCodeEngine<quotern_core::ingest::fs::RealSourceFs>,
+    quotern_core::ingest::Engine<quotern_core::ingest::fs::RealSourceFs>,
+    String,
     Connection,
 )> {
     let a = open_fixture(&source.join("opencode-a.db"))?;
@@ -6221,11 +6273,11 @@ fn known_a_then_large_b(
         &json!({"role": "assistant", "tokens": counts(Some(40), Some(0), Some(0), Some(0), Some(0), None)}),
     )?;
     drop(a);
-    let mut engine = open_engine(source, engine_data.0, engine_data.1)?;
-    let base = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(source, engine_data.0, engine_data.1)?;
+    let base = engine.pass(&engine_id, consented(), 1);
     assert_eq!(base.outcome, PassOutcome::Consistent, "{base:?}");
     let b = bulk_legacy(&source.join("opencode-b.db"), 5_100, 1)?;
-    let open_generation = engine.pass(consented(), 2);
+    let open_generation = engine.pass(&engine_id, consented(), 2);
     assert_eq!(
         open_generation.outcome,
         PassOutcome::CatchingUp,
@@ -6238,18 +6290,22 @@ fn known_a_then_large_b(
         )? > 0,
         "the generation is open"
     );
-    Ok((engine, b))
+    Ok((engine, engine_id, b))
 }
 
 fn input_of(
-    engine: &quotern_core::ingest::OpenCodeEngine<quotern_core::ingest::fs::RealSourceFs>,
+    engine: &quotern_core::ingest::Engine<quotern_core::ingest::fs::RealSourceFs>,
+    engine_id: &str,
     id: &str,
 ) -> TestResult<Option<u64>> {
-    Ok(
-        find(&engine.observations_page(None, 1_000)?.observations, id)
-            .input
-            .value,
+    Ok(find(
+        &engine
+            .observations_page(engine_id, None, 1_000)?
+            .observations,
+        id,
     )
+    .input
+    .value)
 }
 
 fn set_a(source: &Path, input: u64) -> TestResult {
@@ -6265,10 +6321,10 @@ fn a_failed_finalization_never_certifies_acquisition_evidence_older_than_the_sou
     for reopen in [false, true] {
         let directory = tempdir()?;
         let (source, data, home) = source_roots(directory.path())?;
-        let (mut engine, _b) = known_a_then_large_b(&source, (&data, &home))?;
+        let (mut engine, mut engine_id, _b) = known_a_then_large_b(&source, (&data, &home))?;
         // The pass that would finalize fails before its commit.
         engine.inject_commit_fault(quotern_core::store::FaultPoint::BeforeCommit);
-        let failed = engine.pass(consented(), 3);
+        let failed = engine.pass(&engine_id, consented(), 3);
         assert_eq!(failed.failure, Some(FailureCode::Store), "{failed:?}");
         assert_eq!(
             scalar::<i64>(&data, "SELECT COUNT(*) FROM opencode_progress")?,
@@ -6279,12 +6335,12 @@ fn a_failed_finalization_never_certifies_acquisition_evidence_older_than_the_sou
         set_a(&source, 41)?;
         if reopen {
             drop(engine);
-            engine = open_engine(&source, &data, &home)?;
+            (engine, engine_id) = open_engine(&source, &data, &home)?;
         }
         let mut now = 100_000_i64;
         let mut last = failed;
         for _ in 0..12 {
-            last = engine.pass(consented(), now);
+            last = engine.pass(&engine_id, consented(), now);
             now += 300_000;
             if last.outcome == PassOutcome::Consistent {
                 break;
@@ -6292,7 +6348,7 @@ fn a_failed_finalization_never_certifies_acquisition_evidence_older_than_the_sou
         }
         assert_eq!(last.outcome, PassOutcome::Consistent, "{last:?}");
         assert_eq!(
-            input_of(&engine, "a")?,
+            input_of(&engine, &engine_id, "a")?,
             Some(41),
             "the physical source was read again (reopen={reopen})"
         );
@@ -6305,7 +6361,7 @@ fn a_database_replaced_after_it_finished_is_caught_before_the_generation_complet
     let _guard = vfs_test_guard();
     let directory = tempdir()?;
     let (source, data, home) = source_roots(directory.path())?;
-    let (mut engine, _b) = known_a_then_large_b(&source, (&data, &home))?;
+    let (mut engine, engine_id, _b) = known_a_then_large_b(&source, (&data, &home))?;
     // Replace the finished database by another inode holding a new value.
     std::fs::remove_file(source.join("opencode-a.db"))?;
     let a = open_fixture(&source.join("opencode-a.db"))?;
@@ -6318,24 +6374,24 @@ fn a_database_replaced_after_it_finished_is_caught_before_the_generation_complet
     )?;
     drop(a);
     let mut now = 10_000_i64;
-    let mut last = engine.pass(consented(), now);
+    let mut last = engine.pass(&engine_id, consented(), now);
     let mut stale_certified =
-        last.outcome == PassOutcome::Consistent && input_of(&engine, "a")? == Some(40);
+        last.outcome == PassOutcome::Consistent && input_of(&engine, &engine_id, "a")? == Some(40);
     for _ in 0..12 {
         if last.outcome == PassOutcome::Consistent {
             break;
         }
         now += 300_000;
-        last = engine.pass(consented(), now);
-        stale_certified |=
-            last.outcome == PassOutcome::Consistent && input_of(&engine, "a")? == Some(40);
+        last = engine.pass(&engine_id, consented(), now);
+        stale_certified |= last.outcome == PassOutcome::Consistent
+            && input_of(&engine, &engine_id, "a")? == Some(40);
     }
     assert!(
         !stale_certified,
         "stale value 40 was certified as Consistent"
     );
     assert_eq!(last.outcome, PassOutcome::Consistent, "{last:?}");
-    assert_eq!(input_of(&engine, "a")?, Some(41));
+    assert_eq!(input_of(&engine, &engine_id, "a")?, Some(41));
     Ok(())
 }
 
@@ -6354,10 +6410,10 @@ fn competing_acquisitions_inside_one_generation_restore_the_pre_generation_basel
             T0,
             Some(counts(Some(40), None, None, None, None, None)),
         )?;
-        let mut engine = open_engine(&source, &data, &home)?;
-        let base = engine.pass(consented(), 1);
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+        let base = engine.pass(&engine_id, consented(), 1);
         assert_eq!(base.outcome, PassOutcome::Consistent, "{base:?}");
-        assert_eq!(input_of(&engine, "m")?, Some(40));
+        assert_eq!(input_of(&engine, &engine_id, "m")?, Some(40));
         // A capped second generation: the bulk database keeps it open.
         let _bulk = bulk_legacy(&source.join("opencode.db"), 5_100, 1)?;
         write_json_message(
@@ -6367,10 +6423,10 @@ fn competing_acquisitions_inside_one_generation_restore_the_pre_generation_basel
             T0,
             Some(counts(Some(first_value), None, None, None, None, None)),
         )?;
-        let staged = engine.pass(consented(), 2);
+        let staged = engine.pass(&engine_id, consented(), 2);
         assert_eq!(staged.outcome, PassOutcome::CatchingUp, "{staged:?}");
         assert_eq!(
-            input_of(&engine, "m")?,
+            input_of(&engine, &engine_id, "m")?,
             Some(first_value),
             "allowed progress: the completed group is published"
         );
@@ -6381,13 +6437,15 @@ fn competing_acquisitions_inside_one_generation_restore_the_pre_generation_basel
             T0,
             Some(counts(Some(second_value), None, None, None, None, None)),
         )?;
-        let conflict = engine.pass(consented(), 3);
+        let conflict = engine.pass(&engine_id, consented(), 3);
         assert_eq!(
             conflict.failure,
             Some(FailureCode::SourceChanging),
             "{conflict:?}"
         );
-        let records = engine.observations_page(None, 1_000)?.observations;
+        let records = engine
+            .observations_page(&engine_id, None, 1_000)?
+            .observations;
         let m = find(&records, "m");
         assert_eq!(
             m.input.value,
@@ -6401,14 +6459,16 @@ fn competing_acquisitions_inside_one_generation_restore_the_pre_generation_basel
         let mut now = 1_000_000_i64;
         let mut last = conflict;
         for _ in 0..16 {
-            last = engine.pass(consented(), now);
+            last = engine.pass(&engine_id, consented(), now);
             now += 400_000;
             if last.outcome == PassOutcome::Consistent {
                 break;
             }
         }
         assert_eq!(last.outcome, PassOutcome::Consistent, "{last:?}");
-        let records = engine.observations_page(None, 1_000)?.observations;
+        let records = engine
+            .observations_page(&engine_id, None, 1_000)?
+            .observations;
         let m = find(&records, "m");
         assert_eq!(
             (m.input.value, m.pending_partial),
@@ -6422,10 +6482,13 @@ fn competing_acquisitions_inside_one_generation_restore_the_pre_generation_basel
 type GroupState = (Option<u64>, u64, bool, Option<FailureCode>, Vec<String>);
 
 fn group_state<F: quotern_core::ingest::fs::SourceFs>(
-    engine: &OpenCodeEngine<F>,
+    engine: &Engine<F>,
+    engine_id: &str,
     id: &str,
 ) -> TestResult<GroupState> {
-    let records = engine.observations_page(None, 1_000)?.observations;
+    let records = engine
+        .observations_page(engine_id, None, 1_000)?
+        .observations;
     let record = find(&records, id);
     Ok((
         record.input.value,
@@ -6453,7 +6516,8 @@ fn group_part(input: u64) -> Value {
 /// `report` is an actual report of the engine (or of the pass that last ran); the snapshot only
 /// carries its outcome, failure and last-good time, which are asserted to round-trip.
 fn assert_g_consumers<F: quotern_core::ingest::fs::SourceFs>(
-    engine: &OpenCodeEngine<F>,
+    engine: &Engine<F>,
+    engine_id: &str,
     report: &PassReport,
     data: &Path,
     sqlite: bool,
@@ -6474,7 +6538,9 @@ fn assert_g_consumers<F: quotern_core::ingest::fs::SourceFs>(
         )
     };
     let parts = vec!["p1".to_owned(), "p2".to_owned()];
-    let page = ObservationPage::decode(&serde_json::to_vec(&engine.observations_page(None, 10)?)?)?;
+    let page = ObservationPage::decode(&serde_json::to_vec(
+        &engine.observations_page(engine_id, None, 10)?,
+    )?)?;
     assert_eq!(page.observations.len(), 1);
     let g = find(&page.observations, "g");
     assert_eq!(
@@ -6491,7 +6557,8 @@ fn assert_g_consumers<F: quotern_core::ingest::fs::SourceFs>(
     assert_eq!(g.acquisition_consistency, acquisition);
     assert!(!g.total_mismatch && !g.mirror_conflict);
 
-    let snapshot = SourceSnapshot::decode(&serde_json::to_vec(&engine.snapshot(report)?)?)?;
+    let snapshot =
+        SourceSnapshot::decode(&serde_json::to_vec(&engine.snapshot(engine_id, report)?)?)?;
     assert_eq!(
         (snapshot.outcome, snapshot.failure, snapshot.last_good_ms),
         (report.outcome, report.failure, report.last_good_ms)
@@ -6612,23 +6679,23 @@ fn group_cursor_fault_reopen_atomic() -> TestResult {
         put_message(&c, "g", "s", T0, &json!({"role": "assistant"}))?;
         put_part(&c, "p1", "g", "s", &part(40))?;
         put_part(&c, "p2", "g", "s", &part(60))?;
-        let mut engine = open_engine(&source, &data, &home)?;
-        let g1 = engine.pass(consented(), 1);
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+        let g1 = engine.pass(&engine_id, consented(), 1);
         assert_eq!(g1.outcome, PassOutcome::Consistent, "{g1:?}");
         let both = vec!["p1".to_owned(), "p2".to_owned()];
         assert_eq!(
-            group_state(&engine, "g")?,
+            group_state(&engine, &engine_id, "g")?,
             (Some(100), 1, false, None, both.clone())
         );
-        assert_g_consumers(&engine, &g1, &data, true, (100, 1, false, None))?;
+        assert_g_consumers(&engine, &engine_id, &g1, &data, true, (100, 1, false, None))?;
         drop(engine);
         // Reopen between G1 and the next change; the prune retains the complete group as pending.
-        let mut engine = open_engine(&source, &data, &home)?;
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
         c.execute("DELETE FROM part WHERE id = 'p2'", [])?;
-        let prune = engine.pass(consented(), 100_000);
+        let prune = engine.pass(&engine_id, consented(), 100_000);
         assert_eq!(prune.outcome, PassOutcome::Partial, "{prune:?}");
         assert_eq!(
-            group_state(&engine, "g")?,
+            group_state(&engine, &engine_id, "g")?,
             (
                 Some(100),
                 1,
@@ -6639,6 +6706,7 @@ fn group_cursor_fault_reopen_atomic() -> TestResult {
         );
         assert_g_consumers(
             &engine,
+            &engine_id,
             &prune,
             &data,
             true,
@@ -6656,21 +6724,21 @@ fn group_cursor_fault_reopen_atomic() -> TestResult {
         assert_acquisition_cleared(&pre, &format!("{fault:?} before the faulted pass"));
         assert_eq!(pre.counters.0, before.0);
         engine.inject_commit_fault(fault);
-        let faulted = engine.pass(consented(), 200_000);
+        let faulted = engine.pass(&engine_id, consented(), 200_000);
         assert_eq!(
             faulted.failure,
             Some(FailureCode::Store),
             "{fault:?}: {faulted:?}"
         );
         drop(engine);
-        let mut engine = open_engine(&source, &data, &home)?;
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
         // Read immediately after the reopen, before any later pass could repair a half state.
         let landed = durable_acquisition(&data)?;
         match fault {
             FaultPoint::BeforeCommit => {
                 // Atomic: nothing of the new membership, value, pending flag or generation landed.
                 assert_eq!(
-                    group_state(&engine, "g")?,
+                    group_state(&engine, &engine_id, "g")?,
                     (
                         Some(100),
                         1,
@@ -6681,6 +6749,7 @@ fn group_cursor_fault_reopen_atomic() -> TestResult {
                 );
                 assert_g_consumers(
                     &engine,
+                    &engine_id,
                     &faulted,
                     &data,
                     true,
@@ -6701,14 +6770,21 @@ fn group_cursor_fault_reopen_atomic() -> TestResult {
             }
             FaultPoint::AfterCommit => {
                 assert_eq!(
-                    group_state(&engine, "g")?,
+                    group_state(&engine, &engine_id, "g")?,
                     (Some(40), 2, false, None, both.clone())
                 );
                 assert_eq!(
                     scalar::<i64>(&data, "SELECT generation FROM sources")?,
                     before.0 + 1
                 );
-                assert_g_consumers(&engine, &faulted, &data, true, (40, 2, false, None))?;
+                assert_g_consumers(
+                    &engine,
+                    &engine_id,
+                    &faulted,
+                    &data,
+                    true,
+                    (40, 2, false, None),
+                )?;
                 // The same transaction published the group and finalized the generation: the
                 // cursor the pass saved, its metadata, candidates and baseline are gone with it.
                 assert_acquisition_cleared(&landed, "after the committed generation");
@@ -6730,33 +6806,35 @@ fn group_cursor_fault_reopen_atomic() -> TestResult {
             }
         }
         // Stable reacquisition converges on 40 with exactly one revision step, never a duplicate.
-        let reports = run_until_consistent(&mut engine, 300_000, 6);
+        let reports = run_until_consistent(&mut engine, &engine_id, 300_000, 6);
         assert_eq!(
             reports.last().ok_or("pass")?.outcome,
             PassOutcome::Consistent,
             "{fault:?}: {reports:?}"
         );
         assert_eq!(
-            group_state(&engine, "g")?,
+            group_state(&engine, &engine_id, "g")?,
             (Some(40), 2, false, None, both.clone()),
             "{fault:?}"
         );
         assert_g_consumers(
             &engine,
+            &engine_id,
             reports.last().ok_or("pass")?,
             &data,
             true,
             (40, 2, false, None),
         )?;
-        let after = run_until_consistent(&mut engine, 5_000_000, 3);
+        let after = run_until_consistent(&mut engine, &engine_id, 5_000_000, 3);
         assert_eq!(after.last().ok_or("pass")?.outcome, PassOutcome::Consistent);
         assert_eq!(
-            group_state(&engine, "g")?.1,
+            group_state(&engine, &engine_id, "g")?.1,
             2,
             "{fault:?}: no duplicate revision"
         );
         assert_g_consumers(
             &engine,
+            &engine_id,
             after.last().ok_or("pass")?,
             &data,
             true,
@@ -7245,22 +7323,36 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
             write_json_part(&source, "g", "p2", &group_part(60))?;
 
             // G1: the clean group.
-            let mut engine = open_engine(&source, &data, &home)?;
-            let g1 = engine.pass(consented(), 1);
+            let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+            let g1 = engine.pass(&engine_id, consented(), 1);
             assert_eq!(g1.outcome, PassOutcome::Consistent, "{label}: {g1:?}");
-            assert_g_consumers(&engine, &g1, &data, false, (100, 1, false, None))?;
+            assert_g_consumers(
+                &engine,
+                &engine_id,
+                &g1,
+                &data,
+                false,
+                (100, 1, false, None),
+            )?;
             drop(engine);
-            let mut engine = open_engine(&source, &data, &home)?;
+            let (mut engine, mut engine_id) = open_engine(&source, &data, &home)?;
 
             // Prune: a missing part is not an explicit zero; the complete group is retained.
             std::fs::remove_file(source.join("storage/part/g/p2.json"))?;
-            let prune = engine.pass(consented(), 100_000);
+            let prune = engine.pass(&engine_id, consented(), 100_000);
             assert_eq!(
                 (prune.outcome, prune.failure),
                 (PassOutcome::Partial, invalid),
                 "{label}: {prune:?}"
             );
-            assert_g_consumers(&engine, &prune, &data, false, (100, 1, true, invalid))?;
+            assert_g_consumers(
+                &engine,
+                &engine_id,
+                &prune,
+                &data,
+                false,
+                (100, 1, true, invalid),
+            )?;
 
             // G2: p2 returns as an explicit zero, which authoritatively revises the group to 40.
             write_json_part(&source, "g", "p2", &group_part(0))?;
@@ -7269,14 +7361,14 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
             assert_acquisition_cleared(&pre, &format!("{label}: before G2"));
             let mut last = if let Some(point) = fault {
                 engine.inject_commit_fault(point);
-                let faulted = engine.pass(consented(), 200_000);
+                let faulted = engine.pass(&engine_id, consented(), 200_000);
                 assert_eq!(
                     faulted.failure,
                     Some(FailureCode::Store),
                     "{label}: {faulted:?}"
                 );
                 drop(engine);
-                engine = open_engine(&source, &data, &home)?;
+                (engine, engine_id) = open_engine(&source, &data, &home)?;
                 // Read immediately after the reopen, before any later pass could repair a half
                 // state.
                 let landed = durable_acquisition(&data)?;
@@ -7284,6 +7376,7 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
                     FaultPoint::BeforeCommit => {
                         assert_g_consumers(
                             &engine,
+                            &engine_id,
                             &faulted,
                             &data,
                             false,
@@ -7293,7 +7386,14 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
                         assert_eq!(landed, pre, "{label}: no cursor, frontier or spool landed");
                     }
                     FaultPoint::AfterCommit => {
-                        assert_g_consumers(&engine, &faulted, &data, false, (40, 2, false, None))?;
+                        assert_g_consumers(
+                            &engine,
+                            &engine_id,
+                            &faulted,
+                            &data,
+                            false,
+                            (40, 2, false, None),
+                        )?;
                         assert_eq!(
                             scalar::<i64>(&data, "SELECT generation FROM sources")?,
                             before.0 + 1,
@@ -7308,19 +7408,33 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
                         assert_eq!(landed.failures, pre.failures, "{label}");
                     }
                 }
-                let reports = run_until_consistent(&mut engine, 300_000, 6);
+                let reports = run_until_consistent(&mut engine, &engine_id, 300_000, 6);
                 reports.last().ok_or("pass")?.clone()
             } else {
-                engine.pass(consented(), 200_000)
+                engine.pass(&engine_id, consented(), 200_000)
             };
             assert_eq!(last.outcome, PassOutcome::Consistent, "{label}: {last:?}");
-            assert_g_consumers(&engine, &last, &data, false, (40, 2, false, None))?;
+            assert_g_consumers(
+                &engine,
+                &engine_id,
+                &last,
+                &data,
+                false,
+                (40, 2, false, None),
+            )?;
             drop(engine);
-            let mut engine = open_engine(&source, &data, &home)?;
-            let reports = run_until_consistent(&mut engine, 5_000_000, 3);
+            let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+            let reports = run_until_consistent(&mut engine, &engine_id, 5_000_000, 3);
             last = reports.last().ok_or("pass")?.clone();
             assert_eq!(last.outcome, PassOutcome::Consistent, "{label}: {last:?}");
-            assert_g_consumers(&engine, &last, &data, false, (40, 2, false, None))?;
+            assert_g_consumers(
+                &engine,
+                &engine_id,
+                &last,
+                &data,
+                false,
+                (40, 2, false, None),
+            )?;
 
             // G3: a backlog keeps the next generation unfinished while p2 changes twice.
             let backlog_name = backlog_name(&source, backlog_first)?;
@@ -7345,27 +7459,41 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
             );
             let mut now = 10_000_000_i64;
             let generation = scalar::<i64>(&data, "SELECT generation FROM sources")?;
-            let staged = engine.pass(consented(), now);
+            let staged = engine.pass(&engine_id, consented(), now);
             assert_eq!(
                 staged.outcome,
                 PassOutcome::CatchingUp,
                 "{label}: {staged:?}"
             );
-            assert_g_consumers(&engine, &staged, &data, false, (first, 3, false, None))?;
+            assert_g_consumers(
+                &engine,
+                &engine_id,
+                &staged,
+                &data,
+                false,
+                (first, 3, false, None),
+            )?;
             let unfinished = acquisition_state(&data)?;
             assert_eq!(unfinished.0, generation, "{label}: same generation");
             assert!(unfinished.1 > 0, "{label}: durable acquisition spool");
             assert!(!unfinished.2.is_empty(), "{label}: durable baseline");
             drop(engine);
-            let mut engine = open_engine(&source, &data, &home)?;
+            let (mut engine, mut engine_id) = open_engine(&source, &data, &home)?;
             now += 1;
-            let rebuilt = engine.pass(consented(), now);
+            let rebuilt = engine.pass(&engine_id, consented(), now);
             assert_ne!(
                 rebuilt.outcome,
                 PassOutcome::Consistent,
                 "{label}: {rebuilt:?}"
             );
-            assert_g_consumers(&engine, &rebuilt, &data, false, (first, 3, false, None))?;
+            assert_g_consumers(
+                &engine,
+                &engine_id,
+                &rebuilt,
+                &data,
+                false,
+                (first, 3, false, None),
+            )?;
             assert_eq!(
                 acquisition_state(&data)?,
                 unfinished,
@@ -7383,7 +7511,7 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
             }
             now += 1;
             let conflict_time = now;
-            let conflict = engine.pass(consented(), conflict_time);
+            let conflict = engine.pass(&engine_id, consented(), conflict_time);
             // The pass read every row after the saved cursor and no per-pass ceiling (the literal
             // current-lane halves of 5,000 rows, 20,000 entries, 40,000 metadata calls and 64
             // directory opens) cut it short, so it ended the backlog and its frontier and met the
@@ -7411,7 +7539,7 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
                         "{label}: {conflict:?}"
                     );
                     drop(engine);
-                    engine = open_engine(&source, &data, &home)?;
+                    (engine, engine_id) = open_engine(&source, &data, &home)?;
                     // Read immediately after the reopen, before any later pass.
                     let landed = durable_acquisition(&data)?;
                     match point {
@@ -7420,6 +7548,7 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
                             // published with its durable acquisition and baseline.
                             assert_g_consumers(
                                 &engine,
+                                &engine_id,
                                 &conflict,
                                 &data,
                                 false,
@@ -7433,7 +7562,7 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
                             let mut replayed = None;
                             for _ in 0..6 {
                                 now += 400_000;
-                                let report = engine.pass(consented(), now);
+                                let report = engine.pass(&engine_id, consented(), now);
                                 assert_ne!(
                                     report.outcome,
                                     PassOutcome::Consistent,
@@ -7450,6 +7579,7 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
                             // The discard itself committed: restore, pending flag and backoff.
                             assert_g_consumers(
                                 &engine,
+                                &engine_id,
                                 &conflict,
                                 &data,
                                 false,
@@ -7482,7 +7612,7 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
                                 Some("source_changing".to_owned())
                             );
                             now = conflict_time + 1;
-                            let inside_backoff = engine.pass(consented(), now);
+                            let inside_backoff = engine.pass(&engine_id, consented(), now);
                             assert_eq!(
                                 inside_backoff.failure, changing,
                                 "{label}: {inside_backoff:?}"
@@ -7492,7 +7622,14 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
                     }
                 }
             };
-            assert_g_consumers(&engine, &conflict, &data, false, (40, 4, true, changing))?;
+            assert_g_consumers(
+                &engine,
+                &engine_id,
+                &conflict,
+                &data,
+                false,
+                (40, 4, true, changing),
+            )?;
             assert_eq!(
                 scalar::<i64>(&data, "SELECT dirty FROM sources")?,
                 1,
@@ -7503,7 +7640,7 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
             let mut settled = None;
             for _ in 0..24 {
                 now += 400_000;
-                let report = engine.pass(consented(), now);
+                let report = engine.pass(&engine_id, consented(), now);
                 if report.outcome == PassOutcome::Consistent {
                     settled = Some(report);
                     break;
@@ -7511,26 +7648,47 @@ fn revision_generation_tie_fault_reopen() -> TestResult {
             }
             let settled = settled.ok_or("the retry never reached a clean generation")?;
             assert_eq!(settled.failure, None, "{label}: {settled:?}");
-            assert_g_consumers(&engine, &settled, &data, false, (second, 5, false, None))?;
+            assert_g_consumers(
+                &engine,
+                &engine_id,
+                &settled,
+                &data,
+                false,
+                (second, 5, false, None),
+            )?;
             assert_eq!(
                 scalar::<i64>(&data, "SELECT dirty FROM sources")?,
                 0,
                 "{label}"
             );
-            let again = run_until_consistent(&mut engine, now + 400_000, 3);
+            let again = run_until_consistent(&mut engine, &engine_id, now + 400_000, 3);
             let again = again.last().ok_or("pass")?;
             assert_eq!(again.outcome, PassOutcome::Consistent, "{label}: {again:?}");
-            assert_g_consumers(&engine, again, &data, false, (second, 5, false, None))?;
+            assert_g_consumers(
+                &engine,
+                &engine_id,
+                again,
+                &data,
+                false,
+                (second, 5, false, None),
+            )?;
             drop(engine);
-            let mut engine = open_engine(&source, &data, &home)?;
-            let reopened = run_until_consistent(&mut engine, now + 4_000_000, 3);
+            let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+            let reopened = run_until_consistent(&mut engine, &engine_id, now + 4_000_000, 3);
             let reopened = reopened.last().ok_or("pass")?;
             assert_eq!(
                 reopened.outcome,
                 PassOutcome::Consistent,
                 "{label}: {reopened:?}"
             );
-            assert_g_consumers(&engine, reopened, &data, false, (second, 5, false, None))?;
+            assert_g_consumers(
+                &engine,
+                &engine_id,
+                reopened,
+                &data,
+                false,
+                (second, 5, false, None),
+            )?;
         }
     }
     assert_eq!(witnessed.len(), 12, "{witnessed:?}");
@@ -7561,9 +7719,9 @@ fn idle_and_busy_sources_back_off_durably_on_the_injected_clock() -> TestResult 
     writer.stop()?;
     let fs = RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = open_recording_engine(fs, &source, &data, &home)
+    let (mut engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
         .map_err(|report| format!("OpenCode engine failed: {report:?}"))?;
-    let first = engine.pass(consented(), 1_000);
+    let first = engine.pass(&engine_id, consented(), 1_000);
     assert_eq!(
         (first.outcome, first.failure),
         (PassOutcome::Unavailable, Some(FailureCode::SourceIdle))
@@ -7574,7 +7732,7 @@ fn idle_and_busy_sources_back_off_durably_on_the_injected_clock() -> TestResult 
     );
     // One millisecond before the deadline: no physical source work, the same classification.
     let before = observed.metrics();
-    let gated = engine.pass(consented(), 5_999);
+    let gated = engine.pass(&engine_id, consented(), 5_999);
     assert_eq!(
         (gated.outcome, gated.failure),
         (PassOutcome::Unavailable, Some(FailureCode::SourceIdle))
@@ -7589,10 +7747,10 @@ fn idle_and_busy_sources_back_off_durably_on_the_injected_clock() -> TestResult 
     drop(engine);
     let fs = RecordingFs::new();
     let observed = fs.clone();
-    let mut engine = open_recording_engine(fs, &source, &data, &home)
+    let (mut engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
         .map_err(|report| format!("OpenCode engine failed: {report:?}"))?;
     let before = observed.metrics();
-    let reopened = engine.pass(consented(), 5_999);
+    let reopened = engine.pass(&engine_id, consented(), 5_999);
     assert_eq!(reopened.failure, Some(FailureCode::SourceIdle));
     assert_eq!(
         observed.metrics(),
@@ -7600,7 +7758,7 @@ fn idle_and_busy_sources_back_off_durably_on_the_injected_clock() -> TestResult 
         "reopened engine honours the persisted deadline"
     );
     // At the deadline the permitted attempt happens, and the delay doubles.
-    let at = engine.pass(consented(), 6_000);
+    let at = engine.pass(&engine_id, consented(), 6_000);
     assert_eq!(at.counters.header_reads, 1, "{at:?}");
     assert_eq!(at.failure, Some(FailureCode::SourceIdle));
     assert_eq!(
@@ -7614,10 +7772,10 @@ fn idle_and_busy_sources_back_off_durably_on_the_injected_clock() -> TestResult 
     let (source, data, home) = source_roots(directory.path())?;
     let database = source.join("opencode.db");
     let mut writer = start_writer(&database)?;
-    let engine = open_engine(&source, &data, &home)?;
+    let (engine, engine_id) = open_engine(&source, &data, &home)?;
     writer.command("exclusive", "LOCKED")?;
     let (mut engine, busy) = {
-        let (engine, report) = pass_within(engine, 10_000, 5)?;
+        let (engine, report) = pass_within(engine, engine_id.clone(), 10_000, 5)?;
         (engine, report)
     };
     assert_eq!(
@@ -7631,13 +7789,13 @@ fn idle_and_busy_sources_back_off_durably_on_the_injected_clock() -> TestResult 
     writer.command("release", "RELEASED")?;
     // Leaving exclusive locking mode takes effect with the writer's next transaction.
     writer.exec("INSERT INTO records VALUES ('after-busy')")?;
-    let gated = engine.pass(consented(), 14_999);
+    let gated = engine.pass(&engine_id, consented(), 14_999);
     assert_eq!(
         (gated.failure, gated.counters),
         (Some(FailureCode::Busy), Default::default())
     );
     // Released and past the deadline: the pass reads, resets the schedule and publishes.
-    let read = engine.pass(consented(), 15_000);
+    let read = engine.pass(&engine_id, consented(), 15_000);
     assert!(read.counters.source_opens > 0, "{read:?}");
     assert_ne!(read.outcome, PassOutcome::Unavailable, "{read:?}");
     assert_eq!(
@@ -7681,8 +7839,8 @@ fn two_registered_roots_share_one_history_with_a_deterministic_owner_in_either_a
                     )),
                 )?;
             }
-            let mut engine_a = open_engine(&a, &data, &home)?;
-            let mut engine_b = open_engine(&b, &data, &home)?;
+            let (mut engine_a, engine_a_id) = open_engine(&a, &data, &home)?;
+            let (mut engine_b, engine_b_id) = open_engine(&b, &data, &home)?;
             let order: [bool; 2] = if b_first {
                 [true, false]
             } else {
@@ -7690,9 +7848,9 @@ fn two_registered_roots_share_one_history_with_a_deterministic_owner_in_either_a
             };
             for pass_b in order {
                 let reports = if pass_b {
-                    run_until_consistent(&mut engine_b, 1, 5)
+                    run_until_consistent(&mut engine_b, &engine_b_id, 1, 5)
                 } else {
-                    run_until_consistent(&mut engine_a, 1, 5)
+                    run_until_consistent(&mut engine_a, &engine_a_id, 1, 5)
                 };
                 assert_eq!(
                     reports.last().ok_or("pass")?.outcome,
@@ -7700,13 +7858,13 @@ fn two_registered_roots_share_one_history_with_a_deterministic_owner_in_either_a
                     "{name}"
                 );
             }
-            let view = |engine_a: &quotern_core::ingest::OpenCodeEngine<_>,
-                        engine_b: &quotern_core::ingest::OpenCodeEngine<_>|
+            let view = |engine_a: &quotern_core::ingest::Engine<_>,
+                        engine_b: &quotern_core::ingest::Engine<_>|
              -> TestResult<CrossRootView> {
                 let events: i64 = scalar(&data, "SELECT COUNT(*) FROM usage_events")?;
-                let observed: Vec<_> = [engine_a, engine_b]
+                let observed: Vec<_> = [(engine_a, &engine_a_id), (engine_b, &engine_b_id)]
                     .into_iter()
-                    .flat_map(|engine| engine.observations().expect("page"))
+                    .flat_map(|(engine, id)| engine.observations(id).expect("page"))
                     .map(|record| (record.input.value, record.mirror_conflict))
                     .collect();
                 let report = PassReport::unavailable(FailureCode::Store, Default::default());
@@ -7714,8 +7872,8 @@ fn two_registered_roots_share_one_history_with_a_deterministic_owner_in_either_a
                     events,
                     observed,
                     [
-                        engine_a.snapshot(&report)?.projection.records,
-                        engine_b.snapshot(&report)?.projection.records,
+                        engine_a.snapshot(&engine_a_id, &report)?.projection.records,
+                        engine_b.snapshot(&engine_b_id, &report)?.projection.records,
                     ],
                 ))
             };
@@ -7733,8 +7891,8 @@ fn two_registered_roots_share_one_history_with_a_deterministic_owner_in_either_a
             );
             // A reopen of both engines changes nothing.
             drop((engine_a, engine_b));
-            let engine_a = open_engine(&a, &data, &home)?;
-            let engine_b = open_engine(&b, &data, &home)?;
+            let (engine_a, _engine_a_id) = open_engine(&a, &data, &home)?;
+            let (engine_b, _engine_b_id) = open_engine(&b, &data, &home)?;
             assert_eq!(view(&engine_a, &engine_b)?, seen, "{name}: reopen");
             outcomes.push(seen);
         }
@@ -7778,14 +7936,14 @@ fn every_sidecar_identity_change_during_acquisition_publishes_nothing_and_backs_
             }
         });
         let observed = fs.clone();
-        let mut engine = open_recording_engine(fs, &source, &data, &home)
+        let (mut engine, engine_id) = open_recording_engine(fs, &source, &data, &home)
             .map_err(|report| format!("OpenCode engine failed: {report:?}"))?;
-        let baseline = engine.pass(consented(), 1);
+        let baseline = engine.pass(&engine_id, consented(), 1);
         assert_eq!(baseline.outcome, PassOutcome::Consistent, "{baseline:?}");
-        assert_eq!(engine.observations()?.len(), 1);
+        assert_eq!(engine.observations(&engine_id)?.len(), 1);
         c_update(&database, 6)?;
         armed.store(true, Ordering::SeqCst);
-        let changed = engine.pass(consented(), 100);
+        let changed = engine.pass(&engine_id, consented(), 100);
         armed.store(false, Ordering::SeqCst);
         let label = format!("{suffix}: {changed:?}");
         assert_eq!(
@@ -7794,7 +7952,7 @@ fn every_sidecar_identity_change_during_acquisition_publishes_nothing_and_backs_
             "{label}"
         );
         assert_ne!(changed.outcome, PassOutcome::Consistent, "{label}");
-        let records = engine.observations()?;
+        let records = engine.observations(&engine_id)?;
         assert_eq!(
             find(&records, "m").input.value,
             Some(5),
@@ -7810,18 +7968,18 @@ fn every_sidecar_identity_change_during_acquisition_publishes_nothing_and_backs_
         // At deadline - 1 nothing is read; after the sidecar settles and the deadline passes the
         // new value is published and the schedule resets.
         let before = observed.metrics();
-        let gated = engine.pass(consented(), 5_099);
+        let gated = engine.pass(&engine_id, consented(), 5_099);
         assert_eq!(observed.metrics(), before, "{label}: no physical work");
         assert_eq!(gated.failure, Some(FailureCode::SourceChanging));
         let _ = std::fs::remove_file(format!("{}{suffix}", database.display()));
-        let settled = run_until_consistent(&mut engine, 5_100, 4);
+        let settled = run_until_consistent(&mut engine, &engine_id, 5_100, 4);
         assert_eq!(
             settled.last().ok_or("pass")?.outcome,
             PassOutcome::Consistent,
             "{label}: {settled:?}"
         );
         assert_eq!(
-            find(&engine.observations()?, "m").input.value,
+            find(&engine.observations(&engine_id)?, "m").input.value,
             Some(6),
             "{label}"
         );
@@ -7909,9 +8067,9 @@ fn raw_json_files_malformed_nested_or_oversized_are_rejected_without_hurting_val
         let target = source.join("storage/message/sj/target.json");
         std::fs::write(&target, &bytes)?;
         let before = file_tree_image(&source)?;
-        let mut engine = open_engine(&source, &data, &home)?;
-        let first = engine.pass(consented(), 1);
-        let records = engine.observations()?;
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+        let first = engine.pass(&engine_id, consented(), 1);
+        let records = engine.observations(&engine_id)?;
         assert_eq!(
             find(&records, "ok").input.value,
             Some(1),
@@ -7933,7 +8091,11 @@ fn raw_json_files_malformed_nested_or_oversized_are_rejected_without_hurting_val
                     records.iter().all(|record| record.message_id != "target"),
                     "{name}"
                 );
-                assert_eq!(engine.snapshot(&first)?.projection.records, 1, "{name}");
+                assert_eq!(
+                    engine.snapshot(&engine_id, &first)?.projection.records,
+                    1,
+                    "{name}"
+                );
             }
         }
         assert_eq!(
@@ -7963,9 +8125,9 @@ fn raw_json_files_malformed_nested_or_oversized_are_rejected_without_hurting_val
         let target = source.join("storage/part/m/p2.json");
         std::fs::write(&target, &bytes)?;
         let before = file_tree_image(&source)?;
-        let mut engine = open_engine(&source, &data, &home)?;
-        let first = engine.pass(consented(), 1);
-        let records = engine.observations()?;
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+        let first = engine.pass(&engine_id, consented(), 1);
+        let records = engine.observations(&engine_id)?;
         match expected {
             None => {
                 assert_eq!(
@@ -8034,9 +8196,9 @@ fn raw_sqlite_payloads_malformed_nested_or_oversized_are_rejected_in_both_layout
             }
             drop(c);
             let before = source_image(&database)?;
-            let mut engine = open_engine(&source, &data, &home)?;
-            let first = engine.pass(consented(), 1);
-            let records = engine.observations()?;
+            let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+            let first = engine.pass(&engine_id, consented(), 1);
+            let records = engine.observations(&engine_id)?;
             let label = format!("{layout} {name}");
             assert_eq!(find(&records, "ok").input.value, Some(1), "{label}");
             match expected {
@@ -8198,8 +8360,8 @@ fn the_maintained_projection_equals_an_independent_recount_through_revisions_and
         T0 + 1,
         Some(counts(Some(3), Some(0), Some(0), Some(0), Some(0), Some(3))),
     )?;
-    let mut engine_b = open_engine(&b, &data, &home)?;
-    run_until_consistent(&mut engine_b, 1, 5);
+    let (mut engine_b, engine_b_id) = open_engine(&b, &data, &home)?;
+    run_until_consistent(&mut engine_b, &engine_b_id, 1, 5);
     write_json_message(
         &a,
         "sj",
@@ -8207,8 +8369,8 @@ fn the_maintained_projection_equals_an_independent_recount_through_revisions_and
         T0,
         Some(counts(Some(7), Some(1), Some(0), Some(0), Some(0), None)),
     )?;
-    let mut engine_a = open_engine(&a, &data, &home)?;
-    run_until_consistent(&mut engine_a, 1, 5);
+    let (mut engine_a, engine_a_id) = open_engine(&a, &data, &home)?;
+    run_until_consistent(&mut engine_a, &engine_a_id, 1, 5);
     write_json_message(
         &b,
         "sj",
@@ -8216,7 +8378,7 @@ fn the_maintained_projection_equals_an_independent_recount_through_revisions_and
         T0 + 1,
         Some(counts(Some(4), Some(0), Some(0), Some(0), Some(0), Some(4))),
     )?;
-    run_until_consistent(&mut engine_b, 1_000_000, 5);
+    run_until_consistent(&mut engine_b, &engine_b_id, 1_000_000, 5);
     let report = PassReport::unavailable(FailureCode::Store, Default::default());
     type Recount = (i64, Option<i64>, i64, Option<i64>, i64, Option<i64>, i64);
     let recount = |source_id: &str| -> TestResult<Recount> {
@@ -8227,8 +8389,8 @@ fn the_maintained_projection_equals_an_independent_recount_through_revisions_and
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         )?)
     };
-    for engine in [&engine_a, &engine_b] {
-        let snapshot = engine.snapshot(&report)?;
+    for (engine, id) in [(&engine_a, &engine_a_id), (&engine_b, &engine_b_id)] {
+        let snapshot = engine.snapshot(id, &report)?;
         let (records, input, input_count, output, total_count, total, derived) =
             recount(&snapshot.source_id)?;
         let projection = snapshot.projection;
@@ -8250,8 +8412,8 @@ fn the_maintained_projection_equals_an_independent_recount_through_revisions_and
         );
     }
     let (a_owned, b_owned) = (
-        engine_a.snapshot(&report)?.projection.records,
-        engine_b.snapshot(&report)?.projection.records,
+        engine_a.snapshot(&engine_a_id, &report)?.projection.records,
+        engine_b.snapshot(&engine_b_id, &report)?.projection.records,
     );
     assert_eq!(
         (a_owned, b_owned),
@@ -8259,7 +8421,14 @@ fn the_maintained_projection_equals_an_independent_recount_through_revisions_and
         "root-a took the shared record; root-b kept only-b"
     );
     // The revision of only-b reached the maintained numbers exactly once.
-    assert_eq!(engine_b.snapshot(&report)?.projection.input.value, Some(4));
+    assert_eq!(
+        engine_b
+            .snapshot(&engine_b_id, &report)?
+            .projection
+            .input
+            .value,
+        Some(4)
+    );
     Ok(())
 }
 
@@ -8326,19 +8495,19 @@ fn iterator_errors_and_every_physical_metadata_operation_are_charged_to_the_pass
         T0,
         Some(counts(Some(1), None, None, None, None, None)),
     )?;
-    let mut engine = quotern_core::ingest::OpenCodeEngine::open(
-        FailingListing,
-        &source,
-        &data,
-        &home,
-        quotern_core::domain::SourceAuthorization {
-            selected: true,
-            consent: quotern_core::domain::ConsentState::Enabled,
-        },
-        quotern_core::domain::SourceKind::Custom,
-    )
-    .map_err(|report| format!("open failed: {report:?}"))?;
-    let report = engine.pass(consented(), 1);
+    let mut engine = quotern_core::ingest::Engine::open(&data, &home);
+    let engine_id = engine
+        .attach_opencode(
+            FailingListing,
+            &source,
+            quotern_core::domain::SourceAuthorization {
+                selected: true,
+                consent: quotern_core::domain::ConsentState::Enabled,
+            },
+            quotern_core::domain::SourceKind::Custom,
+        )
+        .map_err(|report| format!("open failed: {report:?}"))?;
+    let report = engine.pass(&engine_id, consented(), 1);
     // Every directory listing yields exactly one error: it is an entry, not free work.
     assert!(report.counters.entries >= 1, "{report:?}");
     assert_eq!(report.failure, Some(FailureCode::Io), "{report:?}");
@@ -8361,9 +8530,9 @@ fn iterator_errors_and_every_physical_metadata_operation_are_charged_to_the_pass
         )?;
         (d, (s, da), h)
     };
-    let mut engine = open_engine(&real_data.0, &real_data.1, &real_home)?;
+    let (mut engine, engine_id) = open_engine(&real_data.0, &real_data.1, &real_home)?;
     let before = physical_operations();
-    let report = engine.pass(consented(), 1);
+    let report = engine.pass(&engine_id, consented(), 1);
     let physical = physical_operations().metadata - before.metadata;
     assert_eq!(
         u64::from(report.counters.stat_calls),
@@ -8397,7 +8566,7 @@ fn source_database_swapped_at_the_instant_of_open_is_refused_not_read_or_waited_
                 let parked = directory.path().canonicalize()?.join("parked.db");
                 let (hook_target, hook_outside) = (target.clone(), outside.clone());
                 let fired = std::cell::Cell::new(false);
-                set_open_hook(Some(Box::new(move |path| {
+                set_open_hook(Some(Box::new(move |path, _flags| {
                     if path == hook_target && !fired.replace(true) {
                         std::fs::rename(&hook_target, &parked).expect("park the database");
                         if mode == "fifo" {
@@ -8411,10 +8580,10 @@ fn source_database_swapped_at_the_instant_of_open_is_refused_not_read_or_waited_
                         }
                     }
                 })));
-                let mut engine = open_engine(&source, &data, &home)?;
-                let report = engine.pass(consented(), 1);
+                let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+                let report = engine.pass(&engine_id, consented(), 1);
                 set_open_hook(None);
-                let projection = engine.snapshot(&report)?.projection;
+                let projection = engine.snapshot(&engine_id, &report)?.projection;
                 let untouched = mode == "fifo" || std::fs::read(&target)? == outside_bytes;
                 Ok((
                     report.outcome,
@@ -8455,20 +8624,35 @@ fn store_database_swapped_at_the_instant_of_open_is_refused_before_any_write() -
     let database = data.join("history.sqlite");
     let parked = base.join("parked.sqlite");
     let (hook_database, hook_external) = (database.clone(), external.clone());
-    let seen = std::cell::Cell::new(0_u32);
-    // The first by-name open of the store is the read-only admission view; the second is the
-    // writable open, which is where the path becomes a hard-link alias of an external file.
-    set_open_hook(Some(Box::new(move |path| {
-        if path == hook_database {
-            seen.set(seen.get() + 1);
-            if seen.get() == 2 {
+    // The ordinary preflight reads the store through read-only views before it opens it
+    // writable. The swap therefore happens at the first open that requests a writable access
+    // mode (a one-shot latch), which is where the path becomes a hard-link alias of an external
+    // file; the read-only opens before it are counted and left unswapped.
+    const O_ACCMODE: std::ffi::c_int = 3;
+    const O_RDONLY: std::ffi::c_int = 0;
+    let latched = std::cell::Cell::new(false);
+    let writable_reached = std::rc::Rc::new(std::cell::Cell::new(false));
+    let read_only_before = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+    let (hook_reached, hook_before) = (
+        std::rc::Rc::clone(&writable_reached),
+        std::rc::Rc::clone(&read_only_before),
+    );
+    set_open_hook(Some(Box::new(move |path, flags| {
+        if path == hook_database && !latched.get() {
+            if flags & O_ACCMODE != O_RDONLY {
+                latched.set(true);
+                hook_reached.set(true);
                 std::fs::rename(&hook_database, &parked).expect("park");
                 std::fs::hard_link(&hook_external, &hook_database).expect("alias");
+            } else {
+                hook_before.set(hook_before.get() + 1);
             }
         }
     })));
     let result = Store::open(&data);
     set_open_hook(None);
+    assert!(writable_reached.get());
+    assert!(read_only_before.get() >= 1);
     assert_eq!(result.err(), Some(StoreError::UnsafeFile));
     assert_eq!(
         std::fs::read(&external)?,
@@ -8571,13 +8755,14 @@ fn assert_complete_store(data: &Path) -> TestResult {
 /// from its five components plus one JSON message with an explicit total that disagrees with its
 /// components. Every expected number is written here, never taken from the producer.
 fn assert_fresh_v1_consumers<F: quotern_core::ingest::fs::SourceFs>(
-    engine: &OpenCodeEngine<F>,
+    engine: &Engine<F>,
+    engine_id: &str,
     report: &PassReport,
     data: &Path,
     source: &Path,
 ) -> TestResult {
     use quotern_core::snapshot::{ObservationPage, SourceSnapshot};
-    let encoded_snapshot = serde_json::to_vec(&engine.snapshot(report)?)?;
+    let encoded_snapshot = serde_json::to_vec(&engine.snapshot(engine_id, report)?)?;
     let snapshot = SourceSnapshot::decode(&encoded_snapshot)?;
     // The envelope (outcome, failure, identity, freshness, counters) is compared with literals,
     // with the actual report and with the durable rows read by plain SQL, never with itself.
@@ -8660,16 +8845,20 @@ fn assert_fresh_v1_consumers<F: quotern_core::ingest::fs::SourceFs>(
             "pending_partial": false
         })
     );
-    let first = ObservationPage::decode(&serde_json::to_vec(&engine.observations_page(None, 1)?)?)?;
+    let first = ObservationPage::decode(&serde_json::to_vec(
+        &engine.observations_page(engine_id, None, 1)?,
+    )?)?;
     assert_eq!(first.observations.len(), 1);
     let cursor = first.next.as_ref().ok_or("missing first-page cursor")?;
     assert_eq!(
         (cursor.occurred_at_ms, cursor.record_id.as_str()),
         (T0, "opencode:1:s:7:derived")
     );
-    let second = ObservationPage::decode(&serde_json::to_vec(
-        &engine.observations_page(Some(cursor), 1)?,
-    )?)?;
+    let second = ObservationPage::decode(&serde_json::to_vec(&engine.observations_page(
+        engine_id,
+        Some(cursor),
+        1,
+    )?)?)?;
     assert_eq!(second.observations.len(), 1);
     assert_eq!(second.next, None);
     for (record, message, record_id, at, numbers, provenance, convention, acquisition, mismatch) in [
@@ -8726,7 +8915,7 @@ fn assert_fresh_v1_consumers<F: quotern_core::ingest::fs::SourceFs>(
         assert_eq!(encoded["revision"], json!(1));
     }
     assert_eq!(
-        engine.observations()?,
+        engine.observations(engine_id)?,
         vec![
             first.observations[0].clone(),
             second.observations[0].clone()
@@ -8894,10 +9083,10 @@ fn fresh_schema_child_entrypoint() -> TestResult {
             panic!("creation hook was not reached: {:?}", result.err());
         }
         "retry" => {
-            let mut engine = open_engine(&source, &data, &home)?;
+            let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
             assert_eq!(schema_state(&history(&data)?)?, (1, complete_v1_objects()));
-            assert!(engine.observations()?.is_empty());
-            let reports = run_until_consistent(&mut engine, T0 + 100, 6);
+            assert!(engine.observations(&engine_id)?.is_empty());
+            let reports = run_until_consistent(&mut engine, &engine_id, T0 + 100, 6);
             let last = reports.last().ok_or("no pass ran")?;
             assert_eq!(
                 (last.outcome, last.failure),
@@ -8905,25 +9094,25 @@ fn fresh_schema_child_entrypoint() -> TestResult {
                 "{reports:?}"
             );
             assert!(last.last_good_ms.is_some(), "{last:?}");
-            assert_fresh_v1_consumers(&engine, last, &data, &source)?;
+            assert_fresh_v1_consumers(&engine, &engine_id, last, &data, &source)?;
             std::fs::write(&saved, serde_json::to_vec(last)?)?;
             drop(engine);
         }
         "reopen" => {
             let before: PassReport = serde_json::from_slice(&std::fs::read(&saved)?)?;
-            let mut engine = open_engine(&source, &data, &home)?;
+            let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
             // Before any pass: the retained history alone must already satisfy every oracle.
             assert_eq!(schema_state(&history(&data)?)?, (1, complete_v1_objects()));
-            assert_fresh_v1_consumers(&engine, &before, &data, &source)?;
+            assert_fresh_v1_consumers(&engine, &engine_id, &before, &data, &source)?;
             assert_fresh_v1_durable(&data, &source, before.last_good_ms)?;
-            let reports = run_until_consistent(&mut engine, T0 + 1_000, 6);
+            let reports = run_until_consistent(&mut engine, &engine_id, T0 + 1_000, 6);
             let last = reports.last().ok_or("no pass ran")?;
             assert_eq!(
                 (last.outcome, last.failure),
                 (PassOutcome::Consistent, None),
                 "{reports:?}"
             );
-            assert_fresh_v1_consumers(&engine, last, &data, &source)?;
+            assert_fresh_v1_consumers(&engine, &engine_id, last, &data, &source)?;
             std::fs::write(
                 base.join("fresh-schema-report-reopen.json"),
                 serde_json::to_vec(last)?,
@@ -9214,8 +9403,8 @@ fn durable_range_cursor_algebra_and_spool_presence_fail_with_their_promised_erro
         T0,
         Some(counts(Some(1), Some(1), Some(1), Some(1), Some(1), None)),
     )?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let reports = run_until_consistent(&mut engine, 1, 6);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let reports = run_until_consistent(&mut engine, &engine_id, 1, 6);
     let report = reports.last().ok_or("pass")?;
     assert_eq!(report.outcome, PassOutcome::Consistent);
     // Observation cursor: a canonical tuple seeks; every malformed tuple is InvalidStoredValue.
@@ -9225,7 +9414,7 @@ fn durable_range_cursor_algebra_and_spool_presence_fail_with_their_promised_erro
     };
     assert!(
         engine
-            .observations_page(Some(&cursor("opencode:1:s:1:m")), 10)
+            .observations_page(&engine_id, Some(&cursor("opencode:1:s:1:m")), 10)
             .is_ok()
     );
     for bad in [
@@ -9236,7 +9425,9 @@ fn durable_range_cursor_algebra_and_spool_presence_fail_with_their_promised_erro
         "opencode:x:s:1:m",
     ] {
         assert_eq!(
-            engine.observations_page(Some(&cursor(bad)), 10).err(),
+            engine
+                .observations_page(&engine_id, Some(&cursor(bad)), 10)
+                .err(),
             Some(StoreError::InvalidStoredValue),
             "{bad}"
         );
@@ -9245,7 +9436,7 @@ fn durable_range_cursor_algebra_and_spool_presence_fail_with_their_promised_erro
     let writer = Connection::open(data.join("history.sqlite"))?;
     writer.execute("UPDATE usage_events SET input_tokens = 1000000000001", [])?;
     assert_eq!(
-        engine.observations().err(),
+        engine.observations(&engine_id).err(),
         Some(StoreError::CountOutOfRange)
     );
     writer.execute("UPDATE usage_events SET input_tokens = 1", [])?;
@@ -9254,17 +9445,21 @@ fn durable_range_cursor_algebra_and_spool_presence_fail_with_their_promised_erro
         [],
     )?;
     assert_eq!(
-        engine.observations().err(),
+        engine.observations(&engine_id).err(),
         Some(StoreError::InvalidStoredValue)
     );
     writer.execute("UPDATE usage_events SET occurred_at_ms = ?1", [T0])?;
-    assert_eq!(engine.observations()?.len(), 1, "restored rows read back");
+    assert_eq!(
+        engine.observations(&engine_id)?.len(),
+        1,
+        "restored rows read back"
+    );
     writer.execute(
         "UPDATE source_projection_totals SET sqlite_count = 0, json_count = 0",
         [],
     )?;
     assert_eq!(
-        engine.snapshot(report).err(),
+        engine.snapshot(&engine_id, report).err(),
         Some(StoreError::InvalidStoredValue)
     );
     writer.execute(
@@ -9272,7 +9467,7 @@ fn durable_range_cursor_algebra_and_spool_presence_fail_with_their_promised_erro
         [],
     )?;
     assert!(
-        engine.snapshot(report).is_ok(),
+        engine.snapshot(&engine_id, report).is_ok(),
         "a coherent algebra projects"
     );
     Ok(())
@@ -9285,10 +9480,10 @@ fn staged_candidate_missing_a_required_nullable_key_makes_the_pass_unavailable_w
     let directory = tempdir()?;
     let (source, data, home) = source_roots(directory.path())?;
     let _c = bulk_legacy(&source.join("opencode.db"), 5_001, 1)?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let first = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let first = engine.pass(&engine_id, consented(), 1);
     assert_eq!(first.outcome, PassOutcome::CatchingUp);
-    let records = engine.snapshot(&first)?.projection.records;
+    let records = engine.snapshot(&engine_id, &first)?.projection.records;
     // Removing the key (not nulling it) must be a decode failure, never an implicit None.
     let writer = Connection::open(data.join("history.sqlite"))?;
     let touched = writer.execute(
@@ -9298,7 +9493,7 @@ fn staged_candidate_missing_a_required_nullable_key_makes_the_pass_unavailable_w
     assert!(touched > 0);
     let mut unavailable = None;
     for step in 0..6 {
-        let report = engine.pass(consented(), 2 + step);
+        let report = engine.pass(&engine_id, consented(), 2 + step);
         if report.outcome == PassOutcome::Unavailable {
             unavailable = Some(report);
             break;
@@ -9312,7 +9507,7 @@ fn staged_candidate_missing_a_required_nullable_key_makes_the_pass_unavailable_w
     );
     assert_eq!(report.last_good_ms, Some(1), "last-good is retained");
     assert_eq!(
-        engine.snapshot(&report)?.projection.records,
+        engine.snapshot(&engine_id, &report)?.projection.records,
         records,
         "history retained"
     );
@@ -9356,10 +9551,10 @@ fn a_part_group_changed_between_passes_is_never_published_under_a_stale_label() 
         insert_part("z-2".to_owned(), finish(60)?)?;
         tx.commit()?;
         drop(c);
-        let mut engine = open_engine(&source, &data, &home)?;
-        let first = engine.pass(consented(), 1);
+        let (mut engine, mut engine_id) = open_engine(&source, &data, &home)?;
+        let first = engine.pass(&engine_id, consented(), 1);
         assert_eq!(first.outcome, PassOutcome::CatchingUp, "{first:?}");
-        assert_eq!(engine.snapshot(&first)?.projection.records, 0);
+        assert_eq!(engine.snapshot(&engine_id, &first)?.projection.records, 0);
         // A step-finish part appears behind the suspension point between the two passes.
         let writer = Connection::open(&path)?;
         writer.execute(
@@ -9369,12 +9564,12 @@ fn a_part_group_changed_between_passes_is_never_published_under_a_stale_label() 
         drop(writer);
         if reopen {
             drop(engine);
-            engine = open_engine(&source, &data, &home)?;
+            (engine, engine_id) = open_engine(&source, &data, &home)?;
         }
         let mut last = None;
         for step in 0..12 {
-            let report = engine.pass(consented(), 2 + step);
-            let projection = engine.snapshot(&report)?.projection;
+            let report = engine.pass(&engine_id, consented(), 2 + step);
+            let projection = engine.snapshot(&engine_id, &report)?.projection;
             assert!(
                 matches!(projection.input.value, None | Some(105)),
                 "reopen={reopen}: published {:?} (stale 100 would mean a mixed group)",
@@ -9393,7 +9588,7 @@ fn a_part_group_changed_between_passes_is_never_published_under_a_stale_label() 
             "reopen={reopen}: {last:?}"
         );
         assert_eq!(
-            engine.snapshot(&last)?.projection.input.value,
+            engine.snapshot(&engine_id, &last)?.projection.input.value,
             Some(105),
             "reopen={reopen}"
         );
@@ -9418,11 +9613,11 @@ fn more_than_1024_completed_databases_drain_to_an_exact_terminal_publication() -
             rusqlite::params![id, session],
         )?;
     }
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
     let mut peak_completed = 0_i64;
     let mut last = None;
     for step in 0..80 {
-        let report = engine.pass(consented(), 1 + step);
+        let report = engine.pass(&engine_id, consented(), 1 + step);
         let completed: i64 = scalar(
             &data,
             "SELECT COUNT(*) FROM metadata_spool WHERE parser_kind = 'sqlite'",
@@ -9440,7 +9635,7 @@ fn more_than_1024_completed_databases_drain_to_an_exact_terminal_publication() -
         peak_completed > 1_024,
         "the generation really held {peak_completed} databases"
     );
-    let projection = engine.snapshot(&last)?.projection;
+    let projection = engine.snapshot(&engine_id, &last)?.projection;
     assert_eq!(
         (projection.records, projection.input.value),
         (1_100, Some(1_100))
@@ -9465,7 +9660,7 @@ fn json_group_of_more_than_40000_raw_parts_drains_across_one_reopen_to_exact_num
         "z-finish",
         &step_finish(counts(Some(7), None, None, None, None, None)),
     )?;
-    let mut engine = open_engine(&source, &data, &home)?;
+    let (mut engine, mut engine_id) = open_engine(&source, &data, &home)?;
     let mut finished = None;
     for pass in 0..160_i64 {
         if pass == 3 {
@@ -9488,9 +9683,9 @@ fn json_group_of_more_than_40000_raw_parts_drains_across_one_reopen_to_exact_num
             // One restart in the middle: unfinished iterator state is reconstructed from the
             // beginning, completed durable state is kept.
             drop(engine);
-            engine = open_engine(&source, &data, &home)?;
+            (engine, engine_id) = open_engine(&source, &data, &home)?;
         }
-        let report = engine.pass(consented(), 1 + pass);
+        let report = engine.pass(&engine_id, consented(), 1 + pass);
         assert!(
             report.counters.stat_calls <= 40_000,
             "pass {pass}: {report:?}"
@@ -9510,7 +9705,7 @@ fn json_group_of_more_than_40000_raw_parts_drains_across_one_reopen_to_exact_num
             usize::try_from(queued)? <= quotern_core::limits::MAX_FRONTIER_DIRECTORIES,
             "pass {pass}: {queued} persisted frontier directories"
         );
-        let projection = engine.snapshot(&report)?.projection;
+        let projection = engine.snapshot(&engine_id, &report)?.projection;
         if report.outcome == PassOutcome::Consistent {
             assert!(report.last_good_ms.is_some(), "pass {pass}: {report:?}");
             finished = Some(projection);
@@ -9551,12 +9746,12 @@ fn unfinished_json_parts_reopen_without_advancing_last_good() -> TestResult {
         let tokens = counts(Some(input), None, None, None, None, None);
         write_json_part(&source, "g", id, &step_finish(tokens))?;
     }
-    let mut engine = open_engine(&source, &data, &home)?;
-    let baseline = engine.pass(consented(), 1);
+    let (mut engine, mut engine_id) = open_engine(&source, &data, &home)?;
+    let baseline = engine.pass(&engine_id, consented(), 1);
     assert_eq!(baseline.outcome, PassOutcome::Consistent, "{baseline:?}");
     let baseline_good = baseline.last_good_ms;
     assert!(baseline_good.is_some(), "{baseline:?}");
-    let published = group_state(&engine, "g")?;
+    let published = group_state(&engine, &engine_id, "g")?;
     assert_eq!(
         (published.0, published.1, published.2),
         (Some(100), 1, false)
@@ -9575,7 +9770,7 @@ fn unfinished_json_parts_reopen_without_advancing_last_good() -> TestResult {
     let mut incomplete_after_reopen = 0;
     let mut finished = None;
     for step in 0..60_i64 {
-        let report = engine.pass(consented(), 2 + step);
+        let report = engine.pass(&engine_id, consented(), 2 + step);
         assert!(report.counters.entries <= 20_000, "step {step}: {report:?}");
         if report.outcome == PassOutcome::Consistent {
             finished = Some(report);
@@ -9594,8 +9789,12 @@ fn unfinished_json_parts_reopen_without_advancing_last_good() -> TestResult {
             baseline_good,
             "step {step}: durable last-good"
         );
-        assert_eq!(group_state(&engine, "g")?, published, "step {step}");
-        let projection = engine.snapshot(&report)?.projection;
+        assert_eq!(
+            group_state(&engine, &engine_id, "g")?,
+            published,
+            "step {step}"
+        );
+        let projection = engine.snapshot(&engine_id, &report)?.projection;
         assert_eq!(
             (projection.records, projection.input.value),
             (1, Some(100)),
@@ -9607,7 +9806,7 @@ fn unfinished_json_parts_reopen_without_advancing_last_good() -> TestResult {
         } else {
             // One restart in the middle of the unfinished scan.
             drop(engine);
-            engine = open_engine(&source, &data, &home)?;
+            (engine, engine_id) = open_engine(&source, &data, &home)?;
             reopened = true;
         }
     }
@@ -9618,7 +9817,7 @@ fn unfinished_json_parts_reopen_without_advancing_last_good() -> TestResult {
         "the restarted scan finished in its first pass"
     );
     assert!(finished.last_good_ms > baseline_good, "{finished:?}");
-    let settled = group_state(&engine, "g")?;
+    let settled = group_state(&engine, &engine_id, "g")?;
     assert_eq!(
         (settled.0, settled.1, settled.2),
         (Some(40), 2, false),
@@ -9626,9 +9825,13 @@ fn unfinished_json_parts_reopen_without_advancing_last_good() -> TestResult {
     );
     assert_eq!(settled.4, published.4);
     assert_eq!(scalar::<i64>(&data, "SELECT dirty FROM sources")?, 0);
-    let again = run_until_consistent(&mut engine, 1_000_000, 3);
+    let again = run_until_consistent(&mut engine, &engine_id, 1_000_000, 3);
     assert_eq!(again.last().ok_or("pass")?.outcome, PassOutcome::Consistent);
-    assert_eq!(group_state(&engine, "g")?, settled, "stable reacquisition");
+    assert_eq!(
+        group_state(&engine, &engine_id, "g")?,
+        settled,
+        "stable reacquisition"
+    );
     Ok(())
 }
 
@@ -9769,16 +9972,17 @@ fn open_eof_engine(
     source: &Path,
     data: &Path,
     home: &Path,
-) -> TestResult<OpenCodeEngine<EofFs>> {
-    OpenCodeEngine::open(
-        fs.clone(),
-        source,
-        data,
-        home,
-        consented(),
-        quotern_core::domain::SourceKind::Custom,
-    )
-    .map_err(|report| format!("OpenCode engine failed: {report:?}").into())
+) -> TestResult<(Engine<EofFs>, String)> {
+    let mut engine = Engine::open(data, home);
+    let source_id = engine
+        .attach_opencode(
+            fs.clone(),
+            source,
+            consented(),
+            quotern_core::domain::SourceKind::Custom,
+        )
+        .map_err(|report| format!("OpenCode engine failed: {report:?}"))?;
+    Ok((engine, source_id))
 }
 
 /// `root` and every directory below it, read independently of the engine.
@@ -9989,7 +10193,8 @@ use quotern_core::domain::PassCounters;
 /// `meter` adds the native observation of the same pass, which reads none of the production
 /// counters.
 fn bounded_pass<F: quotern_core::ingest::fs::SourceFs>(
-    engine: &mut OpenCodeEngine<F>,
+    engine: &mut Engine<F>,
+    engine_id: &str,
     recording: &RecordingFs,
     meter: &native::Meter,
     now_ms: i64,
@@ -9998,7 +10203,7 @@ fn bounded_pass<F: quotern_core::ingest::fs::SourceFs>(
     use quotern_core::ingest::fs::physical_operations;
     let (physical, metrics) = (physical_operations(), recording.metrics());
     meter.begin();
-    let report = engine.pass(consented(), now_ms);
+    let report = engine.pass(engine_id, consented(), now_ms);
     let after = physical_operations();
     let (metadata, opens, yields, requested) = (
         after.metadata - physical.metadata,
@@ -10088,16 +10293,16 @@ fn queue_ceiling_inventory() -> TestResult {
     for reopen in [false, true] {
         let data = directory.path().join(format!("data-{reopen}"));
         let fs = EofFs::new();
-        let mut engine = open_eof_engine(&fs, &source, &data, &home)?;
+        let (mut engine, mut engine_id) = open_eof_engine(&fs, &source, &data, &home)?;
         let mut saturated_at = None;
         let mut finished = None;
         for pass in 0..800_i64 {
             if reopen && saturated_at.is_some_and(|at| pass == at + 2) {
                 drop(engine);
-                engine = open_eof_engine(&fs, &source, &data, &home)?;
+                (engine, engine_id) = open_eof_engine(&fs, &source, &data, &home)?;
             }
             let label = format!("reopen={reopen} pass {pass}");
-            let report = bounded_pass(&mut engine, &fs.inner, &meter, 1 + pass, &label);
+            let report = bounded_pass(&mut engine, &engine_id, &fs.inner, &meter, 1 + pass, &label);
             let queued: i64 = scalar(&data, "SELECT COUNT(*) FROM frontier_directories")?;
             assert!(
                 queued <= 4_096,
@@ -10106,7 +10311,7 @@ fn queue_ceiling_inventory() -> TestResult {
             if report.failure == Some(FailureCode::LimitExceeded) && queued == 4_096 {
                 saturated_at.get_or_insert(pass);
             }
-            let projection = engine.snapshot(&report)?.projection;
+            let projection = engine.snapshot(&engine_id, &report)?.projection;
             if report.outcome == PassOutcome::Consistent {
                 // No Consistent report before every directory of the fixture reached its end.
                 assert_eq!(
@@ -10176,13 +10381,14 @@ fn current_lane_refresh() -> TestResult {
     let expected_directories = directory_set(&source)?;
     let meter = native::Meter::arm(&source);
     let fs = EofFs::new();
-    let mut engine = open_eof_engine(&fs, &source, &data, &home)?;
+    let (mut engine, mut engine_id) = open_eof_engine(&fs, &source, &data, &home)?;
     let mut baseline = None;
     let mut baseline_time = 0;
     for pass in 0..400_i64 {
         baseline_time = 1 + pass;
         let report = bounded_pass(
             &mut engine,
+            &engine_id,
             &fs.inner,
             &meter,
             baseline_time,
@@ -10200,7 +10406,7 @@ fn current_lane_refresh() -> TestResult {
     // The terminal pass publishes at exactly its own injected time.
     let baseline_good = baseline.last_good_ms;
     assert_eq!(baseline_good, Some(baseline_time), "{baseline:?}");
-    let published = engine.snapshot(&baseline)?.projection;
+    let published = engine.snapshot(&engine_id, &baseline)?.projection;
     assert_eq!(
         (
             published.records,
@@ -10241,11 +10447,18 @@ fn current_lane_refresh() -> TestResult {
                 "SELECT COUNT(*) FROM frontier_directories WHERE restart_blocked = 1",
             )?;
             drop(engine);
-            engine = open_eof_engine(&fs, &source, &data, &home)?;
+            (engine, engine_id) = open_eof_engine(&fs, &source, &data, &home)?;
         }
         let label = format!("refresh {pass}");
-        let report = bounded_pass(&mut engine, &fs.inner, &meter, 1_000 + pass, &label);
-        let projection = engine.snapshot(&report)?.projection;
+        let report = bounded_pass(
+            &mut engine,
+            &engine_id,
+            &fs.inner,
+            &meter,
+            1_000 + pass,
+            &label,
+        );
+        let projection = engine.snapshot(&engine_id, &report)?.projection;
         // Every pass, terminal one included, still exposes the retained history exactly.
         assert_eq!(
             (
@@ -10339,14 +10552,14 @@ fn current_lane_refresh() -> TestResult {
     );
     assert_eq!(report.failure, None, "{report:?}");
     assert!(report.last_good_ms > baseline_good, "{report:?}");
-    let projection = engine.snapshot(&report)?.projection;
+    let projection = engine.snapshot(&engine_id, &report)?.projection;
     assert_eq!(
         (projection.records, projection.input.value),
         (MESSAGES, Some(MESSAGES))
     );
     assert_eq!(scalar::<i64>(&data, "SELECT dirty FROM sources")?, 0);
     for message in ["m000", "m299"] {
-        let state = group_state(&engine, message)?;
+        let state = group_state(&engine, &engine_id, message)?;
         assert_eq!(
             (state.0, state.1, state.2),
             (Some(1), 1, false),
@@ -10382,14 +10595,17 @@ fn single_message_databases(source: &Path) -> TestResult {
 
 /// Every durable observation, paged through the encoded decoder.
 fn all_observations<F: quotern_core::ingest::fs::SourceFs>(
-    engine: &OpenCodeEngine<F>,
+    engine: &Engine<F>,
+    engine_id: &str,
 ) -> TestResult<Vec<SourceReportedObservation>> {
     use quotern_core::snapshot::ObservationPage;
     let (mut observations, mut cursor) = (Vec::new(), None);
     loop {
-        let page = ObservationPage::decode(&serde_json::to_vec(
-            &engine.observations_page(cursor.as_ref(), 1_000)?,
-        )?)?;
+        let page = ObservationPage::decode(&serde_json::to_vec(&engine.observations_page(
+            engine_id,
+            cursor.as_ref(),
+            1_000,
+        )?)?)?;
         observations.extend(page.observations);
         match page.next {
             Some(next) => cursor = Some(next),
@@ -10401,14 +10617,16 @@ fn all_observations<F: quotern_core::ingest::fs::SourceFs>(
 /// What a consistent report over the 1,089 databases must expose: every record once with one
 /// token, except the edited one, in the decoded snapshot and in every decoded history page.
 fn assert_database_consumers<F: quotern_core::ingest::fs::SourceFs>(
-    engine: &OpenCodeEngine<F>,
+    engine: &Engine<F>,
+    engine_id: &str,
     report: &PassReport,
     data: &Path,
     edited: Option<(&str, u64)>,
 ) -> TestResult {
     use quotern_core::snapshot::SourceSnapshot;
     let total = 1_089 + edited.map_or(0, |(_, value)| value - 1);
-    let snapshot = SourceSnapshot::decode(&serde_json::to_vec(&engine.snapshot(report)?)?)?;
+    let snapshot =
+        SourceSnapshot::decode(&serde_json::to_vec(&engine.snapshot(engine_id, report)?)?)?;
     let durable_source: String = scalar(data, "SELECT source_id FROM sources")?;
     assert_eq!(
         snapshot.source_id, durable_source,
@@ -10421,7 +10639,7 @@ fn assert_database_consumers<F: quotern_core::ingest::fs::SourceFs>(
         "certification must include the edited completed database"
     );
     assert_eq!(snapshot.projection.total.value, Some(total));
-    let observations = all_observations(engine)?;
+    let observations = all_observations(engine, engine_id)?;
     let ids: std::collections::BTreeSet<&str> = observations
         .iter()
         .map(|record| record.message_id.as_str())
@@ -10529,7 +10747,7 @@ fn completed_database_beyond_the_legacy_window_is_revalidated_before_certificati
             log.lock().expect("open log").push(path.to_path_buf());
         }
     });
-    let mut engine = open_recording_engine(fs.clone(), &source, &data, &home)
+    let (mut engine, engine_id) = open_recording_engine(fs.clone(), &source, &data, &home)
         .map_err(|report| format!("open failed: {report:?}"))?;
     let source_id: String = scalar(&data, "SELECT source_id FROM sources")?;
     let generation: i64 = scalar(&data, "SELECT generation FROM sources")?;
@@ -10561,7 +10779,7 @@ fn completed_database_beyond_the_legacy_window_is_revalidated_before_certificati
     // Drive bounded passes until more than 1,024 databases are durably completed, short of all.
     let mut checkpoint = false;
     for pass in 0..64_i64 {
-        let report = engine.pass(consented(), 1 + pass);
+        let report = engine.pass(&engine_id, consented(), 1 + pass);
         assert_ne!(
             report.outcome,
             PassOutcome::Consistent,
@@ -10666,9 +10884,10 @@ fn completed_database_beyond_the_legacy_window_is_revalidated_before_certificati
     let mut now = 1_000_000_i64;
     let mut changed = false;
     for step in 0..64 {
-        let report = engine.pass(consented(), now);
+        let report = engine.pass(&engine_id, consented(), now);
         now += 400_000;
-        let snapshot = SourceSnapshot::decode(&serde_json::to_vec(&engine.snapshot(&report)?)?)?;
+        let snapshot =
+            SourceSnapshot::decode(&serde_json::to_vec(&engine.snapshot(&engine_id, &report)?)?)?;
         if report.outcome == PassOutcome::Consistent {
             assert_eq!(snapshot.projection.records, 1_089, "step {step}");
             assert_eq!(
@@ -10677,7 +10896,7 @@ fn completed_database_beyond_the_legacy_window_is_revalidated_before_certificati
                 "step {step}: terminal certification must include the edited completed database"
             );
             assert_eq!(snapshot.projection.total.value, Some(1_097));
-            assert_database_consumers(&engine, &report, &data, Some((&id, 9)))?;
+            assert_database_consumers(&engine, &engine_id, &report, &data, Some((&id, 9)))?;
             break;
         }
         if report.failure == Some(FailureCode::SourceChanging) {
@@ -10703,13 +10922,14 @@ fn completed_database_beyond_the_legacy_window_is_revalidated_before_certificati
 
     // Restart after the detected change and reacquire the stable fixture.
     drop(engine);
-    let mut engine = open_recording_engine(fs.clone(), &source, &data, &home)
+    let (mut engine, engine_id) = open_recording_engine(fs.clone(), &source, &data, &home)
         .map_err(|report| format!("reopen failed: {report:?}"))?;
     let mut settled = None;
     for step in 0..80 {
-        let report = engine.pass(consented(), now);
+        let report = engine.pass(&engine_id, consented(), now);
         now += 400_000;
-        let snapshot = SourceSnapshot::decode(&serde_json::to_vec(&engine.snapshot(&report)?)?)?;
+        let snapshot =
+            SourceSnapshot::decode(&serde_json::to_vec(&engine.snapshot(&engine_id, &report)?)?)?;
         if report.outcome == PassOutcome::Consistent {
             assert_eq!(snapshot.projection.input.value, Some(1_097), "step {step}");
             settled = Some(report);
@@ -10718,7 +10938,7 @@ fn completed_database_beyond_the_legacy_window_is_revalidated_before_certificati
     }
     let settled = settled.ok_or("the stable fixture never reached a consistent generation")?;
     assert_eq!(settled.failure, None, "{settled:?}");
-    assert_database_consumers(&engine, &settled, &data, Some((&id, 9)))?;
+    assert_database_consumers(&engine, &engine_id, &settled, &data, Some((&id, 9)))?;
     let revisions = |data: &Path| -> TestResult<(i64, i64, i64, i64)> {
         Ok(history(data)?.query_row(
             "SELECT COUNT(*), SUM(input_tokens), SUM(total_tokens), SUM(revision) FROM usage_events",
@@ -10742,10 +10962,10 @@ fn completed_database_beyond_the_legacy_window_is_revalidated_before_certificati
     assert_eq!(scalar::<i64>(&data, "SELECT dirty FROM sources")?, 0);
 
     // Repeating the stable acquisition adds no revision.
-    let again = run_until_consistent(&mut engine, now, 80);
+    let again = run_until_consistent(&mut engine, &engine_id, now, 80);
     let again = again.last().ok_or("pass")?;
     assert_eq!(again.outcome, PassOutcome::Consistent, "{again:?}");
-    assert_database_consumers(&engine, again, &data, Some((&id, 9)))?;
+    assert_database_consumers(&engine, &engine_id, again, &data, Some((&id, 9)))?;
     assert_eq!(revisions(&data)?, (1_089, 1_097, 1_097, 1_090));
     Ok(())
 }
@@ -10760,12 +10980,12 @@ fn unchanged_one_thousand_eighty_nine_databases_reach_an_exact_consistent_genera
     let directory = tempdir()?;
     let (source, data, home) = source_roots(&directory.path().canonicalize()?)?;
     single_message_databases(&source)?;
-    let mut engine = open_engine(&source, &data, &home)?;
-    let reports = run_until_consistent(&mut engine, 1, 80);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let reports = run_until_consistent(&mut engine, &engine_id, 1, 80);
     let last = reports.last().ok_or("pass")?;
     assert_eq!(last.outcome, PassOutcome::Consistent, "{last:?}");
     assert_eq!(last.failure, None, "{last:?}");
-    assert_database_consumers(&engine, last, &data, None)?;
+    assert_database_consumers(&engine, &engine_id, last, &data, None)?;
     let (records, input, total, revisions): (i64, i64, i64, i64) = history(&data)?.query_row(
         "SELECT COUNT(*), SUM(input_tokens), SUM(total_tokens), SUM(revision) FROM usage_events",
         [],
@@ -11025,12 +11245,12 @@ fn reused_writable_shared_memory_fails_closed_in_both_orderings() -> TestResult 
         assert_eq!(metrics.readonly_shared_memory_maps, 0, "{metrics:?}");
         assert_source_unchanged(&database, &image)?;
 
-        let mut engine = open_engine(&source, &data, &home)?;
-        let report = engine.pass(consented(), 1);
+        let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+        let report = engine.pass(&engine_id, consented(), 1);
         assert_eq!(report.outcome, PassOutcome::Unavailable, "{report:?}");
         assert_eq!(report.failure, Some(FailureCode::Sqlite), "{report:?}");
         assert_eq!(report.records_committed, 0);
-        assert!(engine.observations()?.is_empty());
+        assert!(engine.observations(&engine_id)?.is_empty());
         assert_source_unchanged(&database, &image)?;
 
         let events = probe.finish()?;
@@ -11142,12 +11362,12 @@ fn cached_readonly_shared_memory_is_bound_to_the_sidecar_inode() -> TestResult {
     );
 
     // The engine consumer fails closed the same way: nothing published, source untouched.
-    let mut engine = open_engine(&source, &data, &home)?;
-    let report = engine.pass(consented(), 1);
+    let (mut engine, engine_id) = open_engine(&source, &data, &home)?;
+    let report = engine.pass(&engine_id, consented(), 1);
     assert_eq!(report.outcome, PassOutcome::Unavailable, "{report:?}");
     assert_eq!(report.failure, Some(FailureCode::Sqlite), "{report:?}");
     assert_eq!(report.records_committed, 0);
-    assert!(engine.observations()?.is_empty());
+    assert!(engine.observations(&engine_id)?.is_empty());
     assert_eq!(std::fs::read(&canonical)?, db_bytes);
     assert_eq!(std::fs::read(sidecar(&canonical, "-wal"))?, wal_bytes);
 
@@ -11155,7 +11375,7 @@ fn cached_readonly_shared_memory_is_bound_to_the_sidecar_inode() -> TestResult {
     std::fs::remove_file(&shm)?;
     std::fs::rename(&parked, &shm)?;
     assert_eq!(kernel::source_keys(&canonical)?, original);
-    let report = engine.pass(consented(), 2);
+    let report = engine.pass(&engine_id, consented(), 2);
     assert_eq!(report.outcome, PassOutcome::Consistent, "{report:?}");
     assert_eq!(report.records_committed, 1, "{report:?}");
     drop(engine);
@@ -11703,7 +11923,7 @@ fn a_shared_memory_map_refused_once_is_validated_again_on_retry() -> TestResult 
     let (hook_swaps, hook_shm) = (std::rc::Rc::clone(&swaps), shm.clone());
     // Each open of the sidecar finds another inode with identical bytes at the path, put there
     // between the check of the path and the kernel's open.
-    set_open_hook(Some(Box::new(move |path| {
+    set_open_hook(Some(Box::new(move |path, _flags| {
         let _ = hook_swaps.get();
         if path == hook_shm {
             let round = hook_swaps.get() + 1;
@@ -13255,7 +13475,7 @@ fn a_nested_invocation_restores_the_stale_outer_one_when_it_returns() -> TestRes
     let seen = Rc::new(RefCell::new(Nested::default()));
     let _bound = bind_store(directory.path(), (0, 0))?;
     let hook_seen = Rc::clone(&seen);
-    set_open_hook(Some(Box::new(move |_| {
+    set_open_hook(Some(Box::new(move |_, _| {
         let mut nested = hook_seen.borrow_mut();
         let counts = || {
             (
@@ -13357,7 +13577,7 @@ fn a_nested_invocation_keeps_the_outer_ownership_while_the_probe_restores() -> T
         let plain_entry = plain_fstat_entry()?;
         let _bound = bind_store(directory.path(), (0, 0))?;
         let hook_seen = Rc::clone(&seen);
-        set_open_hook(Some(Box::new(move |_| {
+        set_open_hook(Some(Box::new(move |_, _| {
             let mut nested = hook_seen.borrow_mut();
             let counts = || {
                 (
@@ -13538,7 +13758,7 @@ fn a_failed_delegated_open_hands_back_the_errno_of_the_kernel() -> TestResult {
     drop(open_canonical(&canonical)?); // first-use initialisation
     let probe = kernel::SyscallProbe::start()?;
     let (hook_database, hook_parked) = (canonical.clone(), parked.clone());
-    set_open_hook(Some(Box::new(move |path| {
+    set_open_hook(Some(Box::new(move |path, _flags| {
         if path == hook_database {
             let _ = std::fs::rename(&hook_database, &hook_parked);
         }

@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/quotern-core"]
+members = ["crates/quotern-core", "crates/quotern-ffi"]
 resolver = "3"

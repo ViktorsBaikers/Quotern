@@ -1,0 +1,28 @@
+{
+  "legacy_messages": [
+    {"id":"derived","session_id":"session-day","time_created":1775124000000,"data":{"role":"assistant","tokens":{"input":10,"output":20,"reasoning":3,"cache":{"read":4,"write":5}}}},
+    {"id":"explicit","session_id":"session-day","time_created":1775124001000,"data":{"role":"assistant","tokens":{"input":10,"output":20,"reasoning":3,"cache":{"read":4,"write":5},"total":99}}},
+    {"id":"null-components","session_id":"session-day","time_created":1775124002000,"data":{"role":"assistant","tokens":{"input":7,"output":1}}},
+    {"id":"zero","session_id":"session-day","time_created":1775124003000,"data":{"role":"assistant","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}},
+
+    {"id":"spring-before","session_id":"session-day","time_created":1774735199999,"data":{"role":"assistant","tokens":{"input":3,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":3}}},
+    {"id":"spring-start","session_id":"session-day","time_created":1774735200000,"data":{"role":"assistant","tokens":{"input":5,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":5}}},
+    {"id":"spring-last","session_id":"session-day","time_created":1774817999999,"data":{"role":"assistant","tokens":{"input":7,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":7}}},
+    {"id":"spring-end","session_id":"session-day","time_created":1774818000000,"data":{"role":"assistant","tokens":{"input":11,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":11}}},
+
+    {"id":"fall-before","session_id":"session-day","time_created":1792875599999,"data":{"role":"assistant","tokens":{"input":13,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":13}}},
+    {"id":"fall-start","session_id":"session-day","time_created":1792875600000,"data":{"role":"assistant","tokens":{"input":17,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":17}}},
+    {"id":"fall-last","session_id":"session-day","time_created":1792965599999,"data":{"role":"assistant","tokens":{"input":19,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":19}}},
+    {"id":"fall-end","session_id":"session-day","time_created":1792965600000,"data":{"role":"assistant","tokens":{"input":23,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":23}}}
+  ],
+  "json_messages": [
+    {"id":"json-a","session_id":"session-json","data":{"role":"assistant","time":{"created":1775124000000}},"parts":[
+      {"id":"a1","data":{"type":"step-finish","tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":1}}},
+      {"id":"a2","data":{"type":"step-finish","tokens":{"input":2,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":2}}}
+    ]},
+    {"id":"json-b","session_id":"session-json","data":{"role":"assistant","time":{"created":1775124001000}},"parts":[
+      {"id":"b1","data":{"type":"step-finish","tokens":{"input":4,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":4}}},
+      {"id":"b2","data":{"type":"step-finish","tokens":{"input":8,"output":0,"reasoning":0,"cache":{"read":0,"write":0},"total":8}}}
+    ]}
+  ]
+}

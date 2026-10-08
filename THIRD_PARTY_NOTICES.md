@@ -47,6 +47,8 @@ The table covers registry packages reachable from the locked workspace for `aarc
 | vcpkg | 0.2.15 | MIT/Apache-2.0 | [crates.io](https://crates.io/crates/vcpkg/0.2.15) |
 | zmij | 1.0.23 | MIT | [crates.io](https://crates.io/crates/zmij/1.0.23) |
 
+The `quotern-ffi` crate adds no registry package: its dependencies (`quotern-core`, `serde`, `serde_json`, and `rusqlite` and `tempfile` for tests) are in the table above and `Cargo.lock` records the crate itself. The Swift package uses only the Swift toolchain, Dispatch, Foundation and XCTest from the Apple developer tools, which are not redistributed; `/usr/bin/sqlite3` from macOS is started only by tests as a fixture writer child.
+
 The direct runtime dependencies are `jiff`, `rusqlite`, `serde`, and `serde_json`. `tempfile` is dev-only. The workspace enables `rusqlite`'s `bundled` feature through `libsqlite3-sys`; SQLite itself is public domain. The linked SQLite version and source ID observed by the runtime test are recorded in [UPSTREAM.md](UPSTREAM.md). See the [SQLite copyright page](https://www.sqlite.org/copyright.html) for the SQLite public-domain notice.
 
 ## Research-only OpenCode references

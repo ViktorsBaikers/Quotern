@@ -2,6 +2,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rusqlite::types::ValueRef;
@@ -716,6 +717,7 @@ struct Sweep<'a, 'c> {
     failure: Option<FailureCode>,
     hooked: bool,
     witness: Option<u64>,
+    cancel: Option<&'a AtomicBool>,
 }
 
 impl Sweep<'_, '_> {
@@ -809,7 +811,12 @@ fn sweep_table(
             .map_err(sqlite_failure)?;
         let mut emitted = 0_u32;
         loop {
-            if sweep.rows_left() == 0 {
+            // A set cancel flag stops the sweep after the last whole group, as the row budget does.
+            if sweep.rows_left() == 0
+                || sweep
+                    .cancel
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
                 stopped = true;
                 break;
             }
@@ -1200,6 +1207,7 @@ pub fn read_sqlite(
     cursor_key: Option<&str>,
     counters: &mut PassCounters,
     budget: ReadBudget,
+    cancel: Option<&AtomicBool>,
 ) -> Result<SqliteBatch, FailureCode> {
     let mut cursor = match cursor_key {
         Some(json) => {
@@ -1265,6 +1273,7 @@ pub fn read_sqlite(
         failure: None,
         hooked: false,
         witness,
+        cancel,
     };
     if layouts.legacy {
         cursor.legacy = sweep_table(

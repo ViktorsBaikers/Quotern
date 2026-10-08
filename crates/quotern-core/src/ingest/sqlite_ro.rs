@@ -228,9 +228,10 @@ fn charge_io() -> io::Result<()> {
     }
 }
 
-/// A test boundary callback invoked with the path about to be opened.
+/// A test boundary callback invoked with the path about to be opened and the open flags the
+/// caller requested, before any source flag rewrite.
 #[cfg(feature = "test-faults")]
-pub type OpenHook = Box<dyn FnMut(&Path)>;
+pub type OpenHook = Box<dyn FnMut(&Path, c_int)>;
 
 #[cfg(feature = "test-faults")]
 thread_local! {
@@ -246,10 +247,10 @@ pub fn set_open_hook(hook: Option<OpenHook>) {
 }
 
 #[cfg(feature = "test-faults")]
-fn run_open_hook(name: &[u8]) {
+fn run_open_hook(name: &[u8], flags: c_int) {
     let taken = OPEN_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(mut hook) = taken {
-        hook(Path::new(std::ffi::OsStr::from_bytes(name)));
+        hook(Path::new(std::ffi::OsStr::from_bytes(name)), flags);
         OPEN_HOOK.with(|slot| {
             let mut slot = slot.borrow_mut();
             if slot.is_none() {
@@ -347,7 +348,7 @@ unsafe extern "C" fn hook_open(path: *const c_char, flags: c_int, mode: c_int) -
     }
     let name = unsafe { CStr::from_ptr(path) }.to_bytes();
     #[cfg(feature = "test-faults")]
-    run_open_hook(name);
+    run_open_hook(name, flags);
     let (flags, mode) = if source {
         // A source file is never created, truncated, written or waited on: read-only,
         // non-blocking, whatever the parent asked for.
@@ -1007,6 +1008,29 @@ pub fn open_canonical(path: &Path) -> Result<Connection, OpenError> {
     Ok(connection)
 }
 
+/// Why a log walk was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WalError {
+    /// The log is longer than the allowed length; none of it was read.
+    TooLarge,
+    /// A header SQLite would refuse.
+    Invalid,
+    /// The log's length could not be read.
+    Io,
+}
+
+/// Everything about a log that a later comparison needs to prove it is the same one: its
+/// presence and identity, its length, its 32-byte header, the header of the last commit frame
+/// and the header of every frame slot after it (the ignored tail).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalMark {
+    pub identity: (u64, u64),
+    pub length: u64,
+    pub header: [u8; 32],
+    pub last_commit: Option<(u64, [u8; 24])>,
+    pub tail: Vec<(u64, [u8; 24])>,
+}
+
 /// Committed content of a write-ahead log: the newest committed copy of every page, found by
 /// walking the log's frames with SQLite's own salt and checksum rules. A frame past the last
 /// valid commit is ignored, exactly as SQLite ignores it.
@@ -1017,13 +1041,20 @@ pub struct WalOverlay {
     pages: u32,
     /// Page number to the offset of its newest committed frame header.
     frames: HashMap<u32, u64>,
+    mark: WalMark,
 }
 
 impl WalOverlay {
-    /// Walks `wal` read-only. `InvalidData` for a header SQLite would refuse.
-    pub fn committed(wal: File) -> io::Result<Self> {
+    /// Walks `wal` read-only, never past `max_bytes`: its length is read first and a longer log
+    /// is refused before any of its bytes are read. Only `[32, length)` is walked.
+    pub fn committed_within(wal: File, max_bytes: u64) -> Result<Self, WalError> {
         use std::os::unix::fs::FileExt;
-        let bad = || io::Error::new(io::ErrorKind::InvalidData, "invalid write-ahead log");
+        let metadata = wal.metadata().map_err(|_| WalError::Io)?;
+        let length = metadata.len();
+        if length > max_bytes {
+            return Err(WalError::TooLarge);
+        }
+        let bad = || WalError::Invalid;
         let mut header = [0_u8; 32];
         wal.read_exact_at(&mut header, 0).map_err(|_| bad())?;
         let word = |bytes: &[u8], at: usize| {
@@ -1061,12 +1092,12 @@ impl WalOverlay {
         }
         let salt = (word(&header, 16), word(&header, 20));
         let frame_len = 24 + page_size as u64;
-        let length = wal.metadata()?.len();
         let mut committed = HashMap::new();
         let mut pending: HashMap<u32, u64> = HashMap::new();
         let mut pages = 0_u32;
         let mut buffer = vec![0_u8; page_size];
         let mut offset = 32_u64;
+        let mut last_commit: Option<(u64, [u8; 24])> = None;
         while offset + frame_len <= length {
             let mut frame = [0_u8; 24];
             if wal.read_exact_at(&mut frame, offset).is_err()
@@ -1085,15 +1116,39 @@ impl WalOverlay {
                 // A commit frame: everything up to it is part of the committed state.
                 committed.extend(pending.drain());
                 pages = word(&frame, 4);
+                last_commit = Some((offset, frame));
             }
             offset += frame_len;
         }
+        // The ignored tail: every frame slot after the last commit whose header lies in the log.
+        let mut tail = Vec::new();
+        let mut slot = last_commit.map_or(32, |(at, _)| at + frame_len);
+        while slot + 24 <= length {
+            let mut frame = [0_u8; 24];
+            wal.read_exact_at(&mut frame, slot)
+                .map_err(|_| WalError::Io)?;
+            tail.push((slot, frame));
+            slot += frame_len;
+        }
+        let mark = WalMark {
+            identity: (metadata.dev(), metadata.ino()),
+            length,
+            header,
+            last_commit,
+            tail,
+        };
         Ok(Self {
             wal,
             page_size,
             pages,
             frames: committed,
+            mark,
         })
+    }
+
+    /// The mark of the log as this walk saw it.
+    pub fn mark(&self) -> &WalMark {
+        &self.mark
     }
 
     /// The `user_version` committed in the log, if the log rewrites page one.
@@ -1124,22 +1179,97 @@ fn hidden_sidecar(name: &[u8]) -> bool {
     })
 }
 
+/// Where a recorded view read came from: the main file, or the write-ahead log (offset in the
+/// log) for a page the log committed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RangeSource {
+    Main,
+    Frame,
+}
+
+/// One range of bytes a rollback view returned to SQLite, exactly as read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadRange {
+    pub source: RangeSource,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// Everything one rollback view read: the bytes charged against its cap, whether a read was
+/// refused for lack of allowance, and the ranges it returned.
+#[derive(Debug, Default)]
+pub struct ViewReads {
+    pub bytes: u64,
+    pub refused: bool,
+    pub ranges: Vec<ReadRange>,
+}
+
+struct ViewBudget {
+    cap: u64,
+    reads: ViewReads,
+}
+
+thread_local! {
+    static VIEW_BUDGET: RefCell<Option<ViewBudget>> = const { RefCell::new(None) };
+}
+
+/// Charges `amount` bytes against the active view's cap before the read is issued. A read the
+/// cap cannot cover is refused and remembered; with no active view nothing is charged.
+fn charge_view(amount: u64) -> bool {
+    VIEW_BUDGET.with(|slot| match slot.borrow_mut().as_mut() {
+        None => true,
+        Some(budget) => match budget.reads.bytes.checked_add(amount) {
+            Some(total) if total <= budget.cap => {
+                budget.reads.bytes = total;
+                true
+            }
+            _ => {
+                budget.reads.refused = true;
+                false
+            }
+        },
+    })
+}
+
+fn record_view(source: RangeSource, offset: u64, bytes: &[u8]) {
+    VIEW_BUDGET.with(|slot| {
+        if let Some(budget) = slot.borrow_mut().as_mut() {
+            budget.reads.ranges.push(ReadRange {
+                source,
+                offset,
+                bytes: bytes.to_vec(),
+            });
+        }
+    });
+}
+
 /// Runs `inspect` on a read-only view of a quiescent database file whose WAL format flag is
 /// masked and whose `-wal`/`-journal` sidecars are hidden from SQLite, so no sidecar is opened,
 /// created, mapped or recovered. With no overlay the caller must have proved that no non-empty
 /// WAL exists; with one, the committed pages of that log are served over the main file, so a
 /// store whose newest schema lives only in its log is seen as SQLite would see it after
 /// recovery, without recovering and without touching any file.
+///
+/// The view reads at most `read_cap` bytes: the VFS charges each read before issuing it and
+/// refuses one the cap cannot cover. The returned [`ViewReads`] holds the bytes charged and
+/// every range returned, also when the view failed.
 pub fn with_rollback_view<T>(
     path: &Path,
     overlay: Option<WalOverlay>,
+    read_cap: u64,
     inspect: impl FnOnce(&Connection) -> T,
-) -> Result<T, OpenError> {
+) -> (Result<T, OpenError>, ViewReads) {
     if path.to_str().is_none() {
-        return Err(OpenError::PathNotUtf8);
+        return (Err(OpenError::PathNotUtf8), ViewReads::default());
     }
-    let uri = encode_path_uri(path, "mode=ro&quotern_rollback_view=1")?;
-    let vfs = vfs_name()?;
+    let uri = match encode_path_uri(path, "mode=ro&quotern_rollback_view=1") {
+        Ok(uri) => uri,
+        Err(error) => return (Err(error), ViewReads::default()),
+    };
+    let vfs = match vfs_name() {
+        Ok(vfs) => vfs,
+        Err(error) => return (Err(error), ViewReads::default()),
+    };
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -1148,6 +1278,12 @@ pub fn with_rollback_view<T>(
         paths
             .borrow_mut()
             .push(path.as_os_str().as_bytes().to_vec())
+    });
+    VIEW_BUDGET.with(|slot| {
+        *slot.borrow_mut() = Some(ViewBudget {
+            cap: read_cap,
+            reads: ViewReads::default(),
+        });
     });
     PENDING_OVERLAY.with(|slot| *slot.borrow_mut() = overlay.map(Box::new));
     let opened = Connection::open_with_flags_and_vfs(uri, flags, vfs).map_err(sqlite_error);
@@ -1165,7 +1301,11 @@ pub fn with_rollback_view<T>(
     VIEW_PATHS.with(|paths| {
         paths.borrow_mut().pop();
     });
-    result
+    let reads = VIEW_BUDGET
+        .with(|slot| slot.borrow_mut().take())
+        .map(|budget| budget.reads)
+        .unwrap_or_default();
+    (result, reads)
 }
 
 /// Change witness of a database snapshot, independent of SQLite's own cursors: the main file's
@@ -2090,6 +2230,9 @@ unsafe fn overlay_read(
     let (Ok(total), Ok(start)) = (usize::try_from(amount), u64::try_from(offset)) else {
         return IOERR_READ;
     };
+    if !charge_view(total as u64) {
+        return IOERR_READ;
+    }
     let page = overlay.page_size as u64;
     let mut done = 0_usize;
     let mut short = false;
@@ -2110,6 +2253,7 @@ unsafe fn overlay_read(
             {
                 return IOERR_READ;
             }
+            record_view(RangeSource::Frame, frame + 24 + within, output);
         } else {
             let code = unsafe {
                 delegated(
@@ -2127,6 +2271,10 @@ unsafe fn overlay_read(
                 IOERR_SHORT_READ => short = true,
                 other => return other,
             }
+            // SAFETY: the read just filled `take` bytes at `target`.
+            record_view(RangeSource::Main, position, unsafe {
+                std::slice::from_raw_parts(target, take)
+            });
         }
         done += take;
     }
@@ -2166,8 +2314,12 @@ unsafe extern "C" fn file_read(
         }
         return ffi::SQLITE_OK;
     }
-    let result = if wrapper.overlay.is_null() {
-        unsafe {
+    let result = if !wrapper.overlay.is_null() {
+        unsafe { overlay_read(file, &*wrapper.overlay, buffer, amount, offset) }
+    } else if wrapper.rollback_view && !charge_view(u64::try_from(amount).unwrap_or(u64::MAX)) {
+        IOERR_READ
+    } else {
+        let result = unsafe {
             delegated(
                 file,
                 |inner, methods| {
@@ -2177,9 +2329,13 @@ unsafe extern "C" fn file_read(
                 },
                 ffi::SQLITE_IOERR,
             )
+        };
+        if wrapper.rollback_view && (result == ffi::SQLITE_OK || result == IOERR_SHORT_READ) {
+            // SAFETY: SQLite supplied a buffer of `amount` bytes that the read just filled.
+            let read = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), amount as usize) };
+            record_view(RangeSource::Main, offset as u64, read);
         }
-    } else {
-        unsafe { overlay_read(file, &*wrapper.overlay, buffer, amount, offset) }
+        result
     };
     if wrapper.rollback_view && offset == 0 && amount >= 20 && result == ffi::SQLITE_OK {
         // SAFETY: SQLite supplied a writable buffer of `amount >= 20` bytes it just filled.

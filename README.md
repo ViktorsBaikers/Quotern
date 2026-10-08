@@ -2,7 +2,7 @@
 
 Quotern is a Rust workspace. The current `quotern-core` crate reads selected, consented OpenCode SQLite/WAL and JSON sources and stores source-reported token observations locally. These observations do not establish verified consumption or provider quota.
 
-This milestone contains no Swift application or FFI target. The Rust source acquisition and history tests use temporary fixtures and do not require provider credentials or a live OpenCode account.
+The `quotern-ffi` crate builds the core as a static library behind a versioned C ABI (`Sources/CQuotern/include/quotern.h`, eight exports, JSON envelopes defined by `Contracts/bridge-v1`), and the Swift package `Quotern` wraps it in a headless `EngineClient` (library, client and tests only; there is no native application executable yet). The Rust source acquisition, history and bridge tests use temporary fixtures and do not require provider credentials or a live OpenCode account.
 
 ## Source behavior
 
@@ -52,6 +52,7 @@ Use Rust 1.98.1 with the `clippy` and `rustfmt` components and the `aarch64-appl
 | --- | --- | --- |
 | Runtime | `jiff 0.2.35`; `rusqlite 0.40.2` with `libsqlite3-sys 0.38.2`; `serde 1.0.229`; `serde_json 1.0.151` | `jiff` is Unlicense OR MIT; `rusqlite` and `libsqlite3-sys` are MIT; `serde` and `serde_json` are MIT OR Apache-2.0. Bundled SQLite is public domain. |
 | Tests | `tempfile 3.27.0`; test-only `test-faults` feature | `tempfile` is MIT OR Apache-2.0. The fault feature is enabled only through the crate's dev-dependency. |
+| Bridge | `quotern-ffi` (no registry package beyond the runtime list above); Swift 6 toolchain, Dispatch and XCTest from the Apple toolchain | Apple system components, not redistributed. `/usr/bin/sqlite3` runs only as a test fixture writer child. |
 | Peer comparison | CodeBurn `986d72ce1efbfaf40b3c9d4050d9ecdbc24be986`; CodexBar `3239175f6a43aff35a52abc9072f8eca69444a7d` | Pinned source-level references; no upstream project code is included. |
 | Synthetic fixtures | `Fixtures/harness/opencode/peer`, `Fixtures/harness/opencode/wal`, and `Fixtures/hostile/opencode` | Hand-authored JSON/SQLite inputs and independent expected results; not copied from user databases. |
 
@@ -82,3 +83,25 @@ cargo test -p quotern-core --locked --test opencode_wal -- m2_kernel_oracle reus
 ```
 
 The integration tests use synthetic fixtures, temporary SQLite databases, and child writer processes. They do not contact providers or use user databases.
+
+## Bridge and Swift client
+
+The reported daily snapshot is Rust-owned: `today_snapshot` takes `{tz, now_ms}`, the Rust core derives the local-day window and sums only the records inside it, and Swift never filters, re-windows or sums. A request whose instant is outside `0..=253402300799999`, whose zone is unknown, or whose local day has an endpoint outside that range (for example Asia/Kolkata or Europe/Riga at `now_ms` 0) is `invalid_request`, never clamped. One native owner holds each data directory (`flock` on the directory); a second owner gets `store_busy`. The client contract, error table and first-success example are in [Contracts/bridge-v1/README.md](Contracts/bridge-v1/README.md).
+
+Build the Rust archive with the explicit deployment target before any Swift step; the Swift package links only `target/aarch64-apple-darwin/release/libquotern_ffi.a`:
+
+```sh
+MACOSX_DEPLOYMENT_TARGET=14.0 cargo build -p quotern-ffi --release --locked
+swift build
+swift test
+swift test --sanitize=thread --filter CancelTokenTests
+```
+
+The bridge proofs on the Rust side:
+
+```sh
+cargo test -p quotern-core --locked --test reported_today
+cargo test -p quotern-ffi --locked --test contract_v1 --test ffi_ownership --test sentinel_sinks --test repo_policy
+```
+
+`repo_policy` also holds `forbidden_runtime_in_release_artifacts`, which stays ignored until a native executable is relinked and is then run explicitly with `-- --ignored --exact forbidden_runtime_in_release_artifacts`. The release static library never enables the `test-faults` feature; the test seams reach `quotern-ffi` only through its dev-dependency. The Swift live tests start `/usr/bin/sqlite3` as a fixture writer child.

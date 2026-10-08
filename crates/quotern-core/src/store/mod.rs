@@ -1,7 +1,10 @@
 pub mod migrations;
 
 use std::collections::BTreeSet;
+use std::ffi::{CString, OsStr, c_char, c_int};
 use std::fs::{File, Metadata};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -14,10 +17,13 @@ use crate::domain::{
     Provenance, RecordCandidate, SourceKind, SourceReportedObservation, TokenComponents,
     TokenObservation, TokenUnit, is_valid_id_component, required_nullable, total_metadata_is_valid,
 };
-use crate::ingest::sqlite_ro::{self, with_rollback_view};
+use crate::ingest::sqlite_ro::{
+    self, ReadRange, ViewReads, WalError, WalMark, WalOverlay, with_rollback_view,
+};
 use crate::limits::{
-    MAX_FAILED_FILES, MAX_METADATA_SPOOL_BYTES, MAX_METADATA_SPOOL_ROWS, MAX_OBSERVATION_PAGE,
-    MAX_PATH_BYTES, MAX_PROGRESS_CURSOR_BYTES, MAX_RECORD_ID_BYTES, MAX_SELECTED_PART_IDS,
+    ADMISSION_ENABLED_SOURCES, ADMISSION_READ_BYTES, ADMISSION_WAL_BYTES, MAX_FAILED_FILES,
+    MAX_METADATA_SPOOL_BYTES, MAX_METADATA_SPOOL_ROWS, MAX_OBSERVATION_PAGE, MAX_PATH_BYTES,
+    MAX_PROGRESS_CURSOR_BYTES, MAX_RECORD_ID_BYTES, MAX_REPORTED_SOURCES, MAX_SELECTED_PART_IDS,
     MAX_SOURCE_TIMESTAMP_MS, MAX_TOKEN_COUNT, RETRY_INITIAL_MS, RETRY_MAX_MS,
     SOURCE_CHANGING_RETRIES,
 };
@@ -33,7 +39,7 @@ pub enum FaultPoint {
     AfterCommit,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StoreError {
     Io,
     Sqlite,
@@ -52,6 +58,12 @@ pub enum StoreError {
     StaleGeneration,
     /// A competing observation of one candidate carries a different fingerprint.
     StageConflict,
+    /// Another native owner holds the data directory, or an admission comparison saw a change.
+    Busy,
+    /// A persisted or resolved enabled root equals, contains or lies inside the data directory.
+    RootOverlap,
+    /// An admission bound refused a valid existing history, which stays untouched.
+    AdmissionLimit(AdmissionBound),
     #[cfg(feature = "test-faults")]
     InjectedBeforeCommit,
     #[cfg(feature = "test-faults")]
@@ -81,6 +93,11 @@ impl std::fmt::Display for StoreError {
             Self::Corrupt => formatter.write_str("history database failed validation"),
             Self::StaleGeneration => formatter.write_str("source generation changed"),
             Self::StageConflict => formatter.write_str("competing observations differ"),
+            Self::Busy => formatter.write_str("application store is busy"),
+            Self::RootOverlap => formatter.write_str("source root overlaps the data directory"),
+            Self::AdmissionLimit(bound) => {
+                write!(formatter, "admission limit exceeded: {}", bound.as_str())
+            }
             #[cfg(feature = "test-faults")]
             Self::InjectedBeforeCommit => {
                 formatter.write_str("test fault before transaction commit")
@@ -97,6 +114,211 @@ fn sqlite<T>(result: rusqlite::Result<T>) -> Result<T, StoreError> {
     result.map_err(|_| StoreError::Sqlite)
 }
 
+/// The admission bound that refused a valid existing history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionBound {
+    WalBytes,
+    ReadBytes,
+    EnabledSources,
+}
+
+impl AdmissionBound {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WalBytes => "admission_wal_bytes",
+            Self::ReadBytes => "admission_read_bytes",
+            Self::EnabledSources => "enabled_sources",
+        }
+    }
+}
+
+/// The fixed bridge error a store failure maps to (the plan's total `store_error_code`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreErrorCode {
+    StoreBusy,
+    SourceOverlapConflict,
+    StoreNewerVersion,
+    /// `limit_exceeded` with its bound name.
+    LimitExceeded(&'static str),
+    StoreMigrationFailed,
+    StoreCorrupt,
+}
+
+/// Total mapping of a store failure to its bridge error: a valid oversized store is never
+/// `store_corrupt`.
+pub fn store_error_code(error: &StoreError) -> StoreErrorCode {
+    match error {
+        StoreError::Busy => StoreErrorCode::StoreBusy,
+        StoreError::RootOverlap => StoreErrorCode::SourceOverlapConflict,
+        StoreError::UnsupportedVersion => StoreErrorCode::StoreNewerVersion,
+        StoreError::AdmissionLimit(bound) => StoreErrorCode::LimitExceeded(bound.as_str()),
+        StoreError::LimitExceeded => StoreErrorCode::LimitExceeded("store_limit"),
+        StoreError::Sqlite => StoreErrorCode::StoreMigrationFailed,
+        _ => StoreErrorCode::StoreCorrupt,
+    }
+}
+
+#[inline]
+fn note_writable_open() {
+    #[cfg(feature = "test-faults")]
+    faults::WRITABLE_OPENS.with(|count| count.set(count.get() + 1));
+}
+
+#[inline]
+fn note_history_open() {
+    #[cfg(feature = "test-faults")]
+    faults::HISTORY_OPENS.with(|count| count.set(count.get() + 1));
+}
+
+fn admission_read_cap() -> u64 {
+    #[cfg(feature = "test-faults")]
+    if let Some(cap) = faults::READ_CAP.with(std::cell::Cell::get) {
+        return cap;
+    }
+    ADMISSION_READ_BYTES
+}
+
+/// A point inside admission where a test may inject an outside write.
+#[cfg(feature = "test-faults")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionPoint {
+    /// The log walk finished, before the view read.
+    AfterOverlay,
+    /// The enabled-root query finished; carries the bytes the view has read.
+    AfterRoots(u64),
+    /// `admit_existing` is about to return.
+    AfterAdmission,
+    /// Recorded range `i` of the recheck compared equal.
+    AfterRecheckRange(usize),
+    /// The recheck finished, before the writable open.
+    AfterRecheck,
+}
+
+#[cfg(feature = "test-faults")]
+mod faults {
+    use std::cell::{Cell, RefCell};
+
+    pub type AdmissionHook = Box<dyn FnMut(super::AdmissionPoint)>;
+    pub type PlainHook = Box<dyn FnMut()>;
+
+    thread_local! {
+        pub static WRITABLE_OPENS: Cell<usize> = const { Cell::new(0) };
+        pub static HISTORY_OPENS: Cell<usize> = const { Cell::new(0) };
+        pub static READ_CAP: Cell<Option<u64>> = const { Cell::new(None) };
+        pub static ADMISSION_HOOK: RefCell<Option<AdmissionHook>> = const { RefCell::new(None) };
+        pub static CLAIM_HOOK: RefCell<Option<PlainHook>> = const { RefCell::new(None) };
+        pub static RELEASE_HOOK: RefCell<Option<PlainHook>> = const { RefCell::new(None) };
+        pub static PANIC_NEXT_COMMIT: Cell<bool> = const { Cell::new(false) };
+    }
+}
+
+/// Test boundary: writable-open attempts on this thread since the last reset. Each writable-open
+/// seam counts once immediately before its first mutating syscall: the `open_bound` directory
+/// loop (only when a component is missing) and its history open, an owner claim that creates a
+/// missing component, and `open_bound_owned`'s history open.
+#[cfg(feature = "test-faults")]
+pub fn writable_open_attempts() -> usize {
+    faults::WRITABLE_OPENS.with(std::cell::Cell::get)
+}
+
+#[cfg(feature = "test-faults")]
+pub fn reset_writable_open_attempts() {
+    faults::WRITABLE_OPENS.with(|count| count.set(0));
+}
+
+/// Test boundary: history and sidecar descriptors store code, or the connection it binds, opened
+/// on this thread since the last reset.
+#[cfg(feature = "test-faults")]
+pub fn history_descriptor_opens() -> usize {
+    faults::HISTORY_OPENS.with(std::cell::Cell::get)
+}
+
+#[cfg(feature = "test-faults")]
+pub fn reset_history_descriptor_opens() {
+    faults::HISTORY_OPENS.with(|count| count.set(0));
+}
+
+/// Test boundary: lowers (or with `None` restores) the admission view read cap on this thread.
+#[cfg(feature = "test-faults")]
+pub fn set_admission_read_cap(cap: Option<u64>) {
+    faults::READ_CAP.with(|slot| slot.set(cap));
+}
+
+/// Test boundary: runs `hook` at every [`AdmissionPoint`] of `admit_existing` and
+/// `open_admitted` on this thread.
+#[cfg(feature = "test-faults")]
+pub fn set_admission_hook(hook: Option<Box<dyn FnMut(AdmissionPoint)>>) {
+    faults::ADMISSION_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Test boundary: runs `hook` on the claiming thread after the claim's directory chain and
+/// before `flock`.
+#[cfg(feature = "test-faults")]
+pub fn set_owner_claim_hook(hook: Option<Box<dyn FnMut()>>) {
+    faults::CLAIM_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Test boundary: runs `hook` when an owner is released, before its descriptor closes.
+#[cfg(feature = "test-faults")]
+pub fn set_owner_release_hook(hook: Option<Box<dyn FnMut()>>) {
+    faults::RELEASE_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Test boundary: the next store transaction on this thread panics inside the open transaction,
+/// after its record writes and before the commit, so unwinding rolls it back.
+#[cfg(feature = "test-faults")]
+pub fn panic_next_commit() {
+    faults::PANIC_NEXT_COMMIT.with(|armed| armed.set(true));
+}
+
+/// Consulted wherever a store transaction consults its fault point.
+#[cfg(feature = "test-faults")]
+fn panic_if_armed() {
+    if faults::PANIC_NEXT_COMMIT.with(|armed| armed.replace(false)) {
+        panic!("injected panic inside an open store transaction");
+    }
+}
+
+#[cfg(feature = "test-faults")]
+fn run_admission_hook(point: AdmissionPoint) {
+    let taken = faults::ADMISSION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = taken {
+        hook(point);
+        faults::ADMISSION_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
+#[cfg(feature = "test-faults")]
+fn run_plain_hook(
+    select: &'static std::thread::LocalKey<std::cell::RefCell<Option<faults::PlainHook>>>,
+) {
+    let taken = select.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = taken {
+        hook();
+        select.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
+#[cfg(feature = "test-faults")]
+fn run_owner_claim_hook() {
+    run_plain_hook(&faults::CLAIM_HOOK);
+}
+
+#[cfg(feature = "test-faults")]
+fn run_owner_release_hook() {
+    run_plain_hook(&faults::RELEASE_HOOK);
+}
+
 pub struct Store {
     connection: Connection,
     database: PathBuf,
@@ -105,6 +327,319 @@ pub struct Store {
     data_identity: (u64, u64),
     #[cfg(feature = "test-faults")]
     fault: Option<FaultPoint>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// App-store owner and bounded admission (DEC-062)
+
+unsafe extern "C" {
+    fn openat(directory: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
+    fn faccessat(directory: c_int, path: *const c_char, mode: c_int, flags: c_int) -> c_int;
+    fn flock(descriptor: c_int, operation: c_int) -> c_int;
+}
+
+#[cfg(target_os = "macos")]
+const O_CLOEXEC: c_int = 0x0100_0000;
+#[cfg(target_os = "linux")]
+const O_CLOEXEC: c_int = 0o200_0000;
+#[cfg(target_os = "macos")]
+const AT_SYMLINK_NOFOLLOW: c_int = 0x0020;
+#[cfg(target_os = "linux")]
+const AT_SYMLINK_NOFOLLOW: c_int = 0x0100;
+const F_OK: c_int = 0;
+const LOCK_EX: c_int = 2;
+const LOCK_NB: c_int = 4;
+
+fn open_relative(directory: &File, name: &OsStr, flags: c_int) -> std::io::Result<File> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `directory` is a live descriptor and `name` is a NUL-terminated single component;
+    // the flags select a non-creating open that never follows a final symlink.
+    let descriptor = unsafe { openat(directory.as_raw_fd(), name.as_ptr(), flags | O_CLOEXEC) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `descriptor` was just returned by `openat` and is owned by nothing else.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+/// A non-creating, no-follow directory open relative to a held handle.
+fn open_directory_at(parent: &File, name: &OsStr) -> std::io::Result<File> {
+    use crate::ingest::fs::open_flags::{DIRECTORY, NOFOLLOW};
+    let handle = open_relative(parent, name, NOFOLLOW | DIRECTORY)?;
+    if !handle.metadata()?.is_dir() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    Ok(handle)
+}
+
+/// A non-creating, no-follow, read-only, non-blocking open of a history file or sidecar. A
+/// genuine `ENOENT` is `None`; every other error is an unsafe file.
+fn open_file_at(directory: &File, name: &OsStr) -> Result<Option<File>, StoreError> {
+    use crate::ingest::fs::open_flags::{NOFOLLOW, NONBLOCK};
+    match open_relative(directory, name, NOFOLLOW | NONBLOCK) {
+        Ok(file) => {
+            note_history_open();
+            Ok(Some(file))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(StoreError::UnsafeFile),
+    }
+}
+
+/// Whether `name` exists beneath `directory`, without following a final symlink and without
+/// opening it.
+fn exists_at(directory: &File, name: &str) -> Result<bool, StoreError> {
+    let name = CString::new(name).map_err(|_| StoreError::InvalidRoot)?;
+    // SAFETY: as `open_relative`; `faccessat` only inspects the entry.
+    let found = unsafe {
+        faccessat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            F_OK,
+            AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if found == 0 {
+        return Ok(true);
+    }
+    match std::io::Error::last_os_error().kind() {
+        std::io::ErrorKind::NotFound => Ok(false),
+        _ => Err(StoreError::UnsafeFile),
+    }
+}
+
+/// The one native owner of an app data directory. It holds the directory itself open read only
+/// and takes `flock(LOCK_EX|LOCK_NB)` on that descriptor: never an ancestor, the history file or
+/// a sidecar, and SQLite's own locks are untouched. Identity is the directory's (device, inode),
+/// so aliases of one directory contend and sibling, parent and child directories never do.
+///
+/// The owner must be dropped after every `Store` and descriptor opened beneath it, so the lock
+/// outlives them.
+pub struct DataDirOwner {
+    directory: File,
+    identity: (u64, u64),
+    path: PathBuf,
+    anchor: DataAnchor,
+}
+
+impl DataDirOwner {
+    /// Claims the data directory `data` bound to `anchor`. With `create`, missing components are
+    /// created relative to the anchor handle first (the only effect a refused claim can leave);
+    /// without it a missing component is an error. Another owner is [`StoreError::Busy`]; a
+    /// component that cannot be opened or created, or any other lock failure, is
+    /// [`StoreError::UnsafeFile`].
+    pub fn claim(data: &Path, anchor: &DataAnchor, create: bool) -> Result<Self, StoreError> {
+        let relative = data
+            .strip_prefix(&anchor.path)
+            .map_err(|_| StoreError::InvalidRoot)?;
+        let mut directory =
+            sqlite_ro::open_directory(&anchor.path).map_err(|_| StoreError::UnsafeFile)?;
+        let held = directory.metadata().map_err(|_| StoreError::Io)?;
+        if (held.dev(), held.ino()) != (anchor.device, anchor.inode) {
+            return Err(StoreError::UnsafeFile);
+        }
+        let mut creating = false;
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(StoreError::InvalidRoot);
+            };
+            if !creating {
+                match open_directory_at(&directory, name) {
+                    Ok(next) => {
+                        directory = next;
+                        continue;
+                    }
+                    Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                        creating = true;
+                        note_writable_open();
+                    }
+                    Err(_) => return Err(StoreError::UnsafeFile),
+                }
+            }
+            directory = sqlite_ro::open_or_create_directory_at(&directory, name)
+                .map_err(|_| StoreError::UnsafeFile)?;
+        }
+        #[cfg(feature = "test-faults")]
+        run_owner_claim_hook();
+        let metadata = directory.metadata().map_err(|_| StoreError::Io)?;
+        if !metadata.is_dir() {
+            return Err(StoreError::UnsafeFile);
+        }
+        // SAFETY: `directory` is a live descriptor; `flock` only changes its advisory lock.
+        if unsafe { flock(directory.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+            return Err(match std::io::Error::last_os_error().kind() {
+                std::io::ErrorKind::WouldBlock => StoreError::Busy,
+                _ => StoreError::UnsafeFile,
+            });
+        }
+        Ok(Self {
+            directory,
+            identity: (metadata.dev(), metadata.ino()),
+            path: data.to_path_buf(),
+            anchor: anchor.clone(),
+        })
+    }
+
+    /// The canonical data path this owner claimed.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Device and inode of the claimed directory.
+    pub fn identity(&self) -> (u64, u64) {
+        self.identity
+    }
+
+    /// Whether `history.sqlite` exists beneath the claimed directory, found without opening it.
+    pub fn history_exists(&self) -> Result<bool, StoreError> {
+        exists_at(&self.directory, "history.sqlite")
+    }
+
+    /// Re-walks the components from the anchor and requires them to reach the claimed directory.
+    pub fn verify_reachable(&self) -> Result<(), StoreError> {
+        let relative = self
+            .path
+            .strip_prefix(&self.anchor.path)
+            .map_err(|_| StoreError::InvalidRoot)?;
+        let mut directory =
+            sqlite_ro::open_directory(&self.anchor.path).map_err(|_| StoreError::UnsafeFile)?;
+        let held = directory.metadata().map_err(|_| StoreError::Io)?;
+        if (held.dev(), held.ino()) != (self.anchor.device, self.anchor.inode) {
+            return Err(StoreError::UnsafeFile);
+        }
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(StoreError::InvalidRoot);
+            };
+            directory = open_directory_at(&directory, name).map_err(|_| StoreError::UnsafeFile)?;
+        }
+        let reached = directory.metadata().map_err(|_| StoreError::Io)?;
+        if (reached.dev(), reached.ino()) == self.identity {
+            Ok(())
+        } else {
+            Err(StoreError::UnsafeFile)
+        }
+    }
+}
+
+impl Drop for DataDirOwner {
+    fn drop(&mut self) {
+        // The hook runs before the descriptor closes, so it observes the owner still held.
+        #[cfg(feature = "test-faults")]
+        run_owner_release_hook();
+    }
+}
+
+/// One enabled `sources` row as admission read it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedRoot {
+    pub source_id: String,
+    pub canonical_root: PathBuf,
+    pub kind: SourceKind,
+    pub root_device: Option<u64>,
+    pub root_inode: Option<u64>,
+}
+
+/// The result of the one bounded committed read of an existing history, with the descriptors and
+/// witness that let [`Store::open_admitted`] prove, immediately before the writable open, that
+/// nothing it read has changed.
+pub struct Admission {
+    roots: Vec<AdmittedRoot>,
+    history: File,
+    history_identity: (u64, u64),
+    wal: Option<File>,
+    wal_identity: Option<(u64, u64)>,
+    wal_length: u64,
+    mark: Option<WalMark>,
+    ranges: Vec<ReadRange>,
+    read_bytes: u64,
+}
+
+impl Admission {
+    /// Every consent-enabled root, in the order the read returned them.
+    pub fn roots(&self) -> &[AdmittedRoot] {
+        &self.roots
+    }
+
+    /// Bytes the admission view read.
+    pub fn read_bytes(&self) -> u64 {
+        self.read_bytes
+    }
+}
+
+fn recheck_admission(
+    data_dir: &Path,
+    owner: &DataDirOwner,
+    admission: &Admission,
+) -> Result<(), StoreError> {
+    owner.verify_reachable()?;
+    let database = data_dir.join("history.sqlite");
+    if guard_files(&database)? != Some(admission.history_identity) {
+        return Err(StoreError::UnsafeFile);
+    }
+    let wal_now = match std::fs::symlink_metadata(sidecar_path(&database, "-wal")) {
+        Ok(metadata) => Some((metadata.dev(), metadata.ino())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(StoreError::Io),
+    };
+    if wal_now != admission.wal_identity {
+        return Err(StoreError::Busy);
+    }
+    if let Some(wal) = &admission.wal {
+        let length = wal.metadata().map_err(|_| StoreError::Io)?.len();
+        if length != admission.wal_length {
+            return Err(StoreError::Busy);
+        }
+    }
+    if let (Some(mark), Some(wal)) = (&admission.mark, &admission.wal) {
+        let same = |offset: u64, expected: &[u8]| -> Result<(), StoreError> {
+            let mut now = vec![0_u8; expected.len()];
+            wal.read_exact_at(&mut now, offset)
+                .map_err(|_| StoreError::Busy)?;
+            if now == expected {
+                Ok(())
+            } else {
+                Err(StoreError::Busy)
+            }
+        };
+        same(0, &mark.header)?;
+        if let Some((offset, frame)) = &mark.last_commit {
+            same(*offset, frame)?;
+        }
+        for (offset, frame) in &mark.tail {
+            same(*offset, frame)?;
+        }
+    }
+    for (index, range) in admission.ranges.iter().enumerate() {
+        let source = match range.source {
+            sqlite_ro::RangeSource::Main => Some(&admission.history),
+            sqlite_ro::RangeSource::Frame => admission.wal.as_ref(),
+        };
+        let Some(source) = source else {
+            return Err(StoreError::Busy);
+        };
+        // A read past the end of the file is zero-filled, exactly as the VFS returned it.
+        let mut now = vec![0_u8; range.bytes.len()];
+        let mut filled = 0;
+        while filled < now.len() {
+            match source.read_at(&mut now[filled..], range.offset + filled as u64) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(StoreError::Io),
+            }
+        }
+        if now != range.bytes {
+            return Err(StoreError::Busy);
+        }
+        #[cfg(feature = "test-faults")]
+        run_admission_hook(AdmissionPoint::AfterRecheckRange(index));
+        let _ = index;
+    }
+    #[cfg(feature = "test-faults")]
+    run_admission_hook(AdmissionPoint::AfterRecheck);
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -299,7 +834,8 @@ fn sidecar_path(database: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Refuses a newer, foreign or corrupt existing store before any writable open can change it.
+/// Refuses a newer, foreign, corrupt or over-bound existing store before any writable open can
+/// change it.
 ///
 /// Every check is effect free: nothing is opened for writing, created, recovered or deleted, so
 /// a refused store keeps every database byte, sidecar and mode. The main-file header gives the
@@ -308,6 +844,41 @@ fn sidecar_path(database: &Path, suffix: &str) -> PathBuf {
 /// served over the main file through the read-only VFS, so the newest committed version and
 /// schema are compared exactly as SQLite would see them after recovery.
 fn prevalidate(database: &Path, file: &File) -> Result<(), StoreError> {
+    let wal = match crate::ingest::fs::open_regular(&sidecar_path(database, "-wal")) {
+        Ok((wal, _)) => Some(wal),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(StoreError::UnsafeFile),
+    };
+    read_committed(
+        database,
+        file,
+        wal,
+        sidecar_path(database, "-journal").exists(),
+        false,
+    )
+    .map(|_| ())
+}
+
+/// What one bounded committed read of an existing history found.
+struct CommittedRead {
+    roots: Vec<AdmittedRoot>,
+    /// The walked log, when it held at least a header.
+    mark: Option<WalMark>,
+    wal_length: u64,
+    reads: ViewReads,
+}
+
+/// The one bounded committed read: header, version and journal checks, the log walk (its length
+/// refused above the admission bound before any byte is read), and a single read transaction
+/// over the main file plus the committed frames that runs the schema admission and reads the
+/// enabled-root rows. Every refusal is typed; no SQL error is ever read as an empty set.
+fn read_committed(
+    database: &Path,
+    file: &File,
+    wal: Option<File>,
+    journal_present: bool,
+    hooked: bool,
+) -> Result<CommittedRead, StoreError> {
     let mut header = [0_u8; 100];
     let filled = {
         let mut filled = 0;
@@ -321,7 +892,27 @@ fn prevalidate(database: &Path, file: &File) -> Result<(), StoreError> {
         filled
     };
     if filled == 0 {
-        return Ok(());
+        // A zero-byte main is Fresh only beside no `-journal` and an absent or empty `-wal`:
+        // the writable open deletes a log beside a zero-page main, discarding its frames. Other
+        // sidecars are refused in the non-empty order, before any `-wal` byte is read.
+        if journal_present {
+            return Err(StoreError::Corrupt);
+        }
+        if let Some(wal) = &wal {
+            let length = wal.metadata().map_err(|_| StoreError::Io)?.len();
+            if length > ADMISSION_WAL_BYTES {
+                return Err(StoreError::AdmissionLimit(AdmissionBound::WalBytes));
+            }
+            if length > 0 {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        return Ok(CommittedRead {
+            roots: Vec::new(),
+            mark: None,
+            wal_length: 0,
+            reads: ViewReads::default(),
+        });
     }
     if filled < header.len() || !header.starts_with(b"SQLite format 3\0") {
         return Err(StoreError::Corrupt);
@@ -330,26 +921,165 @@ fn prevalidate(database: &Path, file: &File) -> Result<(), StoreError> {
         header[60], header[61], header[62], header[63],
     ]));
     migrations::check_version(version).map_err(|_| StoreError::UnsupportedVersion)?;
-    if sidecar_path(database, "-journal").exists() {
+    if journal_present {
         return Err(StoreError::Corrupt);
     }
-    let overlay = match crate::ingest::fs::open_regular(&sidecar_path(database, "-wal")) {
-        Ok((wal, metadata)) if metadata.len() > 0 => {
-            let overlay = sqlite_ro::WalOverlay::committed(wal).map_err(|_| StoreError::Corrupt)?;
-            if let Some(committed) = overlay.user_version().map_err(|_| StoreError::Corrupt)? {
-                migrations::check_version(i64::from(committed))
-                    .map_err(|_| StoreError::UnsupportedVersion)?;
+    let (overlay, wal_length) = match wal {
+        Some(wal) => {
+            let length = wal.metadata().map_err(|_| StoreError::Io)?.len();
+            if length == 0 {
+                (None, 0)
+            } else {
+                let overlay =
+                    WalOverlay::committed_within(wal, ADMISSION_WAL_BYTES).map_err(|error| {
+                        match error {
+                            WalError::TooLarge => {
+                                StoreError::AdmissionLimit(AdmissionBound::WalBytes)
+                            }
+                            WalError::Invalid => StoreError::Corrupt,
+                            WalError::Io => StoreError::Io,
+                        }
+                    })?;
+                if let Some(committed) = overlay.user_version().map_err(|_| StoreError::Corrupt)? {
+                    migrations::check_version(i64::from(committed))
+                        .map_err(|_| StoreError::UnsupportedVersion)?;
+                }
+                (Some(overlay), length)
             }
-            Some(overlay)
         }
-        Ok(_) => None,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return Err(StoreError::UnsafeFile),
+        None => (None, 0),
     };
-    with_rollback_view(database, overlay, |connection| {
-        migrations::admit(connection).map(|_| ())
+    let mark = overlay.as_ref().map(|overlay| overlay.mark().clone());
+    #[cfg(feature = "test-faults")]
+    if hooked {
+        run_admission_hook(AdmissionPoint::AfterOverlay);
+    }
+    let (result, reads) =
+        with_rollback_view(database, overlay, admission_read_cap(), |connection| {
+            let roots = match migrations::admit(connection)? {
+                migrations::Admission::Fresh => Vec::new(),
+                migrations::Admission::Current => enabled_roots(connection)?,
+            };
+            Ok::<_, StoreError>(roots)
+        });
+    note_history_open();
+    if reads.refused {
+        return Err(StoreError::AdmissionLimit(AdmissionBound::ReadBytes));
+    }
+    let roots = result.map_err(|_| StoreError::Corrupt)??;
+    #[cfg(feature = "test-faults")]
+    if hooked {
+        run_admission_hook(AdmissionPoint::AfterRoots(reads.bytes));
+    }
+    let _ = hooked;
+    Ok(CommittedRead {
+        roots,
+        mark,
+        wal_length,
+        reads,
     })
-    .map_err(|_| StoreError::Corrupt)?
+}
+
+/// The enabled `sources` rows, at most [`ADMISSION_ENABLED_SOURCES`]; a further row is refused.
+fn enabled_roots(connection: &Connection) -> Result<Vec<AdmittedRoot>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT source_id, canonical_root, kind, root_device, root_inode \
+             FROM sources WHERE consent = 'enabled'",
+        )
+        .map_err(|_| StoreError::Corrupt)?;
+    let mut rows = statement.query([]).map_err(|_| StoreError::Corrupt)?;
+    let mut roots = Vec::new();
+    while let Some(row) = rows.next().map_err(|_| StoreError::Corrupt)? {
+        if roots.len() == ADMISSION_ENABLED_SOURCES {
+            return Err(StoreError::AdmissionLimit(AdmissionBound::EnabledSources));
+        }
+        let kind: String = row.get(2).map_err(|_| StoreError::Corrupt)?;
+        let device: Option<i64> = row.get(3).map_err(|_| StoreError::Corrupt)?;
+        let inode: Option<i64> = row.get(4).map_err(|_| StoreError::Corrupt)?;
+        let root: String = row.get(1).map_err(|_| StoreError::Corrupt)?;
+        roots.push(AdmittedRoot {
+            source_id: row.get(0).map_err(|_| StoreError::Corrupt)?,
+            canonical_root: PathBuf::from(root),
+            kind: parse_kind(&kind).ok_or(StoreError::Corrupt)?,
+            root_device: device
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| StoreError::Corrupt)?,
+            root_inode: inode
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| StoreError::Corrupt)?,
+        });
+    }
+    Ok(roots)
+}
+
+fn parse_kind(value: &str) -> Option<SourceKind> {
+    [
+        SourceKind::Builtin,
+        SourceKind::Environment,
+        SourceKind::Custom,
+    ]
+    .into_iter()
+    .find(|kind| kind.as_str() == value)
+}
+
+/// What the read-only existing-history preflight found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Preflight {
+    DirectoryMissing,
+    HistoryMissing,
+    Validated,
+}
+
+/// Read-only existing-history preflight of the ordinary core opens: walks the components from
+/// the anchor handle with non-creating opens and validates the history and any log it finds.
+/// Only a genuine `ENOENT` ends the walk early; every other error is refused typed. Every
+/// descriptor opened here is closed before this returns.
+fn preflight_existing(
+    data_dir: &Path,
+    anchor: &DataAnchor,
+    relative: &Path,
+) -> Result<Preflight, StoreError> {
+    let mut directory =
+        sqlite_ro::open_directory(&anchor.path).map_err(|_| StoreError::UnsafeFile)?;
+    let held = directory.metadata().map_err(|_| StoreError::Io)?;
+    if (held.dev(), held.ino()) != (anchor.device, anchor.inode) {
+        return Err(StoreError::UnsafeFile);
+    }
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(StoreError::InvalidRoot);
+        };
+        match open_directory_at(&directory, name) {
+            Ok(next) => directory = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Preflight::DirectoryMissing);
+            }
+            Err(_) => return Err(StoreError::UnsafeFile),
+        }
+    }
+    let Some(history) = open_file_at(&directory, OsStr::new("history.sqlite"))? else {
+        return Ok(Preflight::HistoryMissing);
+    };
+    let held = history.metadata().map_err(|_| StoreError::Io)?;
+    if !regular_unaliased(&held) {
+        return Err(StoreError::UnsafeFile);
+    }
+    let database = data_dir.join("history.sqlite");
+    if guard_files(&database)? != Some((held.dev(), held.ino())) {
+        return Err(StoreError::UnsafeFile);
+    }
+    let wal = open_file_at(&directory, OsStr::new("history.sqlite-wal"))?;
+    read_committed(
+        &database,
+        &history,
+        wal,
+        sidecar_path(&database, "-journal").exists(),
+        false,
+    )?;
+    Ok(Preflight::Validated)
 }
 
 fn backoff_ms(change_count: u32) -> i64 {
@@ -376,11 +1106,15 @@ impl Store {
         let relative = data_dir
             .strip_prefix(&anchor.path)
             .map_err(|_| StoreError::InvalidRoot)?;
+        let preflight = preflight_existing(data_dir, anchor, relative)?;
         let mut directory =
             sqlite_ro::open_directory(&anchor.path).map_err(|_| StoreError::UnsafeFile)?;
         let held = directory.metadata().map_err(|_| StoreError::Io)?;
         if (held.dev(), held.ino()) != (anchor.device, anchor.inode) {
             return Err(StoreError::UnsafeFile);
+        }
+        if preflight == Preflight::DirectoryMissing {
+            note_writable_open();
         }
         for component in relative.components() {
             let std::path::Component::Normal(name) = component else {
@@ -394,12 +1128,25 @@ impl Store {
             (metadata.dev(), metadata.ino())
         };
         let database = data_dir.join("history.sqlite");
+        note_writable_open();
         let (history, _created) =
             sqlite_ro::open_or_create_file_at(&directory, std::ffi::OsStr::new("history.sqlite"))
                 .map_err(|error| match error.kind() {
                 std::io::ErrorKind::NotFound => StoreError::Io,
                 _ => StoreError::UnsafeFile,
             })?;
+        note_history_open();
+        Self::finish_open(database, history, data_identity, true)
+    }
+
+    /// Everything after the history descriptor is held: identity proof, optional bounded
+    /// validation, the kernel-checked by-name open, schema admission and the WAL pragma.
+    fn finish_open(
+        database: PathBuf,
+        history: File,
+        data_identity: (u64, u64),
+        validate: bool,
+    ) -> Result<Self, StoreError> {
         let held = history.metadata().map_err(|_| StoreError::Io)?;
         if !regular_unaliased(&held) {
             return Err(StoreError::UnsafeFile);
@@ -410,7 +1157,9 @@ impl Store {
         if guard_files(&database)? != Some(identity) {
             return Err(StoreError::UnsafeFile);
         }
-        prevalidate(&database, &history)?;
+        if validate {
+            prevalidate(&database, &history)?;
+        }
         // The by-name open below is checked at the kernel level: the descriptor SQLite actually
         // obtains must be the inode held through the bound handle, and every sidecar it opens
         // must be regular and unaliased. A path swapped for the instant of the open (restored
@@ -426,6 +1175,7 @@ impl Store {
             Err(_) if bind.refused() => return Err(StoreError::UnsafeFile),
             Err(_) => return Err(StoreError::Sqlite),
         };
+        note_history_open();
         if !bind.main_verified() || bind.refused() {
             return Err(StoreError::UnsafeFile);
         }
@@ -464,6 +1214,109 @@ impl Store {
             #[cfg(feature = "test-faults")]
             fault: None,
         })
+    }
+
+    /// Opens the store beneath the claimed data directory `owner` holds: the history is opened or
+    /// created relative to the guard descriptor. Admission of an existing history happened before
+    /// (`admit_existing` and `open_admitted`); nothing here creates a directory.
+    pub fn open_bound_owned(data_dir: &Path, owner: &DataDirOwner) -> Result<Self, StoreError> {
+        if owner.path != data_dir {
+            return Err(StoreError::InvalidRoot);
+        }
+        note_writable_open();
+        let (history, _created) = sqlite_ro::open_or_create_file_at(
+            &owner.directory,
+            std::ffi::OsStr::new("history.sqlite"),
+        )
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => StoreError::Io,
+            _ => StoreError::UnsafeFile,
+        })?;
+        note_history_open();
+        Self::finish_open(
+            data_dir.join("history.sqlite"),
+            history,
+            owner.identity,
+            false,
+        )
+    }
+
+    /// The one bounded committed read of an existing history, beneath the claimed directory:
+    /// read-only history and log descriptors are held, the log is length-checked and walked, and
+    /// one read transaction runs the schema admission and reads the enabled roots. Nothing is
+    /// written, created or recovered.
+    pub fn admit_existing(
+        data_dir: &Path,
+        _anchor: &DataAnchor,
+        owner: &DataDirOwner,
+    ) -> Result<Admission, StoreError> {
+        if owner.path != data_dir {
+            return Err(StoreError::InvalidRoot);
+        }
+        let Some(history) = open_file_at(&owner.directory, OsStr::new("history.sqlite"))? else {
+            return Err(StoreError::Io);
+        };
+        let held = history.metadata().map_err(|_| StoreError::Io)?;
+        if !regular_unaliased(&held) {
+            return Err(StoreError::UnsafeFile);
+        }
+        let history_identity = (held.dev(), held.ino());
+        let database = data_dir.join("history.sqlite");
+        if guard_files(&database)? != Some(history_identity) {
+            return Err(StoreError::UnsafeFile);
+        }
+        let wal = open_file_at(&owner.directory, OsStr::new("history.sqlite-wal"))?;
+        let wal_identity = match &wal {
+            Some(wal) => {
+                let metadata = wal.metadata().map_err(|_| StoreError::Io)?;
+                if !regular_unaliased(&metadata) {
+                    return Err(StoreError::UnsafeFile);
+                }
+                Some((metadata.dev(), metadata.ino()))
+            }
+            None => None,
+        };
+        let journal_present = exists_at(&owner.directory, "history.sqlite-journal")?;
+        // The log descriptor the walk consumes is a duplicate: the original stays held for the
+        // recheck.
+        let walk_wal = wal
+            .as_ref()
+            .map(File::try_clone)
+            .transpose()
+            .map_err(|_| StoreError::Io)?;
+        let read = read_committed(&database, &history, walk_wal, journal_present, true)?;
+        let admission = Admission {
+            roots: read.roots,
+            history,
+            history_identity,
+            wal,
+            wal_identity,
+            wal_length: read.wal_length,
+            mark: read.mark,
+            ranges: read.reads.ranges,
+            read_bytes: read.reads.bytes,
+        };
+        #[cfg(feature = "test-faults")]
+        run_admission_hook(AdmissionPoint::AfterAdmission);
+        Ok(admission)
+    }
+
+    /// Step 3: re-verifies the anchor, guard and history identities, the log mark and every
+    /// recorded range from the held descriptors, one comparison after another, immediately
+    /// before the writable open. A changed mark or byte is [`StoreError::Busy`] (an observation,
+    /// not a guarantee against an outside writer); any other identity change is
+    /// [`StoreError::UnsafeFile`]. The held descriptors close before the SQLite connection opens.
+    pub fn open_admitted(
+        data_dir: &Path,
+        owner: &DataDirOwner,
+        admission: Admission,
+    ) -> Result<Self, StoreError> {
+        if owner.path != data_dir {
+            return Err(StoreError::InvalidRoot);
+        }
+        recheck_admission(data_dir, owner, &admission)?;
+        drop(admission);
+        Self::open_bound_owned(data_dir, owner)
     }
 
     /// Device and inode of the data directory this store is bound to.
@@ -875,6 +1728,8 @@ impl Store {
             advance,
         )?;
         #[cfg(feature = "test-faults")]
+        panic_if_armed();
+        #[cfg(feature = "test-faults")]
         if fault == Some(FaultPoint::BeforeCommit) {
             return Err(StoreError::InjectedBeforeCommit);
         }
@@ -995,6 +1850,8 @@ impl Store {
             clean,
         )?;
         #[cfg(feature = "test-faults")]
+        panic_if_armed();
+        #[cfg(feature = "test-faults")]
         if fault == Some(FaultPoint::BeforeCommit) {
             return Err(StoreError::InjectedBeforeCommit);
         }
@@ -1086,6 +1943,8 @@ impl Store {
             request.now_ms,
             false,
         )?;
+        #[cfg(feature = "test-faults")]
+        panic_if_armed();
         #[cfg(feature = "test-faults")]
         if fault == Some(FaultPoint::BeforeCommit) {
             return Err(StoreError::InjectedBeforeCommit);
@@ -1563,6 +2422,12 @@ fn ensure_source(
             params![source_id, ConsentState::Enabled.as_str()],
         ))?;
         return Ok(source_id);
+    }
+    // A new row past the source bound is refused before it is inserted.
+    let rows: i64 =
+        sqlite(transaction.query_row("SELECT count(*) FROM sources", [], |row| row.get(0)))?;
+    if usize::try_from(rows).map_err(|_| StoreError::InvalidStoredValue)? >= MAX_REPORTED_SOURCES {
+        return Err(StoreError::LimitExceeded);
     }
     sqlite(transaction.query_row(
         "INSERT INTO sources(source_id, harness, canonical_root, kind, consent) \
@@ -2492,6 +3357,110 @@ impl Store {
     /// Read from the projection maintained in the same transactions that write the records.
     pub fn source_projection(&self, source_id: &str) -> Result<SourceProjection, StoreError> {
         let totals = projection_totals(&self.connection, source_id)?.unwrap_or([0; 19]);
+        Self::projection_from_totals(totals)
+    }
+
+    /// The projection of the records whose `occurred_at_ms` lies in `[start_ms, end_ms)`: one
+    /// aggregate over the `usage_events_source` index, producing the same 19 counters as
+    /// `source_projection_totals` and converted by the same code. A SQLite integer `sum()`
+    /// overflow is an error and is never wrapped; a window with no records has `records` 0 and
+    /// every observation unavailable, never 0.
+    pub fn source_window_projection(
+        &self,
+        source_id: &str,
+        window: crate::time::DayBounds,
+    ) -> Result<SourceProjection, StoreError> {
+        let totals = sqlite(self.connection.query_row(
+            "SELECT COUNT(*), \
+             COUNT(input_tokens), COALESCE(SUM(input_tokens), 0), \
+             COUNT(output_tokens), COALESCE(SUM(output_tokens), 0), \
+             COUNT(reasoning_tokens), COALESCE(SUM(reasoning_tokens), 0), \
+             COUNT(cache_read_tokens), COALESCE(SUM(cache_read_tokens), 0), \
+             COUNT(cache_write_tokens), COALESCE(SUM(cache_write_tokens), 0), \
+             COUNT(total_tokens), COALESCE(SUM(total_tokens), 0), \
+             COALESCE(SUM(total_provenance IS 'derived'), 0), \
+             COALESCE(SUM(total_mismatch), 0), COALESCE(SUM(mirror_conflict), 0), \
+             COALESCE(SUM(pending_partial), 0), \
+             COALESCE(SUM(acquisition_consistency = 'sqlite_read_transaction'), 0), \
+             COALESCE(SUM(acquisition_consistency = 'file_by_file_best_effort'), 0) \
+             FROM usage_events \
+             WHERE source_id = ?1 AND occurred_at_ms >= ?2 AND occurred_at_ms < ?3",
+            params![source_id, window.start_ms, window.end_ms],
+            |row| {
+                let mut totals = [0_i64; 19];
+                for (index, slot) in totals.iter_mut().enumerate() {
+                    *slot = row.get(index)?;
+                }
+                Ok(totals)
+            },
+        ))?;
+        Self::projection_from_totals(totals)
+    }
+
+    /// Every registered source with its consent and last status row, at most
+    /// [`MAX_REPORTED_SOURCES`], ordered by source id.
+    pub fn source_rows(&self) -> Result<Vec<SourceRow>, StoreError> {
+        let mut statement = sqlite(self.connection.prepare(&format!(
+            "{SOURCE_ROW_SQL} ORDER BY s.source_id LIMIT {}",
+            MAX_REPORTED_SOURCES + 1
+        )))?;
+        let rows = sqlite(statement.query_map([], source_row_from))?;
+        let mut sources = Vec::new();
+        for row in rows {
+            sources.push(sqlite(row)??);
+        }
+        if sources.len() > MAX_REPORTED_SOURCES {
+            return Err(StoreError::LimitExceeded);
+        }
+        Ok(sources)
+    }
+
+    /// Whether `source_id` has a durable `sources` row. Reads nothing else of it.
+    pub fn has_source(&self, source_id: &str) -> Result<bool, StoreError> {
+        sqlite(
+            self.connection
+                .query_row(
+                    "SELECT 1 FROM sources WHERE source_id = ?1",
+                    [source_id],
+                    |_| Ok(()),
+                )
+                .optional(),
+        )
+        .map(|row| row.is_some())
+    }
+
+    /// One registered source, or `None` when no such id is durable.
+    pub fn source_row(&self, source_id: &str) -> Result<Option<SourceRow>, StoreError> {
+        sqlite(
+            self.connection
+                .query_row(
+                    &format!("{SOURCE_ROW_SQL} WHERE s.source_id = ?1"),
+                    [source_id],
+                    source_row_from,
+                )
+                .optional(),
+        )?
+        .transpose()
+    }
+
+    /// Sets a registered source's consent; the id, status row and history are untouched.
+    pub fn set_consent(
+        &mut self,
+        source_id: &str,
+        consent: ConsentState,
+    ) -> Result<(), StoreError> {
+        let transaction = self.begin()?;
+        let changed = sqlite(transaction.execute(
+            "UPDATE sources SET consent = ?2 WHERE source_id = ?1",
+            params![source_id, consent.as_str()],
+        ))?;
+        if changed != 1 {
+            return Err(StoreError::InvalidRoot);
+        }
+        sqlite(transaction.commit())
+    }
+
+    fn projection_from_totals(totals: [i64; 19]) -> Result<SourceProjection, StoreError> {
         validate_totals(&totals)?;
         let records = totals[0];
         let pending = totals[16] > 0;
@@ -2635,6 +3604,83 @@ fn sql_count(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::CountOutOfRange)
 }
 
+/// One registered source as the store holds it: identity, consent, root metadata and the last
+/// pass status. Nothing here is derived from usage content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceRow {
+    pub source_id: String,
+    pub harness: String,
+    pub canonical_root: String,
+    pub kind: SourceKind,
+    pub consent: ConsentState,
+    pub root_device: Option<u64>,
+    pub root_inode: Option<u64>,
+    /// `None` before the first pass has been recorded.
+    pub outcome: Option<PassOutcome>,
+    pub last_attempt_ms: Option<i64>,
+    pub last_success_ms: Option<i64>,
+    pub last_error_code: Option<FailureCode>,
+    pub rejected_count: u32,
+    pub pending_partial: bool,
+}
+
+const SOURCE_ROW_SQL: &str = "SELECT s.source_id, s.harness, s.canonical_root, s.kind, \
+     s.consent, s.root_device, s.root_inode, st.outcome, st.last_attempt_ms, \
+     st.last_success_ms, st.last_error_code, st.rejected_count, COALESCE(p.pending_count, 0) \
+     FROM sources s LEFT JOIN source_status st ON st.source_id = s.source_id \
+     LEFT JOIN source_projection_totals p ON p.source_id = s.source_id";
+
+fn source_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<SourceRow, StoreError>> {
+    let kind: String = row.get(3)?;
+    let consent: String = row.get(4)?;
+    let device: Option<i64> = row.get(5)?;
+    let inode: Option<i64> = row.get(6)?;
+    let outcome: Option<String> = row.get(7)?;
+    let code: Option<String> = row.get(10)?;
+    let rejected: Option<i64> = row.get(11)?;
+    let pending: i64 = row.get(12)?;
+    let decoded = (|| {
+        Ok(SourceRow {
+            source_id: row.get(0).map_err(|_| StoreError::InvalidStoredValue)?,
+            harness: row.get(1).map_err(|_| StoreError::InvalidStoredValue)?,
+            canonical_root: row.get(2).map_err(|_| StoreError::InvalidStoredValue)?,
+            kind: parse_kind(&kind).ok_or(StoreError::InvalidStoredValue)?,
+            consent: [
+                ConsentState::Undecided,
+                ConsentState::Enabled,
+                ConsentState::Denied,
+            ]
+            .into_iter()
+            .find(|state| state.as_str() == consent)
+            .ok_or(StoreError::InvalidStoredValue)?,
+            root_device: unsigned(device)?,
+            root_inode: unsigned(inode)?,
+            outcome: outcome
+                .map(|value| {
+                    [
+                        PassOutcome::Consistent,
+                        PassOutcome::CatchingUp,
+                        PassOutcome::Partial,
+                        PassOutcome::Unavailable,
+                    ]
+                    .into_iter()
+                    .find(|candidate| candidate.as_str() == value)
+                    .ok_or(StoreError::InvalidStoredValue)
+                })
+                .transpose()?,
+            last_attempt_ms: row.get(8).map_err(|_| StoreError::InvalidStoredValue)?,
+            last_success_ms: row.get(9).map_err(|_| StoreError::InvalidStoredValue)?,
+            last_error_code: code
+                .map(|value| FailureCode::parse(&value).ok_or(StoreError::InvalidStoredValue))
+                .transpose()?,
+            rejected_count: u32::try_from(rejected.unwrap_or(0))
+                .map_err(|_| StoreError::InvalidStoredValue)?,
+            pending_partial: pending > 0,
+        })
+    })();
+    Ok(decoded)
+}
+
 impl PassOutcome {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -2728,4 +3774,161 @@ fn checked_relative_path(path: &str) -> Result<PathBuf, StoreError> {
         return Err(StoreError::InvalidRelativePath);
     }
     Ok(path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingest::Engine;
+    use crate::ingest::fs::RealSourceFs;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn count_sources(store: &Store) -> Result<i64, rusqlite::Error> {
+        store
+            .connection
+            .query_row("SELECT count(*) FROM sources", [], |row| row.get(0))
+    }
+
+    /// A 65th `sources` row is refused inside `register_source`'s transaction, before any insert
+    /// or consent change; registered roots stay registrable.
+    #[test]
+    fn a_65th_sources_row_is_refused_before_any_insert() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let data = directory.path().canonicalize()?.join("data");
+        let mut store = Store::open(&data)?;
+        for index in 0..64_u64 {
+            store.register_source(
+                Path::new(&format!("/roots/r{index}")),
+                SourceKind::Custom,
+                (1, index),
+            )?;
+        }
+        assert_eq!(count_sources(&store)?, 64);
+        let first = store.source_rows()?[0].source_id.clone();
+        store.set_consent(&first, ConsentState::Denied)?;
+        let before = store.source_rows()?;
+        assert_eq!(
+            store
+                .register_source(Path::new("/roots/r64"), SourceKind::Custom, (1, 64))
+                .err(),
+            Some(StoreError::LimitExceeded)
+        );
+        assert_eq!(count_sources(&store)?, 64, "no 65th row");
+        assert_eq!(store.source_rows()?, before, "rows and consent unchanged");
+        store.register_source(Path::new("/roots/r1"), SourceKind::Custom, (1, 1))?;
+        assert_eq!(count_sources(&store)?, 64);
+        Ok(())
+    }
+
+    /// (dev, ino, bytes) of the history and each sidecar, `None` when absent.
+    type Files = Vec<Option<(u64, u64, u64, Vec<u8>)>>;
+
+    fn files(data: &Path) -> Result<Files, std::io::Error> {
+        ["", "-wal", "-shm", "-journal"]
+            .iter()
+            .map(|suffix| {
+                let path = data.join(format!("history.sqlite{suffix}"));
+                match std::fs::metadata(&path) {
+                    Ok(metadata) => {
+                        // A sparse oversized log is compared by identity and length only.
+                        let bytes = if metadata.len() <= 1024 * 1024 {
+                            std::fs::read(&path)?
+                        } else {
+                            Vec::new()
+                        };
+                        Ok(Some((
+                            metadata.dev(),
+                            metadata.ino(),
+                            metadata.len(),
+                            bytes,
+                        )))
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })
+            .collect()
+    }
+
+    /// A valid store's non-empty log, taken while its writer is still open.
+    fn valid_log(base: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let database = base.join("donor.sqlite");
+        let connection = rusqlite::Connection::open(&database)?;
+        let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        assert_eq!(mode, "wal");
+        connection.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")?;
+        let log = std::fs::read(base.join("donor.sqlite-wal"))?;
+        assert!(!log.is_empty());
+        Ok(log)
+    }
+
+    const CALLERS: [&str; 3] = ["Store::open", "Store::open_bound", "Engine::load_existing"];
+
+    /// One caller of the existing-history preflight, with its typed result.
+    fn open_with(caller: &str, data: &Path, home: &Path) -> Result<(), StoreError> {
+        match caller {
+            "Store::open" => Store::open(data).map(drop),
+            "Store::open_bound" => crate::discovery::anchor_for(data)
+                .map_err(|_| StoreError::Io)
+                .and_then(|(path, anchor)| Store::open_bound(&path, &anchor).map(drop)),
+            _ => Engine::<RealSourceFs>::open(data, home).load_existing(&RealSourceFs),
+        }
+    }
+
+    /// A zero-byte history is Fresh only with no `-journal` and an absent or empty `-wal`;
+    /// otherwise it is refused typed like a non-empty one, with nothing opened for writing.
+    #[test]
+    fn zero_byte_history_beside_a_sidecar_is_refused() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let base = directory.path().canonicalize()?;
+        let home = base.join("home");
+        std::fs::create_dir(&home)?;
+        let log = valid_log(&base)?;
+        let over = ADMISSION_WAL_BYTES + 1;
+        for (name, sidecar, length, want) in [
+            ("journal", "-journal", None, StoreError::Corrupt),
+            (
+                "oversized log",
+                "-wal",
+                Some(over),
+                StoreError::AdmissionLimit(AdmissionBound::WalBytes),
+            ),
+            ("valid log", "-wal", None, StoreError::Corrupt),
+        ] {
+            let data = base.join(format!("data-{}", name.replace(' ', "-")));
+            std::fs::create_dir(&data)?;
+            std::fs::write(data.join("history.sqlite"), b"")?;
+            let side = data.join(format!("history.sqlite{sidecar}"));
+            match length {
+                Some(length) => std::fs::File::create(&side)?.set_len(length)?,
+                None => std::fs::write(&side, &log)?,
+            }
+            let before = files(&data)?;
+            for caller in CALLERS {
+                reset_writable_open_attempts();
+                let result = open_with(caller, &data, &home);
+                assert_eq!(result, Err(want.clone()), "{name}: {caller}");
+                assert_eq!(
+                    writable_open_attempts(),
+                    0,
+                    "{name}: {caller}: no writable open"
+                );
+                assert_eq!(files(&data)?, before, "{name}: {caller}: files unchanged");
+            }
+        }
+
+        // Control: a zero-byte history alone is Fresh and the creating open finishes V1.
+        let data = base.join("data-fresh");
+        std::fs::create_dir(&data)?;
+        std::fs::write(data.join("history.sqlite"), b"")?;
+        reset_writable_open_attempts();
+        let store = Store::open(&data)?;
+        assert_eq!(writable_open_attempts(), 1);
+        let version: i64 = store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(version, 1);
+        Ok(())
+    }
 }

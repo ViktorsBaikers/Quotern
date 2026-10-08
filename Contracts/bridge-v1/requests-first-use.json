@@ -1,0 +1,7 @@
+{
+  "open": {"data_dir": "/quotern-golden/data", "home": "/quotern-golden/home"},
+  "set_source_selection": {"harness": "opencode", "root": "/quotern-golden/opencode", "selected": true},
+  "list_sources": {},
+  "ingest": {"now_ms": 1775124000000},
+  "today_snapshot": {"tz": "UTC", "now_ms": 1775124000000}
+}

@@ -242,6 +242,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "quotern-ffi"
+version = "0.1.0"
+dependencies = [
+ "quotern-core",
+ "quotern-ffi",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

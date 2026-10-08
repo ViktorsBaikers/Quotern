@@ -1,0 +1,13 @@
+{
+  "data": {
+    "by_source": [],
+    "source_reported": [],
+    "window": {
+      "end_ms": 1775174400000,
+      "start_ms": 1775088000000,
+      "tz": "UTC"
+    }
+  },
+  "ok": true,
+  "v": 1
+}

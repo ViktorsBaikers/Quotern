@@ -1,0 +1,24 @@
+[package]
+name = "quotern-ffi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = []
+# Test-only seams. Enabled for this crate's own tests through the dev-dependency below and never
+# in the release staticlib.
+test-faults = ["quotern-core/test-faults"]
+
+[dependencies]
+quotern-core = { path = "../quotern-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[dev-dependencies]
+quotern-ffi = { path = ".", features = ["test-faults"] }
+quotern-core = { path = "../quotern-core", features = ["test-faults"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+tempfile = "3.27.0"

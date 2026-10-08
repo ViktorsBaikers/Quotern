@@ -14,10 +14,11 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use crate::adapters::opencode::StepFinishPart;
 use crate::adapters::opencode::{self, DecodeError, ReadBudget, ResolveError};
-use crate::discovery::{self, CanonicalRoots, RootError};
+use crate::discovery::{self, CanonicalRoots, DataAnchor, RootError};
 use crate::domain::{
     ConsentState, FailureCode, PassCounters, PassOutcome, PassReport, RecordCandidate,
     SourceAuthorization, SourceKind, SourceReportedObservation,
@@ -25,13 +26,16 @@ use crate::domain::{
 use crate::limits::{
     MAX_DIRECTORY_DEPTH, MAX_DIRECTORY_ENTRIES, MAX_DIRECTORY_OPENS, MAX_FRONTIER_DIRECTORIES,
     MAX_HEADER_READS, MAX_KNOWN_PATHS_PER_PASS, MAX_METADATA_CALLS, MAX_OPEN_DIRECTORIES,
-    MAX_OPENCODE_RECORD_BYTES, MAX_PATH_BYTES, MAX_SOURCE_BYTES_PER_PASS,
+    MAX_OPENCODE_RECORD_BYTES, MAX_PATH_BYTES, MAX_REPORTED_SOURCES, MAX_SOURCE_BYTES_PER_PASS,
     MAX_SOURCE_DATABASES_PER_PASS, MAX_SQLITE_ROWS_PER_PASS,
 };
-use crate::snapshot::{ObservationCursor, ObservationPage, SourceSnapshot};
+use crate::snapshot::{
+    DailyReported, ObservationCursor, ObservationPage, SourceEntry, SourceSnapshot, TodaySnapshot,
+    Window, WindowError,
+};
 use crate::store::{
-    CommitRequest, DiscardRequest, FileFailure, PendingMark, ProgressUpdate, SpoolFile, StageBatch,
-    StageRequest, Store, StoreError, retry_outcome,
+    CommitRequest, DataDirOwner, DiscardRequest, FileFailure, PendingMark, ProgressUpdate,
+    SourceRow, SpoolFile, StageBatch, StageRequest, Store, StoreError, retry_outcome,
 };
 
 use self::fs::{DirEntries, FileStamp, SourceFs, budget_exhausted};
@@ -425,7 +429,7 @@ impl DirectoryFrontier {
 
 /// Everything one pass gathers before it is written in a single store transaction.
 #[derive(Default)]
-struct PassState {
+struct PassState<'a> {
     counters: PassCounters,
     candidates: Vec<RecordCandidate>,
     files: Vec<SpoolFile>,
@@ -451,6 +455,8 @@ struct PassState {
     current_incomplete: bool,
     changing: bool,
     changing_path: Option<PathBuf>,
+    cancel: Option<&'a AtomicBool>,
+    cancelled: bool,
 }
 
 fn lesser(current: Option<FailureCode>, code: FailureCode) -> Option<FailureCode> {
@@ -460,7 +466,19 @@ fn lesser(current: Option<FailureCode>, code: FailureCode) -> Option<FailureCode
     }
 }
 
-impl PassState {
+impl PassState<'_> {
+    /// Whether the cancel flag is set. Called only where the pass already polls its budget, so
+    /// a cancel stops the pass exactly as a budget stop does.
+    fn cancel_requested(&mut self) -> bool {
+        if self
+            .cancel
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            self.cancelled = true;
+        }
+        self.cancelled
+    }
+
     fn reject(&mut self, code: FailureCode) {
         self.rejection = lesser(self.rejection, code);
     }
@@ -491,7 +509,7 @@ enum FileOutcome {
     Skipped,
 }
 
-pub struct OpenCodeEngine<F: SourceFs> {
+struct OpenCodeSource<F: SourceFs> {
     fs: F,
     source_request: PathBuf,
     data_request: PathBuf,
@@ -499,7 +517,6 @@ pub struct OpenCodeEngine<F: SourceFs> {
     roots: CanonicalRoots,
     source_identity: RootIdentity,
     data_identity: RootIdentity,
-    store: Store,
     source_id: String,
     generation: u64,
     frontier: DirectoryFrontier,
@@ -515,6 +532,8 @@ pub struct OpenCodeEngine<F: SourceFs> {
     /// generation with more databases than one pass can stat still completes. Reset whenever a
     /// database is read, because earlier pages would no longer describe the staged state.
     terminal_cursor: Option<PathBuf>,
+    /// The last pass observed its cancel flag at a budget poll.
+    cancelled: bool,
 }
 
 /// One message's part directory, read incrementally: the held iterator, the step-finish parts
@@ -561,40 +580,24 @@ enum Flow {
     Stop,
 }
 
-impl<F: SourceFs> OpenCodeEngine<F> {
-    pub fn open(
+impl<F: SourceFs> OpenCodeSource<F> {
+    /// A runtime for one registered root. The caller has validated the roots, proved both
+    /// identities and registered the source; everything else is loaded from `store` by `reload`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site per attach path; each argument is a fact the caller already proved"
+    )]
+    fn new(
         fs: F,
         source_root: &Path,
         data_dir: &Path,
         home: &Path,
-        authorization: SourceAuthorization,
-        kind: SourceKind,
-    ) -> Result<Self, PassReport> {
-        if let Some(report) = unauthorized(authorization) {
-            return Err(report);
-        }
-        let mut counters = PassCounters::default();
-        let unavailable = |failure: FailureCode, counters: PassCounters| {
-            pass_report(PassOutcome::Unavailable, Some(failure), counters, 0, None)
-        };
-        let roots = match discovery::validate_roots(&fs, source_root, data_dir, home, &mut counters)
-        {
-            Ok(roots) => roots,
-            Err(error) => return Err(unavailable(root_failure(error), counters)),
-        };
-        let source_identity = match root_identity(&fs, &roots.source, &mut counters) {
-            Ok(identity) => identity,
-            Err(stop) => return Err(unavailable(stop_failure(stop), counters)),
-        };
-        // Everything beneath the data root is created and opened through a handle bound to the
-        // identity validated above, so a path swapped since validation is refused, not followed.
-        let store = match Store::open_bound(&roots.data, &roots.data_anchor) {
-            Ok(store) => store,
-            Err(_) => return Err(unavailable(FailureCode::Store, counters)),
-        };
-        let (device, inode) = store.data_identity();
-        let data_identity = RootIdentity { device, inode };
-        let mut engine = Self {
+        roots: CanonicalRoots,
+        source_identity: RootIdentity,
+        data_identity: RootIdentity,
+        source_id: String,
+    ) -> Self {
+        Self {
             fs,
             source_request: source_root.to_path_buf(),
             data_request: data_dir.to_path_buf(),
@@ -603,42 +606,52 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             roots,
             source_identity,
             data_identity,
-            store,
-            source_id: String::new(),
+            source_id,
             generation: 0,
             failures: BTreeMap::new(),
             needs_reload: true,
             needs_reset: false,
             part_scan: None,
             terminal_cursor: None,
-        };
-        let registration = engine.store.register_source(
-            &engine.roots.source,
-            kind,
-            (source_identity.device, source_identity.inode),
-        );
-        match registration {
-            Ok(registration) => engine.source_id = registration.source_id,
-            Err(_) => return Err(unavailable(FailureCode::Store, counters)),
+            cancelled: false,
         }
-        if engine.reload().is_err() {
-            return Err(unavailable(FailureCode::Store, counters));
-        }
-        Ok(engine)
     }
 
-    pub fn pass(&mut self, authorization: SourceAuthorization, now_ms: i64) -> PassReport {
+    /// One pass that stops like a budget stop when `cancel` is observed: groups completed before
+    /// the poll publish through the unchanged stage/publish transactions, no group is split, and
+    /// the pass reports [`PassCancelled`].
+    fn pass_until(
+        &mut self,
+        store: &mut Store,
+        authorization: SourceAuthorization,
+        now_ms: i64,
+        cancel: &AtomicBool,
+    ) -> Result<PassReport, PassCancelled> {
+        self.cancelled = false;
+        let report = self.pass(store, authorization, now_ms, cancel);
+        if std::mem::take(&mut self.cancelled) {
+            Err(PassCancelled(report))
+        } else {
+            Ok(report)
+        }
+    }
+
+    fn pass(
+        &mut self,
+        store: &mut Store,
+        authorization: SourceAuthorization,
+        now_ms: i64,
+        cancel: &AtomicBool,
+    ) -> PassReport {
         if let Some(report) = unauthorized(authorization) {
             return report;
         }
         if self.needs_reset {
-            match self
-                .store
-                .reset_acquisition(&self.source_id, self.generation)
-            {
+            match store.reset_acquisition(&self.source_id, self.generation) {
                 Ok(()) | Err(StoreError::StaleGeneration) => self.needs_reset = false,
                 Err(error) => {
                     return self.report(
+                        store,
                         PassOutcome::Partial,
                         Some(store_failure(error)),
                         PassCounters::default(),
@@ -649,22 +662,24 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             self.needs_reload = true;
         }
         if self.needs_reload
-            && let Err(error) = self.reload()
+            && let Err(error) = self.reload(store)
         {
             return self.report(
+                store,
                 PassOutcome::Partial,
                 Some(store_failure(error)),
                 PassCounters::default(),
                 0,
             );
         }
-        match self.store.retry_state(&self.source_id) {
+        match store.retry_state(&self.source_id) {
             Ok(retry) => {
                 if retry.next_retry_ms.is_some_and(|next| now_ms < next) {
                     // Backing off after a source change, idle or busy refusal: no source I/O
                     // until the deadline.
                     let reason = retry.reason.unwrap_or(FailureCode::SourceChanging);
                     return self.report(
+                        store,
                         retry_outcome(reason, retry.change_count),
                         Some(reason),
                         PassCounters::default(),
@@ -674,6 +689,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             }
             Err(error) => {
                 return self.report(
+                    store,
                     PassOutcome::Partial,
                     Some(store_failure(error)),
                     PassCounters::default(),
@@ -681,11 +697,15 @@ impl<F: SourceFs> OpenCodeEngine<F> {
                 );
             }
         }
-        let mut state = PassState::default();
+        let mut state = PassState {
+            cancel: Some(cancel),
+            ..PassState::default()
+        };
         match self.check_roots(&mut state.counters) {
             RootCheck::Valid => {}
             RootCheck::Budget => {
                 return self.report(
+                    store,
                     PassOutcome::CatchingUp,
                     Some(FailureCode::LimitExceeded),
                     state.counters,
@@ -694,6 +714,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             }
             RootCheck::Conflict => {
                 return self.report(
+                    store,
                     PassOutcome::Unavailable,
                     Some(FailureCode::RootOverlap),
                     state.counters,
@@ -702,43 +723,40 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             }
         }
         if self.frontier.restart_blocked {
-            return self.report_restart_blocked(state.counters, now_ms);
+            return self.report_restart_blocked(store, state.counters, now_ms);
         }
         self.frontier.begin_pass();
-        state.source_seen = match self
-            .store
-            .generation_has_source_files(&self.source_id, self.generation)
-        {
-            Ok(seen) => seen,
-            Err(error) => {
-                return self.report(
-                    PassOutcome::Partial,
-                    Some(store_failure(error)),
-                    state.counters,
-                    0,
-                );
-            }
-        };
-        self.resume_part_scan(&mut state);
+        state.source_seen =
+            match store.generation_has_source_files(&self.source_id, self.generation) {
+                Ok(seen) => seen,
+                Err(error) => {
+                    return self.report(
+                        store,
+                        PassOutcome::Partial,
+                        Some(store_failure(error)),
+                        state.counters,
+                        0,
+                    );
+                }
+            };
+        self.resume_part_scan(store, &mut state);
         // Every directory of this generation has been listed and each message in them read, so
         // another refresh of the known messages could only start one more held scan and postpone
         // finalization forever; what is unfinished (held scan, failures, databases) still resumes.
         let drained = self.frontier.is_drained();
-        self.current_lane(&mut state, drained);
+        self.current_lane(store, &mut state, drained);
         if !state.changing && !state.caught_up {
-            self.walk(&mut state);
+            self.walk(store, &mut state);
         }
-        self.finish(state, now_ms)
+        self.cancelled = state.cancelled;
+        self.finish(store, state, now_ms)
     }
 
     /// Reserved lane: persisted failed and known source paths are revalidated before general
     /// discovery, so a current mutable record is read even when it sits behind a huge backlog.
-    fn current_lane(&mut self, state: &mut PassState, drained: bool) {
+    fn current_lane(&mut self, store: &mut Store, state: &mut PassState, drained: bool) {
         let mut relatives: Vec<PathBuf> = self.failures.keys().cloned().collect();
-        match self
-            .store
-            .known_paths(&self.source_id, MAX_KNOWN_PATHS_PER_PASS)
-        {
+        match store.known_paths(&self.source_id, MAX_KNOWN_PATHS_PER_PASS) {
             Ok(known) => relatives.extend(
                 known
                     .into_iter()
@@ -752,7 +770,11 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             if !seen.insert(relative.clone()) {
                 continue;
             }
-            if Lane::Current.exhausted(&state.counters) || state.changing || state.caught_up {
+            if Lane::Current.exhausted(&state.counters)
+                || state.changing
+                || state.caught_up
+                || state.cancel_requested()
+            {
                 break;
             }
             let path = self.roots.source.join(&relative);
@@ -781,7 +803,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
                 continue;
             }
             state.revalidated.push(relative.clone());
-            let outcome = self.process_file(&path, &metadata, state, Lane::Current);
+            let outcome = self.process_file(store, &path, &metadata, state, Lane::Current);
             // The reserved lane running out of budget ends only itself; discovery still runs.
             if matches!(outcome, FileOutcome::Budget) {
                 break;
@@ -794,7 +816,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
 
     /// The message whose part directory is held open is finished first, with the reserved lane's
     /// half of the budget, so every pass advances it and no other message can take its slot.
-    fn resume_part_scan(&mut self, state: &mut PassState) {
+    fn resume_part_scan(&mut self, store: &mut Store, state: &mut PassState) {
         let Some(scan) = &self.part_scan else {
             return;
         };
@@ -812,7 +834,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
                 return;
             }
         };
-        let outcome = self.process_file(&path, &metadata, state, Lane::Current);
+        let outcome = self.process_file(store, &path, &metadata, state, Lane::Current);
         if matches!(outcome, FileOutcome::Budget) {
             return;
         }
@@ -820,9 +842,9 @@ impl<F: SourceFs> OpenCodeEngine<F> {
     }
 
     /// Historical lane: bounded round-robin traversal of the directory frontier.
-    fn walk(&mut self, state: &mut PassState) {
+    fn walk(&mut self, store: &mut Store, state: &mut PassState) {
         loop {
-            if Lane::Full.exhausted(&state.counters) {
+            if Lane::Full.exhausted(&state.counters) || state.cancel_requested() {
                 state.caught_up = true;
                 break;
             }
@@ -839,7 +861,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
                 WalkStep::Error(code) => state.skip(code),
                 WalkStep::CompletedDirectory(stat) => state.files.push(stat),
                 WalkStep::Entry(entry) => {
-                    if let Flow::Stop = self.visit(entry, state) {
+                    if let Flow::Stop = self.visit(store, entry, state) {
                         break;
                     }
                 }
@@ -847,7 +869,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         }
     }
 
-    fn visit(&mut self, entry: Entry, state: &mut PassState) -> Flow {
+    fn visit(&mut self, store: &mut Store, entry: Entry, state: &mut PassState) -> Flow {
         if entry.path.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES {
             state.skip(FailureCode::LimitExceeded);
             return Flow::Continue;
@@ -876,7 +898,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             return Flow::Continue;
         }
         let path = entry.path.clone();
-        let outcome = self.process_file(&path, &metadata, state, Lane::Full);
+        let outcome = self.process_file(store, &path, &metadata, state, Lane::Full);
         self.apply(&path, outcome, state, Some(entry))
     }
 
@@ -993,6 +1015,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
 
     fn process_file(
         &mut self,
+        store: &mut Store,
         path: &Path,
         metadata: &std::fs::Metadata,
         state: &mut PassState,
@@ -1002,7 +1025,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             return FileOutcome::Skipped;
         }
         if is_opencode_database(path) {
-            self.process_database(path, metadata, state, lane)
+            self.process_database(store, path, metadata, state, lane)
         } else if let Some((session_id, message_id)) = message_path(&self.roots.source, path) {
             self.process_json_message(&session_id, &message_id, path, metadata, state, lane)
         } else {
@@ -1010,10 +1033,10 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         }
     }
 
-    fn finish(&mut self, mut state: PassState, now_ms: i64) -> PassReport {
+    fn finish(&mut self, store: &mut Store, mut state: PassState, now_ms: i64) -> PassReport {
         if state.changing {
             let paths: Vec<PathBuf> = state.changing_path.iter().cloned().collect();
-            return self.changed(state.counters, now_ms, &paths, &[]);
+            return self.changed(store, state.counters, now_ms, &paths, &[]);
         }
         // A parked directory is complete once its scan is no longer held.
         self.frontier
@@ -1060,7 +1083,14 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             failure = Some(FailureCode::SourceIdle);
         }
         if outcome == PassOutcome::Unavailable {
-            return self.finish_unavailable(state, prospective, database_failure, failure, now_ms);
+            return self.finish_unavailable(
+                store,
+                state,
+                prospective,
+                database_failure,
+                failure,
+                now_ms,
+            );
         }
         if root_complete && !state.source_seen {
             // Nothing readable was found: walk the tree again next pass instead of finalizing an
@@ -1074,16 +1104,16 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         let frontier = self.frontier.snapshot();
         let conflicts = candidate_keys(&self.roots.source, &state.candidates);
         if root_complete && state.source_seen {
-            match self.completed_databases_unchanged(&mut state) {
+            match self.completed_databases_unchanged(store, &mut state) {
                 Ok(true) => {}
-                Ok(false) => return self.changed(state.counters, now_ms, &[], &conflicts),
+                Ok(false) => return self.changed(store, state.counters, now_ms, &[], &conflicts),
                 Err(Stop::Budget) => {
                     // Not enough budget left to prove the staged databases unchanged: stay
                     // catching up and prove it with a fresh budget next pass.
                     state.caught_up = true;
                 }
                 Err(Stop::Fail(code)) => {
-                    return self.report(PassOutcome::Partial, Some(code), state.counters, 0);
+                    return self.report(store, PassOutcome::Partial, Some(code), state.counters, 0);
                 }
             }
         }
@@ -1103,20 +1133,20 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             pending: &state.pending,
         };
         if root_complete && state.source_seen {
-            let mut staged = match self.store.load_staged_candidates(
+            let mut staged = match store.load_staged_candidates(
                 &self.source_id,
                 &self.roots.source,
                 self.generation,
             ) {
                 Ok(staged) => staged,
-                Err(error) => return self.store_failed(error, state.counters),
+                Err(error) => return self.store_failed(store, error, state.counters),
             };
             staged.extend(state.candidates.iter().cloned());
             if let Err(ResolveError::SourceChanging) = opencode::resolve_candidates(staged) {
-                return self.changed(state.counters, now_ms, &[], &conflicts);
+                return self.changed(store, state.counters, now_ms, &[], &conflicts);
             }
             let terminal = failure.is_none() && !state.incomplete;
-            let result = self.store.commit_generation(CommitRequest {
+            let result = store.commit_generation(CommitRequest {
                 source_id: &self.source_id,
                 root: &self.roots.source,
                 generation: self.generation,
@@ -1136,6 +1166,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
                         DirectoryFrontier::new(&self.roots.source, Vec::new(), Vec::new());
                     self.part_scan = None;
                     self.report(
+                        store,
                         summary.outcome,
                         summary.failure,
                         state.counters,
@@ -1143,17 +1174,17 @@ impl<F: SourceFs> OpenCodeEngine<F> {
                     )
                 }
                 Err(StoreError::StageConflict) => {
-                    self.changed(state.counters, now_ms, &[], &conflicts)
+                    self.changed(store, state.counters, now_ms, &[], &conflicts)
                 }
                 Err(error) => {
                     // A failed finalization invalidates the acquisition it would have published:
                     // drop the staged evidence so every source is read again before trusting it.
-                    self.invalidate_acquisition();
-                    self.store_failed(error, state.counters)
+                    self.invalidate_acquisition(store);
+                    self.store_failed(store, error, state.counters)
                 }
             };
         }
-        let result = self.store.stage_scan(StageRequest {
+        let result = store.stage_scan(StageRequest {
             source_id: &self.source_id,
             root: &self.roots.source,
             generation: self.generation,
@@ -1170,10 +1201,18 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         match result {
             Ok(summary) => {
                 self.failures = prospective;
-                self.report(outcome, failure, state.counters, summary.records_committed)
+                self.report(
+                    store,
+                    outcome,
+                    failure,
+                    state.counters,
+                    summary.records_committed,
+                )
             }
-            Err(StoreError::StageConflict) => self.changed(state.counters, now_ms, &[], &conflicts),
-            Err(error) => self.store_failed(error, state.counters),
+            Err(StoreError::StageConflict) => {
+                self.changed(store, state.counters, now_ms, &[], &conflicts)
+            }
+            Err(error) => self.store_failed(store, error, state.counters),
         }
     }
 
@@ -1182,6 +1221,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
     /// the store is rebuilt from what is durable.
     fn finish_unavailable(
         &mut self,
+        store: &mut Store,
         state: PassState,
         prospective: BTreeMap<PathBuf, FailureCode>,
         database_failure: Option<FailureCode>,
@@ -1190,7 +1230,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
     ) -> PassReport {
         let backoff = database_failure
             .filter(|code| matches!(code, FailureCode::SourceIdle | FailureCode::Busy));
-        let result = self.store.stage_scan(StageRequest {
+        let result = store.stage_scan(StageRequest {
             source_id: &self.source_id,
             root: &self.roots.source,
             generation: self.generation,
@@ -1213,26 +1253,29 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         match result {
             Ok(_) => {
                 self.failures = prospective;
-                if self.reload().is_err() {
+                if self.reload(store).is_err() {
                     self.needs_reload = true;
                 }
-                self.report(PassOutcome::Unavailable, failure, state.counters, 0)
+                self.report(store, PassOutcome::Unavailable, failure, state.counters, 0)
             }
-            Err(error) => self.store_failed(error, state.counters),
+            Err(error) => self.store_failed(store, error, state.counters),
         }
     }
 
     /// Terminal proof that no database read earlier in this generation changed since: its
     /// identity set (and, without a write-ahead log, its main-file stamp) must still be the one
     /// it was read under. Databases not in `source_files` yet are covered.
-    fn completed_databases_unchanged(&mut self, state: &mut PassState) -> Result<bool, Stop> {
+    fn completed_databases_unchanged(
+        &mut self,
+        store: &mut Store,
+        state: &mut PassState,
+    ) -> Result<bool, Stop> {
         // A database read in this pass may differ from what earlier pages proved: start over.
         if state.database_opens > 0 {
             self.terminal_cursor = None;
         }
         loop {
-            let page = self
-                .store
+            let page = store
                 .completed_databases(
                     &self.source_id,
                     self.generation,
@@ -1294,12 +1337,9 @@ impl<F: SourceFs> OpenCodeEngine<F> {
 
     /// Drops the staged acquisition of this generation (published history stays). When the store
     /// cannot take the write, the reset is retried before the next pass.
-    fn invalidate_acquisition(&mut self) {
+    fn invalidate_acquisition(&mut self, store: &mut Store) {
         self.part_scan = None;
-        match self
-            .store
-            .reset_acquisition(&self.source_id, self.generation)
-        {
+        match store.reset_acquisition(&self.source_id, self.generation) {
             Ok(()) | Err(StoreError::StaleGeneration) => {}
             Err(_) => self.needs_reset = true,
         }
@@ -1310,13 +1350,14 @@ impl<F: SourceFs> OpenCodeEngine<F> {
     /// back off before touching the source again.
     fn changed(
         &mut self,
+        store: &mut Store,
         counters: PassCounters,
         now_ms: i64,
         paths: &[PathBuf],
         conflicts: &[(PathBuf, String, u8)],
     ) -> PassReport {
         self.part_scan = None;
-        let result = self.store.discard_generation(DiscardRequest {
+        let result = store.discard_generation(DiscardRequest {
             source_id: &self.source_id,
             generation: self.generation,
             paths,
@@ -1327,24 +1368,30 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         });
         match result {
             Ok(summary) => {
-                if self.reload().is_err() {
+                if self.reload(store).is_err() {
                     self.needs_reload = true;
                 }
                 self.report(
+                    store,
                     summary.outcome,
                     Some(FailureCode::SourceChanging),
                     counters,
                     0,
                 )
             }
-            Err(error) => self.store_failed(error, counters),
+            Err(error) => self.store_failed(store, error, counters),
         }
     }
 
     /// A store write failed. Whatever it left durable is the truth: reload from it rather than
     /// continuing from in-memory state that may be ahead of, or behind, what was committed.
-    fn store_failed(&mut self, error: StoreError, counters: PassCounters) -> PassReport {
-        if self.reload().is_err() {
+    fn store_failed(
+        &mut self,
+        store: &mut Store,
+        error: StoreError,
+        counters: PassCounters,
+    ) -> PassReport {
+        if self.reload(store).is_err() {
             self.needs_reload = true;
         }
         // Storage decoding, numeric-range and SQL failures leave history untouched but make the
@@ -1355,24 +1402,18 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             }
             _ => PassOutcome::Partial,
         };
-        self.report(outcome, Some(store_failure(error)), counters, 0)
+        self.report(store, outcome, Some(store_failure(error)), counters, 0)
     }
 
     /// Rebuilds all acquisition-local state from the store: generation, frontier, completed
     /// directories and unresolved file failures.
-    fn reload(&mut self) -> Result<(), StoreError> {
+    fn reload(&mut self, store: &mut Store) -> Result<(), StoreError> {
         self.needs_reload = true;
-        let generation = self.store.generation(&self.source_id)?;
-        let pending = self
-            .store
-            .load_frontier(&self.source_id, &self.roots.source, generation)?;
-        let completed = self.store.load_completed_directories(
-            &self.source_id,
-            &self.roots.source,
-            generation,
-        )?;
-        let failures = self
-            .store
+        let generation = store.generation(&self.source_id)?;
+        let pending = store.load_frontier(&self.source_id, &self.roots.source, generation)?;
+        let completed =
+            store.load_completed_directories(&self.source_id, &self.roots.source, generation)?;
+        let failures = store
             .load_failures(&self.source_id)?
             .into_iter()
             .map(|failure| (failure.relative_path, failure.code))
@@ -1411,8 +1452,13 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         RootCheck::Valid
     }
 
-    fn report_restart_blocked(&mut self, counters: PassCounters, now_ms: i64) -> PassReport {
-        let mut completed = match self.store.load_completed_directories(
+    fn report_restart_blocked(
+        &mut self,
+        store: &mut Store,
+        counters: PassCounters,
+        now_ms: i64,
+    ) -> PassReport {
+        let mut completed = match store.load_completed_directories(
             &self.source_id,
             &self.roots.source,
             self.generation,
@@ -1420,6 +1466,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             Ok(completed) => completed,
             Err(error) => {
                 return self.report(
+                    store,
                     PassOutcome::Partial,
                     Some(store_failure(error)),
                     counters,
@@ -1431,13 +1478,11 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         // Every directory that was still being read is listed again from its beginning (an
         // iterator position is never persisted); the completed ones stay completed.
         let mut incomplete =
-            match self
-                .store
-                .load_frontier(&self.source_id, &self.roots.source, self.generation)
-            {
+            match store.load_frontier(&self.source_id, &self.roots.source, self.generation) {
                 Ok(frontier) => frontier,
                 Err(error) => {
                     return self.report(
+                        store,
                         PassOutcome::Partial,
                         Some(store_failure(error)),
                         counters,
@@ -1453,7 +1498,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         }
         self.frontier = DirectoryFrontier::new(&self.roots.source, incomplete, completed);
         let frontier = self.frontier.snapshot();
-        let result = self.store.stage_scan(StageRequest {
+        let result = store.stage_scan(StageRequest {
             source_id: &self.source_id,
             root: &self.roots.source,
             generation: self.generation,
@@ -1469,54 +1514,25 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         });
         match result {
             Ok(_) => self.report(
+                store,
                 PassOutcome::Partial,
                 Some(FailureCode::LimitExceeded),
                 counters,
                 0,
             ),
-            Err(error) => self.store_failed(error, counters),
+            Err(error) => self.store_failed(store, error, counters),
         }
-    }
-
-    #[cfg(feature = "test-faults")]
-    pub fn inject_commit_fault(&mut self, point: crate::store::FaultPoint) {
-        self.store.inject_fault(point);
-    }
-
-    /// Raw durable records of this source when they fit one bounded page; larger histories
-    /// return `LimitExceeded` and are read with [`Self::observations_page`].
-    pub fn observations(&self) -> Result<Vec<SourceReportedObservation>, StoreError> {
-        self.store.observations(&self.source_id)
-    }
-
-    pub fn observations_page(
-        &self,
-        after: Option<&ObservationCursor>,
-        limit: usize,
-    ) -> Result<ObservationPage, StoreError> {
-        self.store.observations_page(&self.source_id, after, limit)
-    }
-
-    /// Bounded numeric projection of the whole durable history of this source.
-    pub fn snapshot(&self, report: &PassReport) -> Result<SourceSnapshot, StoreError> {
-        Ok(SourceSnapshot::new(
-            self.source_id.clone(),
-            report.outcome,
-            report.failure,
-            report.counters,
-            report.last_good_ms,
-            self.store.source_projection(&self.source_id)?,
-        ))
     }
 
     fn report(
         &self,
+        store: &Store,
         outcome: PassOutcome,
         failure: Option<FailureCode>,
         counters: PassCounters,
         records: u32,
     ) -> PassReport {
-        let last_good_ms = self.store.last_success_ms(&self.source_id).ok().flatten();
+        let last_good_ms = store.last_success_ms(&self.source_id).ok().flatten();
         pass_report(outcome, failure, counters, records, last_good_ms)
     }
 }
@@ -1528,9 +1544,10 @@ fn stop_outcome(stop: Stop) -> FileOutcome {
     }
 }
 
-impl<F: SourceFs> OpenCodeEngine<F> {
+impl<F: SourceFs> OpenCodeSource<F> {
     fn process_database(
         &mut self,
+        store: &mut Store,
         path: &Path,
         initial: &std::fs::Metadata,
         state: &mut PassState,
@@ -1573,10 +1590,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         // A saved cursor and its staged candidates belong to the database and sidecar set they
         // were read under; any other set means the source changed under the sweep.
         let identity = before.key();
-        let cursor = match self
-            .store
-            .saved_progress(&self.source_id, &relative, self.generation)
-        {
+        let cursor = match store.saved_progress(&self.source_id, &relative, self.generation) {
             Ok(Some(saved)) if saved.identity.as_deref() == Some(identity.as_str()) => saved.cursor,
             Ok(Some(_)) => return FileOutcome::Changing,
             Ok(None) => None,
@@ -1601,6 +1615,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         state.counters.source_opens = state.counters.source_opens.saturating_add(1);
         state.database_opens += 1;
         let meter = sqlite_ro::MetadataMeter::begin(allowance);
+        let cancel = state.cancel;
         let read = match self.fs.open_sqlite(&canonical) {
             Ok(mut connection) => opencode::read_sqlite(
                 &mut connection,
@@ -1611,9 +1626,12 @@ impl<F: SourceFs> OpenCodeEngine<F> {
                     rows: lane.rows(),
                     bytes: lane.bytes(),
                 },
+                cancel,
             ),
             Err(error) => Err(sqlite_open_failure(error)),
         };
+        // A flag the sweep stopped on is recorded, so the pass reports the cancel.
+        state.cancel_requested();
         let (used, refused) = meter.state();
         drop(meter);
         state.counters.stat_calls = state.counters.stat_calls.saturating_add(used);
@@ -1852,7 +1870,10 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         state: &mut PassState,
         lane: Lane,
     ) -> Result<Option<PartScan>, FileOutcome> {
-        if lane.operations_exhausted(&state.counters) || lane.opens_exhausted(&state.counters) {
+        if lane.operations_exhausted(&state.counters)
+            || lane.opens_exhausted(&state.counters)
+            || state.cancel_requested()
+        {
             return Err(FileOutcome::Budget);
         }
         let metadata = match stat_optional(&self.fs, directory, &mut state.counters) {
@@ -1901,7 +1922,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
         lane: Lane,
     ) -> ScanStep {
         loop {
-            if lane.operations_exhausted(&state.counters) {
+            if lane.operations_exhausted(&state.counters) || state.cancel_requested() {
                 return ScanStep::Budget;
             }
             let part_path = match scan.deferred.take() {
@@ -2043,7 +2064,7 @@ impl<F: SourceFs> OpenCodeEngine<F> {
             .then_some((scan.directory.clone(), scan.directory_stamp));
         let total = 1 + scan.stamps.len() + usize::from(directory.is_some());
         while scan.revalidated < total {
-            if lane.operations_exhausted(&state.counters) {
+            if lane.operations_exhausted(&state.counters) || state.cancel_requested() {
                 return Err(Stop::Budget);
             }
             let index = scan.revalidated;
@@ -2308,6 +2329,719 @@ fn message_path(root: &Path, path: &Path) -> Option<(String, String)> {
     Some((session, Path::new(file).file_stem()?.to_str()?.to_owned()))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Engine: the sole owner of at most one Store (DEC-060) and of the per-root runtimes.
+
+/// Returned by [`Engine::pass_until`] when the cancel flag stopped the pass at a budget poll.
+/// What the pass committed before the poll stays published; the next pass converges.
+#[derive(Debug)]
+pub struct PassCancelled(pub PassReport);
+
+/// Why [`Engine::ingest`] stopped: the caller's cancel, or a store failure reading the durable
+/// source list, never reported as an empty success.
+#[derive(Debug)]
+pub enum IngestError {
+    Cancelled(PassCancelled),
+    Store(StoreError),
+}
+
+/// The canonical data path a Store (or claim) is bound to, with the anchor it was reached from.
+struct Bound {
+    path: PathBuf,
+    anchor: DataAnchor,
+}
+
+enum Slot<F: SourceFs> {
+    Attached(Box<OpenCodeSource<F>>),
+    /// A durable enabled source whose runtime could not be built; the current failure is shown
+    /// over its durable status without touching it.
+    Unattached {
+        code: FailureCode,
+        attempted_ms: Option<i64>,
+    },
+}
+
+/// A `today_snapshot` request the Engine refuses.
+#[derive(Debug, Eq, PartialEq)]
+pub enum TodayError {
+    Window(WindowError),
+    Store(StoreError),
+}
+
+/// Whether the canonical `data` path equals, contains or lies inside `root`, by path components.
+fn overlaps(data: &Path, root: &Path) -> bool {
+    data.starts_with(root) || root.starts_with(data)
+}
+
+/// A root as the filesystem resolves it now: canonical path and (device, inode), or `None` when
+/// it is absent or unreadable (left to `reattach`).
+type Resolved = Option<(PathBuf, (u64, u64))>;
+
+fn resolve<F: SourceFs>(fs: &F, path: &Path) -> Resolved {
+    let mut counters = PassCounters::default();
+    let canonical = fs.canonicalize(path, &mut counters).ok()?;
+    let metadata = fs.metadata(&canonical, &mut counters).ok()?;
+    Some((canonical, (metadata.dev(), metadata.ino())))
+}
+
+pub struct Engine<F: SourceFs> {
+    data_request: PathBuf,
+    home: PathBuf,
+    store: Option<Store>,
+    bound: Option<Bound>,
+    sources: BTreeMap<String, Slot<F>>,
+    last_store_error: Option<StoreError>,
+    /// This Engine claims its data directory (DEC-062) instead of opening unguarded.
+    owned: bool,
+    /// Declared after `store`, so close, unwind and drop close the SQLite connection and every
+    /// history descriptor before the lock is released.
+    owner: Option<DataDirOwner>,
+}
+
+impl<F: SourceFs> Engine<F> {
+    /// Records the requests and does no I/O.
+    pub fn open(data_dir: &Path, home: &Path) -> Self {
+        Self {
+            data_request: data_dir.to_path_buf(),
+            home: home.to_path_buf(),
+            store: None,
+            bound: None,
+            sources: BTreeMap::new(),
+            last_store_error: None,
+            owned: false,
+            owner: None,
+        }
+    }
+
+    pub fn store(&self) -> Option<&Store> {
+        self.store.as_ref()
+    }
+
+    pub fn store_mut(&mut self) -> Option<&mut Store> {
+        self.store.as_mut()
+    }
+
+    /// The store error of the last `load_existing` or `attach_opencode` that failed on the store.
+    pub fn last_store_error(&self) -> Option<&StoreError> {
+        self.last_store_error.as_ref()
+    }
+
+    /// Marks this Engine owned and opens existing history (ABI only; the 004 suites never call
+    /// it). An existing data directory is claimed before any history or sidecar descriptor
+    /// opens; an absent one is neither created nor locked. When `history.sqlite` exists it is
+    /// admitted (one bounded committed read, containment of every persisted and resolved root,
+    /// then a recheck) before the writable open. On every failure the store stays `None`,
+    /// nothing is written and no persisted row changes.
+    pub fn load_existing(&mut self, fs: &F) -> Result<(), StoreError> {
+        self.last_store_error = None;
+        self.owned = true;
+        let result = self.load_existing_inner(fs);
+        if let Err(error) = &result {
+            self.last_store_error = Some(error.clone());
+        }
+        result
+    }
+
+    fn load_existing_inner(&mut self, fs: &F) -> Result<(), StoreError> {
+        if self.store.is_some() {
+            return Ok(());
+        }
+        let (data, anchor) =
+            discovery::anchor_for(&self.data_request).map_err(|_| StoreError::Io)?;
+        if data != anchor.path {
+            // The data directory does not exist yet.
+            return Ok(());
+        }
+        if self.owner.is_none() {
+            self.owner = Some(DataDirOwner::claim(&data, &anchor, false)?);
+        }
+        self.bound = Some(Bound { path: data, anchor });
+        let history = self
+            .owner
+            .as_ref()
+            .map_or(Ok(false), DataDirOwner::history_exists)?;
+        if !history {
+            return Ok(());
+        }
+        self.open_owned(fs, None)
+    }
+
+    /// Steps (1)–(3) of admission, or a creating open when no history exists, beneath the
+    /// claimed guard. `requested` is a root being attached and joins the containment check.
+    fn open_owned(&mut self, fs: &F, requested: Option<&Path>) -> Result<(), StoreError> {
+        let (Some(owner), Some(bound)) = (self.owner.as_ref(), self.bound.as_ref()) else {
+            return Err(StoreError::Io);
+        };
+        let (data, anchor) = (bound.path.clone(), bound.anchor.clone());
+        let store = if owner.history_exists()? {
+            let admission = Store::admit_existing(&data, &anchor, owner)?;
+            if let Some(requested) = requested
+                && overlaps(&data, requested)
+            {
+                return Err(StoreError::RootOverlap);
+            }
+            // Step 2: the persisted canonical paths, even if missing or unreadable, before any
+            // root I/O; then each enabled root resolved once.
+            if admission
+                .roots()
+                .iter()
+                .any(|root| overlaps(&data, &root.canonical_root))
+            {
+                return Err(StoreError::RootOverlap);
+            }
+            let first: Vec<Resolved> = admission
+                .roots()
+                .iter()
+                .map(|root| resolve(fs, &root.canonical_root))
+                .collect();
+            if first
+                .iter()
+                .flatten()
+                .any(|(canonical, _)| overlaps(&data, canonical))
+            {
+                return Err(StoreError::RootOverlap);
+            }
+            // Step 3: every enabled root resolved again must equal step 2.
+            let second: Vec<Resolved> = admission
+                .roots()
+                .iter()
+                .map(|root| resolve(fs, &root.canonical_root))
+                .collect();
+            if second
+                .iter()
+                .flatten()
+                .any(|(canonical, _)| overlaps(&data, canonical))
+            {
+                return Err(StoreError::RootOverlap);
+            }
+            if second != first {
+                return Err(StoreError::UnsafeFile);
+            }
+            Store::open_admitted(&data, owner, admission)?
+        } else {
+            owner.verify_reachable()?;
+            Store::open_bound_owned(&data, owner)?
+        };
+        self.store = Some(store);
+        Ok(())
+    }
+
+    /// Opens the first Store for `attach_opencode`: unguarded through `Store::open_bound` for
+    /// an unowned Engine, beneath a freshly claimed (or already held) guard for an owned one.
+    fn open_first(&mut self, fs: &F, roots: &CanonicalRoots) -> Result<(), StoreError> {
+        if !self.owned {
+            let store = Store::open_bound(&roots.data, &roots.data_anchor)?;
+            self.bound = Some(Bound {
+                path: roots.data.clone(),
+                anchor: roots.data_anchor.clone(),
+            });
+            self.store = Some(store);
+            return Ok(());
+        }
+        match &self.owner {
+            None => {
+                self.owner = Some(DataDirOwner::claim(&roots.data, &roots.data_anchor, true)?);
+            }
+            Some(owner) => {
+                // The held directory must still be the one the roots resolve to.
+                let same = owner.path() == roots.data
+                    && (roots.data_anchor.path != roots.data
+                        || owner.identity() == (roots.data_anchor.device, roots.data_anchor.inode));
+                if !same {
+                    return Err(StoreError::UnsafeFile);
+                }
+            }
+        }
+        self.bound = Some(Bound {
+            path: roots.data.clone(),
+            anchor: roots.data_anchor.clone(),
+        });
+        // A refusal, containment included, keeps the claim with no Store until close.
+        self.open_owned(fs, Some(&roots.source))
+    }
+
+    /// Registers `source_root` and builds its runtime, opening the Store first when none is
+    /// open. Runs exactly the checks the former single-root engine ran: unauthorized (no I/O),
+    /// root validation, source identity, then the Store. An attached root returns its id
+    /// without a second runtime.
+    pub fn attach_opencode(
+        &mut self,
+        fs: F,
+        source_root: &Path,
+        authorization: SourceAuthorization,
+        kind: SourceKind,
+    ) -> Result<String, PassReport> {
+        self.last_store_error = None;
+        if let Some(report) = unauthorized(authorization) {
+            return Err(report);
+        }
+        let mut counters = PassCounters::default();
+        let unavailable = |failure: FailureCode, counters: PassCounters| {
+            pass_report(PassOutcome::Unavailable, Some(failure), counters, 0, None)
+        };
+        let roots = match discovery::validate_roots(
+            &fs,
+            source_root,
+            &self.data_request,
+            &self.home,
+            &mut counters,
+        ) {
+            Ok(roots) => roots,
+            Err(error) => return Err(unavailable(root_failure(error), counters)),
+        };
+        let source_identity = match root_identity(&fs, &roots.source, &mut counters) {
+            Ok(identity) => identity,
+            Err(stop) => return Err(unavailable(stop_failure(stop), counters)),
+        };
+        let opened_here = self.store.is_none();
+        if opened_here {
+            // Everything beneath the data root is created and opened through a handle bound to
+            // the identity validated above, so a swapped path is refused, not followed.
+            if let Err(error) = self.open_first(&fs, &roots) {
+                self.last_store_error = Some(error);
+                return Err(unavailable(FailureCode::Store, counters));
+            }
+        } else if !self.bound_matches(&roots) {
+            return Err(unavailable(FailureCode::Store, counters));
+        }
+        let Some(store) = self.store.as_mut() else {
+            return Err(unavailable(FailureCode::Store, counters));
+        };
+        let (device, inode) = store.data_identity();
+        let data_identity = RootIdentity { device, inode };
+        let registration = store.register_source(
+            &roots.source,
+            kind,
+            (source_identity.device, source_identity.inode),
+        );
+        let registration = match registration {
+            Ok(registration) => registration,
+            Err(error) => return Err(self.attach_failed(opened_here, error, counters)),
+        };
+        let source_id = registration.source_id;
+        if matches!(self.sources.get(&source_id), Some(Slot::Attached(_))) {
+            return Ok(source_id);
+        }
+        if !self.sources.contains_key(&source_id) && self.sources.len() >= MAX_REPORTED_SOURCES {
+            return Err(unavailable(FailureCode::LimitExceeded, counters));
+        }
+        let mut source = OpenCodeSource::new(
+            fs,
+            source_root,
+            &self.data_request,
+            &self.home,
+            roots,
+            source_identity,
+            data_identity,
+            source_id.clone(),
+        );
+        let store = self.store.as_mut().expect("the store was just used");
+        if let Err(error) = source.reload(store) {
+            return Err(self.attach_failed(opened_here, error, counters));
+        }
+        self.sources
+            .insert(source_id.clone(), Slot::Attached(Box::new(source)));
+        Ok(source_id)
+    }
+
+    /// Whether a re-validated data root is still the one the open Store is bound to.
+    fn bound_matches(&self, roots: &CanonicalRoots) -> bool {
+        match (&self.bound, &self.store) {
+            (Some(bound), Some(store)) => {
+                bound.path == roots.data
+                    && (roots.data_anchor.device, roots.data_anchor.inode) == store.data_identity()
+            }
+            _ => false,
+        }
+    }
+
+    /// A failure after the Store opened: the Store of the attach that opened it is dropped back
+    /// to `None` (a held guard stays held) and its error stays `last_store_error`.
+    fn attach_failed(
+        &mut self,
+        opened_here: bool,
+        error: StoreError,
+        counters: PassCounters,
+    ) -> PassReport {
+        self.last_store_error = Some(error);
+        if opened_here {
+            self.store = None;
+            if !self.owned {
+                self.bound = None;
+            }
+        }
+        pass_report(
+            PassOutcome::Unavailable,
+            Some(FailureCode::Store),
+            counters,
+            0,
+            None,
+        )
+    }
+
+    /// The single startup and retry path for a persisted root. Requires a Store and a durable
+    /// consent-enabled row, re-validates the persisted canonical path and identity, and only
+    /// then registers and reloads. A failure builds no runtime and writes nothing durable: it
+    /// is recorded in the bounded in-memory `Unattached` map, replacing any earlier record.
+    pub fn reattach(
+        &mut self,
+        fs: F,
+        source_id: &str,
+        attempted_ms: Option<i64>,
+    ) -> Result<String, PassReport> {
+        let refused = |failure: FailureCode| {
+            pass_report(
+                PassOutcome::Unavailable,
+                Some(failure),
+                PassCounters::default(),
+                0,
+                None,
+            )
+        };
+        let Some(store) = self.store.as_ref() else {
+            return Err(refused(FailureCode::Unselected));
+        };
+        let row = match store.source_row(source_id) {
+            Ok(Some(row)) => row,
+            _ => return Err(refused(FailureCode::Unselected)),
+        };
+        match row.consent {
+            ConsentState::Enabled => {}
+            ConsentState::Denied => return Err(refused(FailureCode::Denied)),
+            ConsentState::Undecided => return Err(refused(FailureCode::Unselected)),
+        }
+        if matches!(self.sources.get(source_id), Some(Slot::Attached(_))) {
+            return Ok(source_id.to_owned());
+        }
+        let mut counters = PassCounters::default();
+        let attempt = self.reattach_checked(&fs, &row, &mut counters);
+        let (roots, source_identity) = match attempt {
+            Ok(checked) => checked,
+            Err(code) => {
+                self.record_unattached(source_id, code, attempted_ms);
+                return Err(pass_report(
+                    PassOutcome::Unavailable,
+                    Some(code),
+                    counters,
+                    0,
+                    None,
+                ));
+            }
+        };
+        let Some(store) = self.store.as_mut() else {
+            return Err(refused(FailureCode::Unselected));
+        };
+        let (device, inode) = store.data_identity();
+        let data_identity = RootIdentity { device, inode };
+        let registered = store.register_source(
+            &roots.source,
+            row.kind,
+            (source_identity.device, source_identity.inode),
+        );
+        let mut source = match registered {
+            Ok(registration) => OpenCodeSource::new(
+                fs,
+                &PathBuf::from(&row.canonical_root),
+                &self.data_request,
+                &self.home,
+                roots,
+                source_identity,
+                data_identity,
+                registration.source_id,
+            ),
+            Err(_) => {
+                self.record_unattached(source_id, FailureCode::Store, attempted_ms);
+                return Err(refused(FailureCode::Store));
+            }
+        };
+        let store = self.store.as_mut().expect("the store was just used");
+        if source.reload(store).is_err() {
+            self.record_unattached(source_id, FailureCode::Store, attempted_ms);
+            return Err(refused(FailureCode::Store));
+        }
+        self.sources
+            .insert(source_id.to_owned(), Slot::Attached(Box::new(source)));
+        Ok(source_id.to_owned())
+    }
+
+    /// The checks `attach` runs plus the persisted-identity comparison. A different canonical
+    /// path or identity (a replacement directory, including a symlink swap) is `RootOverlap`.
+    fn reattach_checked(
+        &self,
+        fs: &F,
+        row: &SourceRow,
+        counters: &mut PassCounters,
+    ) -> Result<(CanonicalRoots, RootIdentity), FailureCode> {
+        let persisted = PathBuf::from(&row.canonical_root);
+        let roots =
+            discovery::validate_roots(fs, &persisted, &self.data_request, &self.home, counters)
+                .map_err(root_failure)?;
+        let identity = root_identity(fs, &roots.source, counters).map_err(stop_failure)?;
+        let same = roots.source == persisted
+            && row.root_device.zip(row.root_inode) == Some((identity.device, identity.inode));
+        if !same {
+            return Err(FailureCode::RootOverlap);
+        }
+        if !self.bound_matches(&roots) {
+            return Err(FailureCode::Store);
+        }
+        Ok((roots, identity))
+    }
+
+    fn record_unattached(&mut self, source_id: &str, code: FailureCode, attempted_ms: Option<i64>) {
+        self.sources.insert(
+            source_id.to_owned(),
+            Slot::Unattached { code, attempted_ms },
+        );
+    }
+
+    /// Drops a runtime or its recorded failure. The durable row and history are untouched.
+    pub fn detach(&mut self, source_id: &str) {
+        self.sources.remove(source_id);
+    }
+
+    /// Sets a registered source's consent `denied` and detaches it, with no source I/O.
+    pub fn deny(&mut self, source_id: &str) -> Result<(), StoreError> {
+        let store = self.store.as_mut().ok_or(StoreError::InvalidRoot)?;
+        store.set_consent(source_id, ConsentState::Denied)?;
+        self.sources.remove(source_id);
+        Ok(())
+    }
+
+    /// The id of an already registered root, by its stored canonical path or by what `root`
+    /// canonicalizes to. `None` when no such source is durable.
+    pub fn find_registered(&self, fs: &F, root: &Path) -> Result<Option<String>, StoreError> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(id) = store.source_id(root)? {
+            return Ok(Some(id));
+        }
+        let mut counters = PassCounters::default();
+        match fs.canonicalize(root, &mut counters) {
+            Ok(canonical) => store.source_id(&canonical),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Ids of every durable consent-enabled source, ordered by id.
+    pub fn enabled_source_ids(&self) -> Result<Vec<String>, StoreError> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(store
+            .source_rows()?
+            .into_iter()
+            .filter(|row| row.consent == ConsentState::Enabled)
+            .map(|row| row.source_id)
+            .collect())
+    }
+
+    pub fn is_attached(&self, source_id: &str) -> bool {
+        matches!(self.sources.get(source_id), Some(Slot::Attached(_)))
+    }
+
+    /// A pass with no cancel flag.
+    pub fn pass(
+        &mut self,
+        source_id: &str,
+        authorization: SourceAuthorization,
+        now_ms: i64,
+    ) -> PassReport {
+        match self.pass_until(source_id, authorization, now_ms, &AtomicBool::new(false)) {
+            Ok(report) | Err(PassCancelled(report)) => report,
+        }
+    }
+
+    /// One pass that polls `cancel` only where the pass already polls its budget. An id with no
+    /// runtime reports `Unavailable`/`Unselected` with no I/O.
+    pub fn pass_until(
+        &mut self,
+        source_id: &str,
+        authorization: SourceAuthorization,
+        now_ms: i64,
+        cancel: &AtomicBool,
+    ) -> Result<PassReport, PassCancelled> {
+        if let Some(report) = unauthorized(authorization) {
+            return Ok(report);
+        }
+        let (Some(store), Some(Slot::Attached(source))) =
+            (self.store.as_mut(), self.sources.get_mut(source_id))
+        else {
+            return Ok(pass_report(
+                PassOutcome::Unavailable,
+                Some(FailureCode::Unselected),
+                PassCounters::default(),
+                0,
+                None,
+            ));
+        };
+        source.pass_until(store, authorization, now_ms, cancel)
+    }
+
+    /// One ingest over every durable consent-enabled source with the caller's token: an attached
+    /// source runs `pass_until`; a missing runtime gets exactly one `reattach` with `now_ms` and
+    /// runs only when that succeeds. Denied and undecided sources get no reattach, no pass and
+    /// no I/O. A triggered token stops before the next reattach as before the next pass.
+    pub fn ingest(
+        &mut self,
+        mut make_fs: impl FnMut() -> F,
+        now_ms: i64,
+        cancel: &AtomicBool,
+    ) -> Result<(), IngestError> {
+        let ids = self.enabled_source_ids().map_err(IngestError::Store)?;
+        let authorization = SourceAuthorization {
+            selected: true,
+            consent: ConsentState::Enabled,
+        };
+        for id in ids {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(IngestError::Cancelled(PassCancelled(pass_report(
+                    PassOutcome::CatchingUp,
+                    None,
+                    PassCounters::default(),
+                    0,
+                    None,
+                ))));
+            }
+            if !self.is_attached(&id) && self.reattach(make_fs(), &id, Some(now_ms)).is_err() {
+                continue;
+            }
+            self.pass_until(&id, authorization, now_ms, cancel)
+                .map_err(IngestError::Cancelled)?;
+        }
+        Ok(())
+    }
+
+    /// The store holds `source_id` durably; a missing runtime is not missing history.
+    fn durable(&self, source_id: &str) -> Result<&Store, StoreError> {
+        let store = self.store.as_ref().ok_or(StoreError::InvalidRoot)?;
+        if store.has_source(source_id)? {
+            Ok(store)
+        } else {
+            Err(StoreError::InvalidRoot)
+        }
+    }
+
+    /// Raw durable records of a source when they fit one bounded page; larger histories return
+    /// `LimitExceeded` and are read with [`Self::observations_page`]. An id absent from the
+    /// Store is `InvalidRoot`.
+    pub fn observations(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<SourceReportedObservation>, StoreError> {
+        self.durable(source_id)?.observations(source_id)
+    }
+
+    pub fn observations_page(
+        &self,
+        source_id: &str,
+        after: Option<&ObservationCursor>,
+        limit: usize,
+    ) -> Result<ObservationPage, StoreError> {
+        self.durable(source_id)?
+            .observations_page(source_id, after, limit)
+    }
+
+    /// Bounded numeric projection of the whole durable history of one source.
+    pub fn snapshot(
+        &self,
+        source_id: &str,
+        report: &PassReport,
+    ) -> Result<SourceSnapshot, StoreError> {
+        Ok(SourceSnapshot::new(
+            source_id.to_owned(),
+            report.outcome,
+            report.failure,
+            report.counters,
+            report.last_good_ms,
+            self.durable(source_id)?.source_projection(source_id)?,
+        ))
+    }
+
+    /// Every durable source as a snapshot entry, with the unattached overlay (outcome
+    /// `unavailable`, its failure and attempt time) over a consent-enabled source that has no
+    /// runtime. The durable `last_success_ms`, status row and numbers are never replaced.
+    pub fn source_entries(&self) -> Result<Vec<SourceEntry>, StoreError> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(store
+            .source_rows()?
+            .into_iter()
+            .map(|row| {
+                let overlay = match self.sources.get(&row.source_id) {
+                    Some(Slot::Unattached { code, attempted_ms })
+                        if row.consent == ConsentState::Enabled =>
+                    {
+                        Some((*code, *attempted_ms))
+                    }
+                    _ => None,
+                };
+                let root_display = Path::new(&row.canonical_root)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let (outcome, last_attempt_ms, last_error_code) = match overlay {
+                    Some((code, attempted)) => {
+                        (Some(PassOutcome::Unavailable), attempted, Some(code))
+                    }
+                    None => (row.outcome, row.last_attempt_ms, row.last_error_code),
+                };
+                SourceEntry {
+                    source_id: row.source_id,
+                    harness: row.harness,
+                    root_display,
+                    kind: row.kind,
+                    consent: row.consent,
+                    outcome,
+                    last_attempt_ms,
+                    last_success_ms: row.last_success_ms,
+                    last_error_code,
+                    rejected_count: row.rejected_count,
+                    pending_partial: row.pending_partial,
+                }
+            })
+            .collect())
+    }
+
+    /// The v1 daily snapshot: the local-day window of `now_ms` in `tz`, every source entry and
+    /// each source's projection of the records inside that window. A store-less Engine returns
+    /// the window with empty arrays.
+    pub fn today_snapshot(&self, tz: &str, now_ms: i64) -> Result<TodaySnapshot, TodayError> {
+        let window = Window::local_day(now_ms, tz).map_err(TodayError::Window)?;
+        let Some(store) = self.store.as_ref() else {
+            return Ok(TodaySnapshot {
+                window,
+                by_source: Vec::new(),
+                source_reported: Vec::new(),
+            });
+        };
+        let by_source = self.source_entries().map_err(TodayError::Store)?;
+        let mut source_reported = Vec::with_capacity(by_source.len());
+        for entry in &by_source {
+            source_reported.push(DailyReported {
+                source_id: entry.source_id.clone(),
+                projection: store
+                    .source_window_projection(&entry.source_id, window.bounds())
+                    .map_err(TodayError::Store)?,
+            });
+        }
+        Ok(TodaySnapshot {
+            window,
+            by_source,
+            source_reported,
+        })
+    }
+
+    #[cfg(feature = "test-faults")]
+    pub fn inject_commit_fault(&mut self, point: crate::store::FaultPoint) {
+        if let Some(store) = self.store.as_mut() {
+            store.inject_fault(point);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2417,5 +3151,96 @@ mod tests {
         );
         assert_eq!(frontier.snapshot(), vec![(held, 3, false)]);
         assert!(!frontier.is_drained());
+    }
+
+    fn enabled() -> SourceAuthorization {
+        SourceAuthorization {
+            selected: true,
+            consent: ConsentState::Enabled,
+        }
+    }
+
+    /// After a first-attach containment refusal, whether that attach took the claim or already
+    /// held it, the failed handle keeps its owner claim with no Store until it closes.
+    #[test]
+    fn first_attach_overlap_keeps_the_owner_claim_until_close()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let base = directory.path().canonicalize()?;
+        let (a, b, home) = (base.join("a"), base.join("b"), base.join("home"));
+        let data = base.join("x").join("data");
+        for path in [&a, &b, &home] {
+            std::fs::create_dir(path)?;
+        }
+        // H2 opens while no data directory exists, so its first attach claims afresh.
+        let mut h2: Engine<RealSourceFs> = Engine::open(&data, &home);
+        h2.load_existing(&RealSourceFs)?;
+        {
+            let mut h1: Engine<RealSourceFs> = Engine::open(&data, &home);
+            h1.load_existing(&RealSourceFs)?;
+            h1.attach_opencode(RealSourceFs, &a, enabled(), SourceKind::Custom)
+                .map_err(|report| format!("H1 attach: {report:?}"))?;
+        }
+        // The persisted root is re-pointed at an ancestor of the data directory.
+        std::fs::rename(&a, base.join("a-moved"))?;
+        std::os::unix::fs::symlink(base.join("x"), &a)?;
+        for attempt in ["claimed here", "already held"] {
+            assert!(
+                h2.attach_opencode(RealSourceFs, &b, enabled(), SourceKind::Custom)
+                    .is_err(),
+                "{attempt}"
+            );
+            assert_eq!(
+                h2.last_store_error(),
+                Some(&StoreError::RootOverlap),
+                "{attempt}"
+            );
+            assert!(h2.store().is_none(), "{attempt}");
+            let mut rival: Engine<RealSourceFs> = Engine::open(&data, &home);
+            assert_eq!(
+                rival.load_existing(&RealSourceFs),
+                Err(StoreError::Busy),
+                "{attempt}: the claim is still held"
+            );
+        }
+        drop(h2);
+        let mut after: Engine<RealSourceFs> = Engine::open(&data, &home);
+        assert_eq!(
+            after.load_existing(&RealSourceFs),
+            Err(StoreError::RootOverlap),
+            "closing released the claim"
+        );
+        Ok(())
+    }
+
+    /// An ingest whose durable source list cannot be read returns that store error, never an
+    /// empty success.
+    #[test]
+    fn ingest_returns_a_source_list_store_error() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let base = directory.path().canonicalize()?;
+        let (source, home, data) = (base.join("source"), base.join("home"), base.join("data"));
+        std::fs::create_dir(&source)?;
+        std::fs::create_dir(&home)?;
+        let mut engine: Engine<RealSourceFs> = Engine::open(&data, &home);
+        engine
+            .attach_opencode(RealSourceFs, &source, enabled(), SourceKind::Custom)
+            .map_err(|report| format!("attach: {report:?}"))?;
+        // Outside rows past the source bound make the durable list unreadable.
+        let outside = rusqlite::Connection::open(data.join("history.sqlite"))?;
+        for index in 0..64 {
+            outside.execute(
+                "INSERT INTO sources(source_id, harness, canonical_root, kind, consent) \
+                 VALUES(?1, 'opencode', ?2, 'custom', 'denied')",
+                rusqlite::params![format!("{index:032}"), format!("/outside/{index}")],
+            )?;
+        }
+        drop(outside);
+        let result = engine.ingest(|| RealSourceFs, 1, &AtomicBool::new(false));
+        assert!(
+            matches!(result, Err(IngestError::Store(StoreError::LimitExceeded))),
+            "{result:?}"
+        );
+        Ok(())
     }
 }
