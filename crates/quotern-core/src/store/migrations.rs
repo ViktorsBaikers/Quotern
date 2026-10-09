@@ -9,7 +9,7 @@ pub const VERSION: i64 = 1;
 const V1: &str = r#"
 CREATE TABLE sources (
     source_id TEXT PRIMARY KEY,
-    harness TEXT NOT NULL CHECK (harness = 'opencode'),
+    harness TEXT NOT NULL CHECK (harness IN ('opencode', 'codex')),
     canonical_root TEXT NOT NULL UNIQUE,
     kind TEXT NOT NULL CHECK (kind IN ('builtin', 'env', 'custom')),
     consent TEXT NOT NULL CHECK (consent IN ('undecided', 'enabled', 'denied')),
@@ -36,14 +36,23 @@ CREATE TABLE source_files (
     parse_generation INTEGER NOT NULL,
     file_state TEXT NOT NULL CHECK (file_state IN ('present', 'missing', 'replaced', 'rejected')),
     visit_seq INTEGER NOT NULL DEFAULT 0 CHECK (visit_seq >= 0),
-    PRIMARY KEY (source_id, relative_path)
+    header_id TEXT CHECK (header_id IS NULL OR length(CAST(header_id AS BLOB)) BETWEEN 1 AND 256),
+    header_state TEXT,
+    header_era TEXT,
+    record_state TEXT,
+    tail_state TEXT CHECK (tail_state IS NULL OR tail_state IN ('pending', 'discarding')),
+    uncovered_from_ms INTEGER,
+    uncovered_to_ms INTEGER,
+    PRIMARY KEY (source_id, relative_path),
+    CHECK ((uncovered_from_ms IS NULL) = (uncovered_to_ms IS NULL) AND (uncovered_from_ms IS NULL OR (uncovered_from_ms >= 0 AND uncovered_from_ms <= uncovered_to_ms))),
+    CHECK (CASE adapter_state WHEN 'codex_jsonl' THEN (byte_offset > 0 OR first_line_fnv64 = 0) AND (header_state IS NULL OR header_state IN ('own', 'own_forked', 'foreign_first_line', 'appended_header')) AND record_state IN ('none', 'inherited', 'prefix', 'own') AND (header_era IS NULL OR header_era IN ('record', 'legacy')) AND (header_era IS NOT NULL) = COALESCE(header_state IN ('own', 'own_forked', 'appended_header'), 0) ELSE header_id IS NULL AND header_state IS NULL AND header_era IS NULL AND record_state IS NULL AND tail_state IS NULL AND uncovered_from_ms IS NULL END)
 );
 CREATE INDEX source_files_known ON source_files(source_id, adapter_state, file_state, visit_seq, mtime_ns DESC, relative_path);
 CREATE TABLE usage_events (
     event_key TEXT PRIMARY KEY,
-    family TEXT NOT NULL CHECK (family = 'opencode'),
+    family TEXT NOT NULL CHECK (family IN ('opencode', 'codex')),
     measurement_kind TEXT NOT NULL CHECK (measurement_kind = 'source_reported'),
-    harness TEXT NOT NULL CHECK (harness = 'opencode'),
+    harness TEXT NOT NULL CHECK (harness IN ('opencode', 'codex')),
     source_id TEXT NOT NULL REFERENCES sources(source_id),
     session_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
@@ -70,7 +79,8 @@ CREATE TABLE usage_events (
     updated_ms INTEGER NOT NULL,
     CHECK ((total_tokens IS NULL) = (total_provenance IS NULL)),
     CHECK ((total_provenance IS 'derived') = (source_convention IS NOT NULL)),
-    CHECK (source_convention IS NULL OR source_convention = 'codexbar-3239175f-disjoint')
+    CHECK (source_convention IS NULL OR source_convention = 'codexbar-3239175f-disjoint'),
+    CHECK (CASE family WHEN 'opencode' THEN harness = 'opencode' AND substr(event_key, 1, 6) IS NOT 'codex:' WHEN 'codex' THEN harness = 'codex' AND substr(event_key, 1, 6) IS 'codex:' AND total_provenance IS NOT 'derived' AND acquisition_consistency = 'file_by_file_best_effort' AND total_mismatch = 0 AND selected_part_ids = '[]' AND format_rank = 0 AND pending_partial = 0 AND pending_reason IS NULL ELSE 0 END)
 );
 CREATE INDEX usage_events_occurred_at ON usage_events(occurred_at_ms);
 CREATE INDEX usage_events_source ON usage_events(source_id, occurred_at_ms, event_key);

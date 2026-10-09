@@ -29,6 +29,18 @@ These pinned source snapshots were used for bounded source-level comparison. The
 
 The peer-derived total convention is named `codexbar-3239175f-disjoint`. It is used only when all five reported components are present and the source record has no explicit total. The peer fixtures store expected values independently of the adapter.
 
+## Codex record contract
+
+Codex usage is acquired as source-reported tokens with an "origin unverified" label (DEC-077); it is never measured, provider-verified or pooled across sources. The adapter (`crates/quotern-core/src/adapters/codex.rs`) is a redesign against the producer's persisted record contract, not a port: no upstream code was copied, and the cumulative `token_count` delta approach of other readers is not used.
+
+| Project | Revision | Source references | Use |
+| --- | --- | --- | --- |
+| [openai/codex](https://github.com/openai/codex/tree/335c7f8ecab29c4462a553bbf174276d2c67a766) | `335c7f8ecab29c4462a553bbf174276d2c67a766`, rechecked unchanged at `b12ac84be9b5835259581c68dfc7cbe63d49e5f2` | `codex-rs/protocol/src/protocol.rs:2240-2273,3116-3199`, `codex-rs/history/src/rollout_payload.rs:33-72`, `codex-rs/rollout/src/recorder.rs:900-993,1747-1766,1892-1902`, `codex-rs/core/src/session/mod.rs:1656-1706,4703-4736` | `token_usage_record` envelope and fields, own-header-first write order, copied-fork prefixes, root `session_id`, line timestamps, and the 0.153.0-alpha.1 era in which each record precedes its `token_count`. |
+
+Only records whose `thread_id` equals the file's own first-line `session_meta` id are stored. Copied prefixes, appended headers and foreign first lines fail closed, and legacy-era `token_count` lines only mark the day partial. The store's v1 schema gained the Codex extension in place: a data directory written by an earlier unshipped v1 shape is refused with `store_corrupt` by design and stays byte-unchanged. It is never migrated, backed up or deleted, so development uses a fresh data directory.
+
+Codex acquisition is file-by-file best effort. Every observed change to device, inode, size or mtime restarts a bounded read from offset zero; unchanged unfinished scans resume their durable cursor, and unchanged EOF or pending tails read no content. The selected stamp must match the opened-before and opened-after stamps before committing a file batch. Earlier history and uncovered uncertainty survive rereads. Each read is limited to 1 MiB within the existing 8 MiB file and 64 MiB source per-pass ceilings. Repeated writes can restart large files and delay convergence; mutations concealed by identical metadata are outside this detection guarantee.
+
 ## Fixtures
 
 All checked-in OpenCode test inputs are synthetic JSON or SQLite rows; they are not copied from a user database and contain no credentials.
@@ -40,5 +52,9 @@ All checked-in OpenCode test inputs are synthetic JSON or SQLite rows; they are 
 | `Fixtures/harness/opencode/daily/rows.json` and `expected.json` | Hand-authored legacy rows and their independent daily oracle: windows per zone (UTC, Europe/Riga 23 h and 25 h days, Asia/Kolkata), boundary records, a revision crossing local midnight, a pending group, an empty day, `validation_cases` (the window or the exact `invalid_request` field for each `{tz, now_ms}` refusal, including the America/Sao_Paulo 2015-10-18 midnight-gap day and the following day), the `midnight_gap` record at 2015-10-19 00:30 America/Sao_Paulo counted only in the following day, and a two-message JSON part-scan layout (`rows.json` `json_messages`, two step-finish parts each) with its `json_part_scan` oracle for cancellation. Consumed unchanged by `reported_today`, `contract_v1` and the Swift tests; nothing is generated from the implementation. |
 | `Contracts/bridge-v1/*.json` | Response goldens equal to the provider's serialization of the fixtures above, and `requests-first-use.json`, the requests Swift encodes and the production codec parses. Hand-reviewed fixed files; tests compare and never rewrite them. |
 | `Fixtures/hostile/opencode/cases.json` and `expected.json` | Hand-authored malformed records and hostile path cases with separate expected rejection outcomes. |
+| `Fixtures/harness/codex/basic/` | Hand-authored record-era rollout (`sessions/2026/03/29/rollout-2026-03-29T09-00-00-basic.jsonl`) with full, absent-key and explicit-zero counters; `expected.json` holds the stored columns, file state, the daily snapshot and the Europe/Riga and Asia/Kolkata window oracle for records built at test time. |
+| `Fixtures/harness/codex/incremental/` | Hand-authored parent (`base/`) and copied-fork child (`fork/`) rollouts, byte `steps.json` for partial-tail and append reads, and `expected.json` with the exact tail reads, per-step rows and fork ownership oracles. |
+| `Fixtures/harness/codex/headers/` | Hand-authored appended-header, foreign-first-line, legacy, subagent, record-era, resumed-legacy and copied-prefix rollouts; `expected.json` holds per-file states, rows, day completeness, the legacy fork-child line spec and the `cli_version` era cases. |
+| `Fixtures/hostile/codex/cases.json` and `expected.json` | Hand-authored hostile record lines (bad counters, timestamps, ids and JSON) with separate expected rejections. |
 
 The upstream source snapshots and fact-check records used during planning are retained under `.devrites/work/quotern-core/references/`; they are research material, not runtime dependencies.

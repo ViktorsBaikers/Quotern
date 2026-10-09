@@ -12,6 +12,28 @@ pub enum ConsentState {
     Denied,
 }
 
+/// The harness a registered source root belongs to. One canonical root has exactly one harness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Harness {
+    OpenCode,
+    Codex,
+}
+
+impl Harness {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenCode => "opencode",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        [Self::OpenCode, Self::Codex]
+            .into_iter()
+            .find(|harness| harness.as_str() == value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceAuthorization {
     pub selected: bool,
@@ -61,6 +83,8 @@ pub enum FailureCode {
     UnsupportedSchema,
     RecordTooLarge,
     InvalidRecord,
+    /// A reported counter that is not an integer in `0..=MAX_TOKEN_COUNT`.
+    InvalidNumber,
     LimitExceeded,
     Io,
     Sqlite,
@@ -83,6 +107,7 @@ impl FailureCode {
             Self::UnsupportedSchema => "unsupported_schema",
             Self::RecordTooLarge => "record_too_large",
             Self::InvalidRecord => "invalid_record",
+            Self::InvalidNumber => "invalid_number",
             Self::LimitExceeded => "limit_exceeded",
             Self::Io => "io",
             Self::Sqlite => "sqlite",
@@ -105,6 +130,7 @@ impl FailureCode {
             Self::UnsupportedSchema,
             Self::RecordTooLarge,
             Self::InvalidRecord,
+            Self::InvalidNumber,
             Self::LimitExceeded,
             Self::Io,
             Self::Sqlite,
@@ -565,4 +591,92 @@ impl PassReport {
             last_good_ms: None,
         }
     }
+}
+
+/// How a Codex rollout file's first line and later `session_meta` lines classify the file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexHeaderState {
+    /// The first line is the file's own `session_meta`.
+    Own,
+    /// The own header carries a non-null `forked_from_id`.
+    OwnForked,
+    /// The first line is not a valid `session_meta`: nothing in the file is admitted.
+    ForeignFirstLine,
+    /// A later `session_meta` with another id that is not an inherited prefix item: nothing after
+    /// it is admitted.
+    AppendedHeader,
+}
+
+/// The coverage era of a Codex file, fixed by its own header's `cli_version` (DEC-078 (3)).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexHeaderEra {
+    /// `cli_version` >= 0.153.0-alpha.1: a record is persisted before its `token_count`.
+    Record,
+    /// Lower, missing or unparseable `cli_version`.
+    Legacy,
+}
+
+/// Which records a Codex file has carried so far.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexRecordState {
+    None,
+    /// Only records of another thread, with no inherited-prefix `session_meta` yet.
+    Inherited,
+    /// An inherited-prefix `session_meta` was seen and no own record yet.
+    Prefix,
+    /// At least one own record was seen.
+    Own,
+}
+
+/// An unterminated tail: kept pending until its newline, or being discarded because it outgrew
+/// the line bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexTailState {
+    Pending,
+    Discarding,
+}
+
+macro_rules! text_enum {
+    ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $text),+
+                }
+            }
+
+            pub fn parse(value: &str) -> Option<Self> {
+                match value {
+                    $($text => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+text_enum!(CodexHeaderState {
+    Own => "own",
+    OwnForked => "own_forked",
+    ForeignFirstLine => "foreign_first_line",
+    AppendedHeader => "appended_header",
+});
+text_enum!(CodexHeaderEra { Record => "record", Legacy => "legacy" });
+text_enum!(CodexRecordState {
+    None => "none",
+    Inherited => "inherited",
+    Prefix => "prefix",
+    Own => "own",
+});
+text_enum!(CodexTailState { Pending => "pending", Discarding => "discarding" });
+
+/// The identity of one Codex record: the source, the root session and the response, each with
+/// its decimal UTF-8 byte length, so no delimiter inside a component can make two keys collide.
+pub fn codex_event_key(source_id: &str, session_id: &str, response_id: &str) -> String {
+    format!(
+        "codex:{}:{source_id}:{}:{session_id}:{}:{response_id}",
+        source_id.len(),
+        session_id.len(),
+        response_id.len()
+    )
 }

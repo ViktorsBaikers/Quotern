@@ -1,4 +1,5 @@
 pub mod fs;
+pub mod jsonl;
 pub mod sqlite_ro;
 
 /// The most one file read may return: the per-record ceiling, and never more than the lane has
@@ -16,11 +17,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+use crate::adapters::codex::CodexSource;
 use crate::adapters::opencode::StepFinishPart;
 use crate::adapters::opencode::{self, DecodeError, ReadBudget, ResolveError};
 use crate::discovery::{self, CanonicalRoots, DataAnchor, RootError};
 use crate::domain::{
-    ConsentState, FailureCode, PassCounters, PassOutcome, PassReport, RecordCandidate,
+    ConsentState, FailureCode, Harness, PassCounters, PassOutcome, PassReport, RecordCandidate,
     SourceAuthorization, SourceKind, SourceReportedObservation,
 };
 use crate::limits::{
@@ -48,15 +50,16 @@ const FRONTIER_SLOTS: usize = MAX_OPEN_DIRECTORIES - 1;
 const IDENTITY_PROOF_STATS: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RootIdentity {
-    device: u64,
-    inode: u64,
+pub(crate) struct RootIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
 }
 
 /// Why a unit of work stopped: the shared per-pass budget ended (resume later) or a real failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Stop {
+pub(crate) enum Stop {
     Budget,
+    ValidationBudget,
     Fail(FailureCode),
 }
 
@@ -64,7 +67,7 @@ enum Stop {
 /// ceiling while a historical backlog exists; the historical lane may use the full ceiling, so
 /// whatever the current lane leaves unused transfers to it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Lane {
+pub(crate) enum Lane {
     Current,
     Full,
 }
@@ -81,12 +84,12 @@ impl Lane {
         MAX_SQLITE_ROWS_PER_PASS / self.divisor()
     }
 
-    fn bytes(self) -> u64 {
+    pub(crate) fn bytes(self) -> u64 {
         MAX_SOURCE_BYTES_PER_PASS / u64::from(self.divisor())
     }
 
     /// Whether this lane may still open another directory.
-    fn opens_exhausted(self, counters: &PassCounters) -> bool {
+    pub(crate) fn opens_exhausted(self, counters: &PassCounters) -> bool {
         counters.directory_opens >= MAX_DIRECTORY_OPENS / self.divisor()
     }
 
@@ -103,17 +106,17 @@ impl Lane {
 
     /// The reserved current lane also stops at its half of the directory opens; the historical
     /// lane meets that ceiling in the frontier itself.
-    fn exhausted(self, counters: &PassCounters) -> bool {
+    pub(crate) fn exhausted(self, counters: &PassCounters) -> bool {
         self.operations_exhausted(counters)
             || (self == Self::Current && self.opens_exhausted(counters))
     }
 }
 
-struct DirectoryWork {
-    path: PathBuf,
-    depth: usize,
-    stat: Option<SpoolFile>,
-    restart_blocked: bool,
+pub(crate) struct DirectoryWork {
+    pub(crate) path: PathBuf,
+    pub(crate) depth: usize,
+    pub(crate) stat: Option<SpoolFile>,
+    pub(crate) restart_blocked: bool,
 }
 
 struct ActiveDirectory {
@@ -122,19 +125,20 @@ struct ActiveDirectory {
     entries: DirEntries,
     stat: SpoolFile,
     entries_read: u32,
+    retry: bool,
 }
 
 /// A yielded directory entry. `replay` marks one already counted in an earlier pass.
-struct Entry {
-    path: PathBuf,
-    depth: usize,
+pub(crate) struct Entry {
+    pub(crate) path: PathBuf,
+    pub(crate) depth: usize,
     replay: bool,
 }
 
-enum WalkStep {
+pub(crate) enum WalkStep {
     Entry(Entry),
     CompletedDirectory(SpoolFile),
-    /// A directory could not be listed or described; it is dropped from this sweep.
+    /// A directory could not be listed or described; its retry stays in the frontier.
     Error(FailureCode),
     Capped,
     Exhausted,
@@ -149,8 +153,10 @@ struct ParkedDirectory {
     message: PathBuf,
 }
 
-struct DirectoryFrontier {
+pub(crate) struct DirectoryFrontier {
+    root: PathBuf,
     pending: VecDeque<DirectoryWork>,
+    failed: Vec<DirectoryWork>,
     active: Vec<ActiveDirectory>,
     scheduled: HashSet<PathBuf>,
     completed: HashSet<PathBuf>,
@@ -163,15 +169,23 @@ struct DirectoryFrontier {
     source: usize,
     capped: bool,
     restart_blocked: bool,
+    pub(crate) validation_budget: bool,
+    pub(crate) validation_retry: bool,
     /// Exhausted directories kept pending for a held part scan; they count against the queue
     /// ceiling exactly as they did while active.
     parked: Vec<ParkedDirectory>,
 }
 
 impl DirectoryFrontier {
-    fn new(root: &Path, pending: Vec<(PathBuf, usize, bool)>, completed: Vec<PathBuf>) -> Self {
+    pub(crate) fn new(
+        root: &Path,
+        pending: Vec<(PathBuf, usize, bool)>,
+        completed: Vec<PathBuf>,
+    ) -> Self {
         let mut frontier = Self {
+            root: root.to_path_buf(),
             pending: VecDeque::new(),
+            failed: Vec::new(),
             active: Vec::new(),
             scheduled: HashSet::new(),
             completed: completed.into_iter().collect(),
@@ -181,6 +195,8 @@ impl DirectoryFrontier {
             capped: false,
             parked: Vec::new(),
             restart_blocked: false,
+            validation_budget: false,
+            validation_retry: false,
         };
         // A directory that is still pending was persisted complete earlier but must be listed
         // again (its held part scan was lost with the process): pending wins over completed.
@@ -198,29 +214,43 @@ impl DirectoryFrontier {
                 restart_blocked,
             });
         }
-        if frontier.pending.is_empty() && frontier.completed.is_empty() {
-            frontier.enqueue(DirectoryWork {
-                path: root.to_path_buf(),
+        frontier.queue_root();
+        frontier
+    }
+
+    // An absent root witness requires rediscovery. A full queue retains every child; the root
+    // takes the first free slot instead of exceeding the cap or replacing pending work.
+    fn queue_root(&mut self) {
+        if !self.scheduled.contains(&self.root)
+            && self.pending.len() + self.active.len() + self.parked.len() + self.failed.len()
+                < MAX_FRONTIER_DIRECTORIES
+        {
+            self.enqueue(DirectoryWork {
+                path: self.root.clone(),
                 depth: 0,
                 stat: None,
                 restart_blocked: false,
             });
         }
-        frontier
     }
 
-    fn begin_pass(&mut self) {
+    pub(crate) fn begin_pass(&mut self) {
         self.capped = false;
+        self.validation_budget = false;
+        self.validation_retry = false;
+        self.pending.extend(self.failed.drain(..));
     }
 
-    fn enqueue(&mut self, work: DirectoryWork) -> bool {
+    pub(crate) fn enqueue(&mut self, work: DirectoryWork) -> bool {
         if work.restart_blocked {
             self.restart_blocked = true;
         }
         if self.completed.contains(&work.path) || self.scheduled.contains(&work.path) {
             return true;
         }
-        if self.pending.len() + self.active.len() + self.parked.len() >= MAX_FRONTIER_DIRECTORIES {
+        if self.pending.len() + self.active.len() + self.parked.len() + self.failed.len()
+            >= MAX_FRONTIER_DIRECTORIES
+        {
             self.capped = true;
             return false;
         }
@@ -229,7 +259,7 @@ impl DirectoryFrontier {
         true
     }
 
-    fn defer(&mut self, mut entry: Entry) {
+    pub(crate) fn defer(&mut self, mut entry: Entry) {
         entry.replay = true;
         self.deferred = Some(entry);
     }
@@ -238,7 +268,7 @@ impl DirectoryFrontier {
     /// listing goes to the back of the queue, in place (the combined count is unchanged), and is
     /// read again from its beginning once the directories ahead of it have drained, so the child
     /// and every later sibling are found when room exists instead of being dropped.
-    fn requeue_source(&mut self) {
+    pub(crate) fn requeue_source(&mut self) {
         if self.source >= self.active.len() {
             return;
         }
@@ -252,16 +282,68 @@ impl DirectoryFrontier {
         });
     }
 
+    pub(crate) fn retry_source(&mut self) {
+        if let Some(active) = self.active.get_mut(self.source) {
+            active.retry = true;
+        }
+    }
+
     fn mark_complete(&mut self, path: PathBuf) {
         self.completed.insert(path.clone());
         self.scheduled.insert(path);
     }
 
-    fn snapshot(&self) -> Vec<(PathBuf, usize, bool)> {
+    pub(crate) fn retry_unverified_directories(&mut self, files: &[SpoolFile]) {
+        let paths: Vec<PathBuf> = std::iter::once(self.root.clone())
+            .chain(
+                files
+                    .iter()
+                    .filter(|file| file.parser_kind == "directory")
+                    .map(|file| self.root.join(&file.relative_path)),
+            )
+            .collect();
+        for path in paths {
+            if self.completed.remove(&path) {
+                self.scheduled.remove(&path);
+                let depth = path
+                    .strip_prefix(&self.root)
+                    .map_or(0, |relative| relative.components().count());
+                if self.pending.len() + self.active.len() + self.parked.len() + self.failed.len()
+                    < MAX_FRONTIER_DIRECTORIES
+                {
+                    self.enqueue(DirectoryWork {
+                        path,
+                        depth,
+                        stat: None,
+                        restart_blocked: false,
+                    });
+                } else {
+                    for ancestor in path
+                        .ancestors()
+                        .skip(1)
+                        .take_while(|ancestor| ancestor.starts_with(&self.root))
+                    {
+                        if self.completed.remove(ancestor) {
+                            self.scheduled.remove(ancestor);
+                        }
+                    }
+                }
+            }
+        }
+        // If every slot is occupied, the absent root witness schedules rediscovery when one drains.
+        self.queue_root();
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<(PathBuf, usize, bool)> {
         let mut directories =
             Vec::with_capacity(self.pending.len() + self.active.len() + self.parked.len());
         directories.extend(
             self.pending
+                .iter()
+                .map(|work| (work.path.clone(), work.depth, work.restart_blocked)),
+        );
+        directories.extend(
+            self.failed
                 .iter()
                 .map(|work| (work.path.clone(), work.depth, work.restart_blocked)),
         );
@@ -280,8 +362,9 @@ impl DirectoryFrontier {
         directories
     }
 
-    fn is_drained(&self) -> bool {
+    pub(crate) fn is_drained(&self) -> bool {
         self.pending.is_empty()
+            && self.failed.is_empty()
             && self.active.is_empty()
             && self.parked.is_empty()
             && self.deferred.is_none()
@@ -299,15 +382,48 @@ impl DirectoryFrontier {
         }
     }
 
+    pub(crate) fn source_metadata_if_present<F: SourceFs>(
+        fs: &F,
+        roots: &CanonicalRoots,
+        expected: RootIdentity,
+        path: &Path,
+        counters: &mut PassCounters,
+    ) -> Result<Option<std::fs::Metadata>, Stop> {
+        let metadata = stat_optional(fs, path, counters)?;
+        if path == roots.source
+            && metadata.as_ref().is_some_and(|root| {
+                !root.is_dir() || root.dev() != expected.device || root.ino() != expected.inode
+            })
+        {
+            return Err(Stop::Fail(FailureCode::RootOverlap));
+        }
+        if metadata.is_none() {
+            // Only child pruning is terminal; a lost source root must remain a visible failure.
+            if path == roots.source {
+                return Err(Stop::Fail(FailureCode::SourceChanging));
+            }
+            let root = source_metadata(fs, &roots.source, counters).map_err(|stop| match stop {
+                Stop::Budget => Stop::ValidationBudget,
+                other => other,
+            })?;
+            if !root.is_dir() || root.dev() != expected.device || root.ino() != expected.inode {
+                return Err(Stop::Fail(FailureCode::RootOverlap));
+            }
+        }
+        Ok(metadata)
+    }
+
     /// `held` is the message whose part scan is held open: its parent directory is parked, not
     /// completed, when its iterator ends.
-    fn next<F: SourceFs>(
+    pub(crate) fn next<F: SourceFs>(
         &mut self,
         fs: &F,
         roots: &CanonicalRoots,
+        source_identity: RootIdentity,
         held: Option<&Path>,
         counters: &mut PassCounters,
     ) -> WalkStep {
+        self.queue_root();
         if let Some(entry) = self.deferred.take() {
             return WalkStep::Entry(entry);
         }
@@ -329,12 +445,18 @@ impl DirectoryFrontier {
             }
             let stat = match work.stat.take() {
                 Some(stat) => stat,
-                None => match source_metadata(fs, &work.path, counters) {
-                    Ok(metadata) if metadata.is_dir() => {
+                None => match Self::source_metadata_if_present(
+                    fs,
+                    roots,
+                    source_identity,
+                    &work.path,
+                    counters,
+                ) {
+                    Ok(Some(metadata)) if metadata.is_dir() => {
                         match spool_file(roots, &work.path, &metadata, "directory") {
                             Ok(stat) => stat,
                             Err(code) => {
-                                self.scheduled.remove(&work.path);
+                                self.failed.push(work);
                                 return WalkStep::Error(code);
                             }
                         }
@@ -343,38 +465,83 @@ impl DirectoryFrontier {
                         self.scheduled.remove(&work.path);
                         continue;
                     }
-                    Err(Stop::Budget) => {
+                    Err(stop @ (Stop::Budget | Stop::ValidationBudget)) => {
+                        self.validation_budget |= stop == Stop::ValidationBudget;
+                        self.validation_retry |= stop == Stop::ValidationBudget;
                         self.pending.push_front(work);
                         self.capped = true;
                         return WalkStep::Capped;
                     }
                     Err(Stop::Fail(code)) => {
-                        self.scheduled.remove(&work.path);
+                        self.failed.push(work);
                         return WalkStep::Error(code);
                     }
                 },
             };
             counters.directory_opens = counters.directory_opens.saturating_add(1);
-            match fs.read_dir(&work.path, counters) {
+            match fs.read_dir_selected(
+                &work.path,
+                FileStamp {
+                    device: stat.device,
+                    inode: stat.inode,
+                    size: stat.size,
+                    mtime_ns: stat.mtime_ns,
+                },
+                counters,
+            ) {
                 Ok(entries) => self.active.push(ActiveDirectory {
                     path: work.path,
                     depth: work.depth,
                     entries,
                     stat,
                     entries_read: 0,
+                    retry: false,
                 }),
                 Err(error) if budget_exhausted(&error) => {
+                    self.validation_budget |= fs::validation_budget_exhausted(&error);
+                    self.validation_retry |= fs::validation_budget_exhausted(&error);
                     self.pending.push_front(work);
                     self.capped = true;
                     return WalkStep::Capped;
                 }
                 Err(error) => {
-                    self.scheduled.remove(&work.path);
+                    // A cached directory stamp cannot distinguish pruning from a listing failure.
+                    if error.kind() == io::ErrorKind::NotFound {
+                        match Self::source_metadata_if_present(
+                            fs,
+                            roots,
+                            source_identity,
+                            &work.path,
+                            counters,
+                        ) {
+                            Ok(None) => {
+                                self.scheduled.remove(&work.path);
+                                continue;
+                            }
+                            Err(Stop::Budget | Stop::ValidationBudget) => {
+                                self.validation_budget = true;
+                                self.validation_retry = true;
+                                work.stat = Some(stat);
+                                self.pending.push_front(work);
+                                self.capped = true;
+                                return WalkStep::Capped;
+                            }
+                            Err(Stop::Fail(code)) => {
+                                work.stat = None;
+                                self.failed.push(work);
+                                return WalkStep::Error(code);
+                            }
+                            Ok(_) => {}
+                        }
+                    }
+                    work.stat = (error.kind() != io::ErrorKind::NotFound).then_some(stat);
+                    self.failed.push(work);
                     return WalkStep::Error(io_failure(error));
                 }
             }
         }
         if self.active.is_empty() {
+            self.queue_root();
             return if self.pending.is_empty() {
                 WalkStep::Exhausted
             } else {
@@ -399,13 +566,27 @@ impl DirectoryFrontier {
             Some(Err(error)) => {
                 counters.entries = counters.entries.saturating_add(1);
                 let active = self.active.remove(index);
-                self.scheduled.remove(&active.path);
+                self.failed.push(DirectoryWork {
+                    path: active.path,
+                    depth: active.depth,
+                    stat: Some(active.stat),
+                    restart_blocked: false,
+                });
                 self.turn = 0;
                 WalkStep::Error(io_failure(error))
             }
             None => {
                 let active = self.active.remove(index);
                 self.turn = 0;
+                if active.retry {
+                    self.failed.push(DirectoryWork {
+                        path: active.path,
+                        depth: active.depth,
+                        stat: None,
+                        restart_blocked: false,
+                    });
+                    return WalkStep::Capped;
+                }
                 if let Some(message) =
                     held.filter(|message| message.parent() == Some(active.path.as_path()))
                 {
@@ -433,6 +614,7 @@ struct PassState<'a> {
     counters: PassCounters,
     candidates: Vec<RecordCandidate>,
     files: Vec<SpoolFile>,
+    verified_files: usize,
     progress: Vec<ProgressUpdate>,
     failed: Vec<FileFailure>,
     recovered: Vec<PathBuf>,
@@ -459,7 +641,7 @@ struct PassState<'a> {
     cancelled: bool,
 }
 
-fn lesser(current: Option<FailureCode>, code: FailureCode) -> Option<FailureCode> {
+pub(crate) fn lesser(current: Option<FailureCode>, code: FailureCode) -> Option<FailureCode> {
     match current {
         Some(existing) if existing.as_str() <= code.as_str() => Some(existing),
         _ => Some(code),
@@ -484,7 +666,12 @@ impl PassState<'_> {
     }
 
     fn skip(&mut self, code: FailureCode) {
-        self.skipped = lesser(self.skipped, code);
+        self.skipped = match (self.skipped, code) {
+            (Some(FailureCode::RootOverlap), _) | (_, FailureCode::RootOverlap) => {
+                Some(FailureCode::RootOverlap)
+            }
+            (current, code) => lesser(current, code),
+        };
         self.incomplete = true;
     }
 }
@@ -558,7 +745,7 @@ struct PartScan {
     revalidated: usize,
 }
 
-fn unauthorized(authorization: SourceAuthorization) -> Option<PassReport> {
+pub(crate) fn unauthorized(authorization: SourceAuthorization) -> Option<PassReport> {
     let failure = if !authorization.selected {
         FailureCode::Unselected
     } else if authorization.consent != ConsentState::Enabled {
@@ -789,7 +976,7 @@ impl<F: SourceFs> OpenCodeSource<F> {
                     }
                     continue;
                 }
-                Err(Stop::Budget) => break,
+                Err(Stop::Budget | Stop::ValidationBudget) => break,
                 Err(Stop::Fail(code)) => {
                     state.skip(code);
                     continue;
@@ -806,6 +993,7 @@ impl<F: SourceFs> OpenCodeSource<F> {
             let outcome = self.process_file(store, &path, &metadata, state, Lane::Current);
             // The reserved lane running out of budget ends only itself; discovery still runs.
             if matches!(outcome, FileOutcome::Budget) {
+                state.current_incomplete = true;
                 break;
             }
             if let Flow::Stop = self.apply(&path, outcome, state, None) {
@@ -827,7 +1015,7 @@ impl<F: SourceFs> OpenCodeSource<F> {
                 self.part_scan = None;
                 return;
             }
-            Err(Stop::Budget) => return,
+            Err(Stop::Budget | Stop::ValidationBudget) => return,
             Err(Stop::Fail(code)) => {
                 self.part_scan = None;
                 state.skip(code);
@@ -849,9 +1037,13 @@ impl<F: SourceFs> OpenCodeSource<F> {
                 break;
             }
             let held = self.part_scan.as_ref().map(|scan| scan.message.as_path());
-            let step = self
-                .frontier
-                .next(&self.fs, &self.roots, held, &mut state.counters);
+            let step = self.frontier.next(
+                &self.fs,
+                &self.roots,
+                self.source_identity,
+                held,
+                &mut state.counters,
+            );
             match step {
                 WalkStep::Exhausted => break,
                 WalkStep::Capped => {
@@ -876,7 +1068,7 @@ impl<F: SourceFs> OpenCodeSource<F> {
         }
         let metadata = match source_metadata(&self.fs, &entry.path, &mut state.counters) {
             Ok(metadata) => metadata,
-            Err(Stop::Budget) => {
+            Err(Stop::Budget | Stop::ValidationBudget) => {
                 state.caught_up = true;
                 self.frontier.defer(entry);
                 return Flow::Stop;
@@ -1033,6 +1225,20 @@ impl<F: SourceFs> OpenCodeSource<F> {
         }
     }
 
+    fn check_file_roots(&mut self, state: &mut PassState) -> Result<(), FileOutcome> {
+        match self.check_roots(&mut state.counters) {
+            RootCheck::Valid => {
+                state.verified_files = state.files.len();
+                Ok(())
+            }
+            RootCheck::Budget => {
+                self.frontier.validation_budget = true;
+                Err(FileOutcome::Budget)
+            }
+            RootCheck::Conflict => Err(FileOutcome::Failed(FailureCode::RootOverlap)),
+        }
+    }
+
     fn finish(&mut self, store: &mut Store, mut state: PassState, now_ms: i64) -> PassReport {
         if state.changing {
             let paths: Vec<PathBuf> = state.changing_path.iter().cloned().collect();
@@ -1045,6 +1251,28 @@ impl<F: SourceFs> OpenCodeSource<F> {
         // the generation open: the pass is catching up, never idle, consistent or terminal.
         if state.current_incomplete || self.part_scan.is_some() {
             state.caught_up = true;
+        }
+        if self.frontier.is_drained() && !state.caught_up {
+            for (path, expected) in [
+                (&self.roots.source, self.source_identity),
+                (&self.roots.data, self.data_identity),
+            ] {
+                match root_identity(&self.fs, path, &mut state.counters) {
+                    Ok(identity) if identity == expected => {}
+                    Err(Stop::Budget | Stop::ValidationBudget) => {
+                        self.frontier.validation_budget = true;
+                        self.frontier.validation_retry = true;
+                        state.caught_up = true;
+                    }
+                    _ => {
+                        state.skip(FailureCode::RootOverlap);
+                        state.caught_up = true;
+                    }
+                }
+                if state.caught_up {
+                    break;
+                }
+            }
         }
         let mut prospective = self.failures.clone();
         for failed in &state.failed {
@@ -1061,7 +1289,10 @@ impl<F: SourceFs> OpenCodeSource<F> {
                 other_failure = lesser(other_failure, *code);
             }
         }
-        let mut failure = database_failure
+        let mut failure = state
+            .skipped
+            .filter(|code| *code == FailureCode::RootOverlap)
+            .or(database_failure)
             .or(other_failure)
             .or(state.rejection)
             .or(state.skipped);
@@ -1070,6 +1301,8 @@ impl<F: SourceFs> OpenCodeSource<F> {
         // never depends on which sibling happened to be visited first.
         let outcome = if database_failure.is_some() {
             PassOutcome::Unavailable
+        } else if failure == Some(FailureCode::RootOverlap) {
+            PassOutcome::Partial
         } else if state.caught_up {
             PassOutcome::CatchingUp
         } else if failure.is_some() {
@@ -1101,15 +1334,15 @@ impl<F: SourceFs> OpenCodeSource<F> {
                 Vec::new(),
             );
         }
-        let frontier = self.frontier.snapshot();
         let conflicts = candidate_keys(&self.roots.source, &state.candidates);
         if root_complete && state.source_seen {
             match self.completed_databases_unchanged(store, &mut state) {
                 Ok(true) => {}
                 Ok(false) => return self.changed(store, state.counters, now_ms, &[], &conflicts),
-                Err(Stop::Budget) => {
+                Err(Stop::Budget | Stop::ValidationBudget) => {
                     // Not enough budget left to prove the staged databases unchanged: stay
                     // catching up and prove it with a fresh budget next pass.
+                    self.frontier.validation_budget = true;
                     state.caught_up = true;
                 }
                 Err(Stop::Fail(code)) => {
@@ -1123,6 +1356,17 @@ impl<F: SourceFs> OpenCodeSource<F> {
         } else {
             outcome
         };
+        let unverified = &state.files[state.verified_files..];
+        let retry_files = (self.frontier.validation_budget
+            && (self.frontier.validation_retry
+                || unverified
+                    .iter()
+                    .any(|file| file.parser_kind == "directory")))
+        .then_some(unverified);
+        if let Some(files) = retry_files {
+            self.frontier.retry_unverified_directories(files);
+        }
+        let frontier = self.frontier.snapshot();
         let batch = StageBatch {
             visited: &state.revalidated,
             candidates: &state.candidates,
@@ -1184,23 +1428,30 @@ impl<F: SourceFs> OpenCodeSource<F> {
                 }
             };
         }
-        let result = store.stage_scan(StageRequest {
-            source_id: &self.source_id,
-            root: &self.roots.source,
-            generation: self.generation,
-            batch,
-            frontier: Some(&frontier),
-            outcome,
-            failure,
-            rejection: state.rejection,
-            backoff: None,
-            stable_read: state.stable_read,
-            counters: state.counters,
-            now_ms,
-        });
+        let result = store.stage_scan_with_freshness(
+            StageRequest {
+                source_id: &self.source_id,
+                root: &self.roots.source,
+                generation: self.generation,
+                batch,
+                frontier: Some(&frontier),
+                outcome,
+                failure,
+                rejection: state.rejection,
+                backoff: None,
+                stable_read: state.stable_read,
+                counters: state.counters,
+                now_ms,
+            },
+            !self.frontier.validation_budget,
+            retry_files,
+        );
         match result {
             Ok(summary) => {
                 self.failures = prospective;
+                if failure == Some(FailureCode::RootOverlap) && self.reload(store).is_err() {
+                    self.needs_reload = true;
+                }
                 self.report(
                     store,
                     outcome,
@@ -1439,13 +1690,17 @@ impl<F: SourceFs> OpenCodeSource<F> {
             Err(RootError::LimitExceeded) => return RootCheck::Budget,
             _ => return RootCheck::Conflict,
         }
+        self.check_identities(counters)
+    }
+
+    fn check_identities(&self, counters: &mut PassCounters) -> RootCheck {
         for (path, expected) in [
             (&self.roots.source, self.source_identity),
             (&self.roots.data, self.data_identity),
         ] {
             match root_identity(&self.fs, path, counters) {
                 Ok(identity) if identity == expected => {}
-                Err(Stop::Budget) => return RootCheck::Budget,
+                Err(Stop::Budget | Stop::ValidationBudget) => return RootCheck::Budget,
                 _ => return RootCheck::Conflict,
             }
         }
@@ -1539,7 +1794,7 @@ impl<F: SourceFs> OpenCodeSource<F> {
 
 fn stop_outcome(stop: Stop) -> FileOutcome {
     match stop {
-        Stop::Budget => FileOutcome::Budget,
+        Stop::Budget | Stop::ValidationBudget => FileOutcome::Budget,
         Stop::Fail(code) => FileOutcome::Failed(code),
     }
 }
@@ -1566,10 +1821,8 @@ impl<F: SourceFs> OpenCodeSource<F> {
             Ok(path) => path,
             Err(stop) => return stop_outcome(stop),
         };
-        match self.check_roots(&mut state.counters) {
-            RootCheck::Valid => {}
-            RootCheck::Budget => return FileOutcome::Budget,
-            RootCheck::Conflict => return FileOutcome::Failed(FailureCode::RootOverlap),
+        if let Err(outcome) = self.check_file_roots(state) {
+            return outcome;
         }
         let stat =
             match source_metadata(&self.fs, &canonical, &mut state.counters).and_then(|metadata| {
@@ -1580,7 +1833,10 @@ impl<F: SourceFs> OpenCodeSource<F> {
             };
         let before = match sqlite_ro::preflight(&self.fs, &canonical, &mut state.counters) {
             Ok(identity) => identity,
-            Err(FailureCode::LimitExceeded) => return FileOutcome::Budget,
+            Err(FailureCode::LimitExceeded) => {
+                self.frontier.validation_budget = true;
+                return FileOutcome::Budget;
+            }
             Err(code) => return FileOutcome::Failed(code),
         };
         let Ok(relative) = canonical.strip_prefix(&self.roots.source) else {
@@ -1610,6 +1866,7 @@ impl<F: SourceFs> OpenCodeSource<F> {
             .saturating_sub(state.counters.stat_calls)
             .saturating_sub(IDENTITY_PROOF_STATS);
         if allowance == 0 {
+            self.frontier.validation_budget = true;
             return FileOutcome::Budget;
         }
         state.counters.source_opens = state.counters.source_opens.saturating_add(1);
@@ -1638,17 +1895,29 @@ impl<F: SourceFs> OpenCodeSource<F> {
         if refused {
             // A physical operation was refused for lack of allowance: the read is discarded and
             // retried whole with a fresh budget.
+            self.frontier.validation_budget = true;
             return FileOutcome::Budget;
         }
         let batch = match read {
             Ok(batch) => batch,
-            Err(code) => return FileOutcome::Failed(code),
+            Err(code) => {
+                if let Err(outcome) = self.check_file_roots(state) {
+                    return outcome;
+                }
+                return FileOutcome::Failed(code);
+            }
         };
         match sqlite_ro::identity_unchanged(&self.fs, &canonical, before, &mut state.counters) {
             Ok(true) => {}
             Ok(false) => return FileOutcome::Changing,
-            Err(FailureCode::LimitExceeded) => return FileOutcome::Budget,
+            Err(FailureCode::LimitExceeded) => {
+                self.frontier.validation_budget = true;
+                return FileOutcome::Budget;
+            }
             Err(code) => return FileOutcome::Failed(code),
+        }
+        if let Err(outcome) = self.check_file_roots(state) {
+            return outcome;
         }
         state.candidates.extend(batch.records);
         state.progress.push(ProgressUpdate {
@@ -1710,10 +1979,8 @@ impl<F: SourceFs> OpenCodeSource<F> {
         {
             return FileOutcome::Budget;
         }
-        match self.check_roots(&mut state.counters) {
-            RootCheck::Valid => {}
-            RootCheck::Budget => return FileOutcome::Budget,
-            RootCheck::Conflict => return FileOutcome::Failed(FailureCode::RootOverlap),
+        if let Err(outcome) = self.check_file_roots(state) {
+            return outcome;
         }
         state.counters.source_opens = state.counters.source_opens.saturating_add(1);
         let read = match self.fs.read_bounded(
@@ -1722,13 +1989,26 @@ impl<F: SourceFs> OpenCodeSource<F> {
             &mut state.counters,
         ) {
             Ok(read) => read,
-            Err(error) => return stop_outcome(stop_of(error)),
+            Err(error) => {
+                if let Err(outcome) = self.check_file_roots(state) {
+                    return outcome;
+                }
+                return stop_outcome(stop_of(error));
+            }
         };
         state.counters.bytes_read = state
             .counters
             .bytes_read
             .saturating_add(read.bytes.len() as u64);
         state.counters.rows_read = state.counters.rows_read.saturating_add(1);
+        match self.check_identities(&mut state.counters) {
+            RootCheck::Valid => state.verified_files = state.files.len(),
+            RootCheck::Budget => {
+                self.frontier.validation_budget = true;
+                return FileOutcome::Budget;
+            }
+            RootCheck::Conflict => return FileOutcome::Failed(FailureCode::RootOverlap),
+        }
         if read.before != stamp || read.before != read.after {
             return FileOutcome::Failed(FailureCode::SourceChanging);
         }
@@ -1781,7 +2061,7 @@ impl<F: SourceFs> OpenCodeSource<F> {
         match self.revalidate(&canonical, stamp, &mut scan, state, lane) {
             Ok(true) => {}
             Ok(false) => return FileOutcome::Failed(FailureCode::SourceChanging),
-            Err(Stop::Budget) => {
+            Err(Stop::Budget | Stop::ValidationBudget) => {
                 self.part_scan = Some(scan);
                 return FileOutcome::Budget;
             }
@@ -1902,12 +2182,32 @@ impl<F: SourceFs> OpenCodeSource<F> {
             Err(code) => return Err(FileOutcome::Failed(code)),
         }
         state.counters.directory_opens = state.counters.directory_opens.saturating_add(1);
-        match self.fs.read_dir(&canonical, &mut state.counters) {
+        match self
+            .fs
+            .read_dir_selected(&canonical, scan.directory_stamp, &mut state.counters)
+        {
             Ok(entries) => scan.entries = Some(entries),
             Err(error) if error.kind() == io::ErrorKind::NotFound && !budget_exhausted(&error) => {
-                return Ok(None);
+                match DirectoryFrontier::source_metadata_if_present(
+                    &self.fs,
+                    &self.roots,
+                    self.source_identity,
+                    &canonical,
+                    &mut state.counters,
+                ) {
+                    Ok(None) => return Ok(None),
+                    Ok(Some(_)) => return Err(FileOutcome::Failed(FailureCode::SourceChanging)),
+                    Err(Stop::Budget | Stop::ValidationBudget) => {
+                        self.frontier.validation_budget = true;
+                        return Err(FileOutcome::Budget);
+                    }
+                    Err(stop) => return Err(stop_outcome(stop)),
+                }
             }
-            Err(error) => return Err(stop_outcome(stop_of(error))),
+            Err(error) => {
+                self.frontier.validation_budget |= fs::validation_budget_exhausted(&error);
+                return Err(stop_outcome(stop_of(error)));
+            }
         }
         Ok(Some(scan))
     }
@@ -1952,7 +2252,7 @@ impl<F: SourceFs> OpenCodeSource<F> {
             }
             let metadata = match source_metadata(&self.fs, &part_path, &mut state.counters) {
                 Ok(metadata) => metadata,
-                Err(Stop::Budget) => {
+                Err(Stop::Budget | Stop::ValidationBudget) => {
                     scan.deferred = Some(part_path);
                     return ScanStep::Budget;
                 }
@@ -1970,7 +2270,7 @@ impl<F: SourceFs> OpenCodeSource<F> {
                 &mut state.counters,
             ) {
                 Ok(path) => path,
-                Err(Stop::Budget) => {
+                Err(Stop::Budget | Stop::ValidationBudget) => {
                     scan.deferred = Some(part_path);
                     return ScanStep::Budget;
                 }
@@ -2046,17 +2346,18 @@ impl<F: SourceFs> OpenCodeSource<F> {
     /// roots, the message, each part and the part directory still carry the identity and stamp
     /// they were read under. Anything else is a mixed generation and is not published.
     fn revalidate(
-        &self,
+        &mut self,
         message: &Path,
         message_stamp: FileStamp,
         scan: &mut PartScan,
         state: &mut PassState,
         lane: Lane,
     ) -> Result<bool, Stop> {
-        match self.check_roots(&mut state.counters) {
-            RootCheck::Valid => {}
-            RootCheck::Budget => return Err(Stop::Budget),
-            RootCheck::Conflict => return Err(Stop::Fail(FailureCode::RootOverlap)),
+        if let Err(outcome) = self.check_file_roots(state) {
+            return Err(match outcome {
+                FileOutcome::Budget => Stop::Budget,
+                _ => Stop::Fail(FailureCode::RootOverlap),
+            });
         }
         let directory = scan
             .entries
@@ -2129,7 +2430,7 @@ fn candidate_keys(root: &Path, candidates: &[RecordCandidate]) -> Vec<(PathBuf, 
         .collect()
 }
 
-fn pass_report(
+pub(crate) fn pass_report(
     outcome: PassOutcome,
     failure: Option<FailureCode>,
     counters: PassCounters,
@@ -2155,14 +2456,14 @@ fn root_failure(error: RootError) -> FailureCode {
     }
 }
 
-fn stop_failure(stop: Stop) -> FailureCode {
+pub(crate) fn stop_failure(stop: Stop) -> FailureCode {
     match stop {
-        Stop::Budget => FailureCode::LimitExceeded,
+        Stop::Budget | Stop::ValidationBudget => FailureCode::LimitExceeded,
         Stop::Fail(code) => code,
     }
 }
 
-fn store_failure(error: StoreError) -> FailureCode {
+pub(crate) fn store_failure(error: StoreError) -> FailureCode {
     match error {
         StoreError::LimitExceeded => FailureCode::LimitExceeded,
         StoreError::CountOutOfRange | StoreError::InvalidStoredValue => FailureCode::InvalidRecord,
@@ -2186,6 +2487,9 @@ fn sqlite_open_failure(error: sqlite_ro::OpenError) -> FailureCode {
 }
 
 fn io_failure(error: io::Error) -> FailureCode {
+    if fs::selected_directory_limit(&error) {
+        return FailureCode::LimitExceeded;
+    }
     match error.kind() {
         io::ErrorKind::NotFound => FailureCode::SourceChanging,
         io::ErrorKind::InvalidInput => FailureCode::RootOverlap,
@@ -2194,7 +2498,7 @@ fn io_failure(error: io::Error) -> FailureCode {
 }
 
 /// One metadata call, charged by the filesystem against the shared per-pass ceiling.
-fn source_metadata<F: SourceFs>(
+pub(crate) fn source_metadata<F: SourceFs>(
     fs: &F,
     path: &Path,
     counters: &mut PassCounters,
@@ -2203,7 +2507,7 @@ fn source_metadata<F: SourceFs>(
 }
 
 /// Like [`source_metadata`] but a missing path is `None`, not a failure.
-fn stat_optional<F: SourceFs>(
+pub(crate) fn stat_optional<F: SourceFs>(
     fs: &F,
     path: &Path,
     counters: &mut PassCounters,
@@ -2226,8 +2530,10 @@ fn canonicalize_counted<F: SourceFs>(
 }
 
 /// A filesystem error as a stop: the metadata ceiling resumes later, anything else fails.
-fn stop_of(error: io::Error) -> Stop {
-    if budget_exhausted(&error) {
+pub(crate) fn stop_of(error: io::Error) -> Stop {
+    if fs::validation_budget_exhausted(&error) {
+        Stop::ValidationBudget
+    } else if budget_exhausted(&error) {
         Stop::Budget
     } else {
         Stop::Fail(io_failure(error))
@@ -2255,7 +2561,7 @@ fn canonical_source_file<F: SourceFs>(
     Ok(canonical)
 }
 
-fn root_identity<F: SourceFs>(
+pub(crate) fn root_identity<F: SourceFs>(
     fs: &F,
     path: &Path,
     counters: &mut PassCounters,
@@ -2270,7 +2576,7 @@ fn root_identity<F: SourceFs>(
     })
 }
 
-fn spool_file(
+pub(crate) fn spool_file(
     roots: &CanonicalRoots,
     path: &Path,
     metadata: &std::fs::Metadata,
@@ -2351,14 +2657,69 @@ struct Bound {
     anchor: DataAnchor,
 }
 
+/// One attached root's runtime, by harness.
+enum Runtime<F: SourceFs> {
+    OpenCode(Box<OpenCodeSource<F>>),
+    Codex(Box<CodexSource<F>>),
+}
+
 enum Slot<F: SourceFs> {
-    Attached(Box<OpenCodeSource<F>>),
+    Attached(Runtime<F>),
     /// A durable enabled source whose runtime could not be built; the current failure is shown
     /// over its durable status without touching it.
     Unattached {
         code: FailureCode,
         attempted_ms: Option<i64>,
     },
+}
+
+/// The runtime of a registered root for its harness, loaded from the store.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the attach and reattach paths pass the facts each already proved"
+)]
+fn build_runtime<F: SourceFs>(
+    harness: Harness,
+    fs: F,
+    source_root: &Path,
+    data_dir: &Path,
+    home: &Path,
+    roots: CanonicalRoots,
+    source_identity: RootIdentity,
+    data_identity: RootIdentity,
+    source_id: String,
+    store: &mut Store,
+) -> Result<Runtime<F>, StoreError> {
+    Ok(match harness {
+        Harness::OpenCode => {
+            let mut source = OpenCodeSource::new(
+                fs,
+                source_root,
+                data_dir,
+                home,
+                roots,
+                source_identity,
+                data_identity,
+                source_id,
+            );
+            source.reload(store)?;
+            Runtime::OpenCode(Box::new(source))
+        }
+        Harness::Codex => {
+            let mut source = CodexSource::new(
+                fs,
+                source_root,
+                data_dir,
+                home,
+                roots,
+                source_identity,
+                data_identity,
+                source_id,
+            );
+            source.reload(store)?;
+            Runtime::Codex(Box::new(source))
+        }
+    })
 }
 
 /// A `today_snapshot` request the Engine refuses.
@@ -2571,6 +2932,30 @@ impl<F: SourceFs> Engine<F> {
         authorization: SourceAuthorization,
         kind: SourceKind,
     ) -> Result<String, PassReport> {
+        self.attach(Harness::OpenCode, fs, source_root, authorization, kind)
+    }
+
+    /// Registers a Codex root and builds its runtime on the one Store, exactly as
+    /// [`Engine::attach_opencode`] does for OpenCode. A root already registered for another
+    /// harness is refused `RootInvalid` with no write, in either direction.
+    pub fn attach_codex(
+        &mut self,
+        fs: F,
+        source_root: &Path,
+        authorization: SourceAuthorization,
+        kind: SourceKind,
+    ) -> Result<String, PassReport> {
+        self.attach(Harness::Codex, fs, source_root, authorization, kind)
+    }
+
+    fn attach(
+        &mut self,
+        harness: Harness,
+        fs: F,
+        source_root: &Path,
+        authorization: SourceAuthorization,
+        kind: SourceKind,
+    ) -> Result<String, PassReport> {
         self.last_store_error = None;
         if let Some(report) = unauthorized(authorization) {
             return Err(report);
@@ -2609,13 +2994,18 @@ impl<F: SourceFs> Engine<F> {
         };
         let (device, inode) = store.data_identity();
         let data_identity = RootIdentity { device, inode };
-        let registration = store.register_source(
+        let registration = store.register_harness_source(
+            harness,
             &roots.source,
             kind,
             (source_identity.device, source_identity.inode),
         );
         let registration = match registration {
             Ok(registration) => registration,
+            // The root is registered for another harness: refused, nothing written.
+            Err(StoreError::InvalidRoot) => {
+                return Err(unavailable(FailureCode::RootInvalid, counters));
+            }
             Err(error) => return Err(self.attach_failed(opened_here, error, counters)),
         };
         let source_id = registration.source_id;
@@ -2625,7 +3015,9 @@ impl<F: SourceFs> Engine<F> {
         if !self.sources.contains_key(&source_id) && self.sources.len() >= MAX_REPORTED_SOURCES {
             return Err(unavailable(FailureCode::LimitExceeded, counters));
         }
-        let mut source = OpenCodeSource::new(
+        let store = self.store.as_mut().expect("the store was just used");
+        let runtime = build_runtime(
+            harness,
             fs,
             source_root,
             &self.data_request,
@@ -2634,13 +3026,14 @@ impl<F: SourceFs> Engine<F> {
             source_identity,
             data_identity,
             source_id.clone(),
+            store,
         );
-        let store = self.store.as_mut().expect("the store was just used");
-        if let Err(error) = source.reload(store) {
-            return Err(self.attach_failed(opened_here, error, counters));
-        }
+        let runtime = match runtime {
+            Ok(runtime) => runtime,
+            Err(error) => return Err(self.attach_failed(opened_here, error, counters)),
+        };
         self.sources
-            .insert(source_id.clone(), Slot::Attached(Box::new(source)));
+            .insert(source_id.clone(), Slot::Attached(runtime));
         Ok(source_id)
     }
 
@@ -2679,9 +3072,10 @@ impl<F: SourceFs> Engine<F> {
         )
     }
 
-    /// The single startup and retry path for a persisted root. Requires a Store and a durable
-    /// consent-enabled row, re-validates the persisted canonical path and identity, and only
-    /// then registers and reloads. A failure builds no runtime and writes nothing durable: it
+    /// The single startup and retry path for a persisted root, for every harness: the runtime is
+    /// built for the harness of its durable row. Requires a Store and a durable consent-enabled
+    /// row, re-validates the persisted canonical path and identity, and only then registers and
+    /// reloads. A failure builds no runtime and writes nothing durable: it
     /// is recorded in the bounded in-memory `Unattached` map, replacing any earlier record.
     pub fn reattach(
         &mut self,
@@ -2731,15 +3125,21 @@ impl<F: SourceFs> Engine<F> {
         let Some(store) = self.store.as_mut() else {
             return Err(refused(FailureCode::Unselected));
         };
+        let Some(harness) = Harness::parse(&row.harness) else {
+            self.record_unattached(source_id, FailureCode::Store, attempted_ms);
+            return Err(refused(FailureCode::Store));
+        };
         let (device, inode) = store.data_identity();
         let data_identity = RootIdentity { device, inode };
-        let registered = store.register_source(
+        let registered = store.register_harness_source(
+            harness,
             &roots.source,
             row.kind,
             (source_identity.device, source_identity.inode),
         );
-        let mut source = match registered {
-            Ok(registration) => OpenCodeSource::new(
+        let runtime = registered.and_then(|registration| {
+            build_runtime(
+                harness,
                 fs,
                 &PathBuf::from(&row.canonical_root),
                 &self.data_request,
@@ -2748,19 +3148,15 @@ impl<F: SourceFs> Engine<F> {
                 source_identity,
                 data_identity,
                 registration.source_id,
-            ),
-            Err(_) => {
-                self.record_unattached(source_id, FailureCode::Store, attempted_ms);
-                return Err(refused(FailureCode::Store));
-            }
-        };
-        let store = self.store.as_mut().expect("the store was just used");
-        if source.reload(store).is_err() {
+                store,
+            )
+        });
+        let Ok(runtime) = runtime else {
             self.record_unattached(source_id, FailureCode::Store, attempted_ms);
             return Err(refused(FailureCode::Store));
-        }
+        };
         self.sources
-            .insert(source_id.to_owned(), Slot::Attached(Box::new(source)));
+            .insert(source_id.to_owned(), Slot::Attached(runtime));
         Ok(source_id.to_owned())
     }
 
@@ -2865,7 +3261,7 @@ impl<F: SourceFs> Engine<F> {
         if let Some(report) = unauthorized(authorization) {
             return Ok(report);
         }
-        let (Some(store), Some(Slot::Attached(source))) =
+        let (Some(store), Some(Slot::Attached(runtime))) =
             (self.store.as_mut(), self.sources.get_mut(source_id))
         else {
             return Ok(pass_report(
@@ -2876,7 +3272,10 @@ impl<F: SourceFs> Engine<F> {
                 None,
             ));
         };
-        source.pass_until(store, authorization, now_ms, cancel)
+        match runtime {
+            Runtime::OpenCode(source) => source.pass_until(store, authorization, now_ms, cancel),
+            Runtime::Codex(source) => source.pass_until(store, authorization, now_ms, cancel),
+        }
     }
 
     /// One ingest over every durable consent-enabled source with the caller's token: an attached
@@ -3090,8 +3489,16 @@ mod tests {
         };
         let mut counters = PassCounters::default();
         // Walk until the held directory's iterator ends while its message scan is held.
+        let identity = super::root_identity(&RealSourceFs, &root, &mut counters)
+            .map_err(|error| format!("{error:?}"))?;
         for _ in 0..100 {
-            match frontier.next(&RealSourceFs, &roots, Some(&message), &mut counters) {
+            match frontier.next(
+                &RealSourceFs,
+                &roots,
+                identity,
+                Some(&message),
+                &mut counters,
+            ) {
                 WalkStep::CompletedDirectory(stat) if stat.relative_path == Path::new("held") => {
                     break;
                 }

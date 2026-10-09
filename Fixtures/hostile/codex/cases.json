@@ -1,0 +1,79 @@
+{
+  "description": "Hostile Codex record lines. Each case file is written at test time as: the header line, the case's raw line, then the control line, each newline-terminated, at sessions/2026/03/29/rollout-hostile-<name>.jsonl in a fresh root. Nothing here is stored or interpreted except through the adapter under test.",
+  "header": "{\"timestamp\":\"2026-03-29T09:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"0195f000-0000-7000-8000-0000000000aa\",\"cli_version\":\"0.153.0\",\"source\":\"cli\"}}",
+  "control": "{\"timestamp\":\"2026-03-29T09:30:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_control\",\"usage\":{\"input_tokens\":1,\"total_tokens\":1}}}",
+  "cases": [
+    {
+      "name": "negative_counter",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":-1,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "fractional_counter",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":1.5,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "above_ceiling_counter",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":1000000000001,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "at_ceiling_counter",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":1000000000000,\"total_tokens\":1000000000000}}}"
+    },
+    {
+      "name": "string_counter",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":\"12\",\"total_tokens\":5}}}"
+    },
+    {
+      "name": "exponent_counter",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":5,\"total_tokens\":1e3}}}"
+    },
+    {
+      "name": "unparseable_timestamp",
+      "raw": "{\"timestamp\":\"yesterday\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":5,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "year_10000_timestamp",
+      "raw": "{\"timestamp\":\"10000-01-01T00:00:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":5,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "pre_epoch_timestamp",
+      "raw": "{\"timestamp\":\"1969-12-31T23:59:59.999Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":5,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "oversize_timestamp",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.00000000000000000000000000000000000000000000000000000000000000000000000000000000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":5,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "missing_timestamp",
+      "raw": "{\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":5,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "empty_response_id",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"\",\"usage\":{\"input_tokens\":5,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "control_char_session_id",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"a\\u0001b\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":5,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "oversize_response_id",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr\",\"usage\":{\"input_tokens\":5,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "missing_thread_id",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":{\"input_tokens\":5,\"total_tokens\":5}}}"
+    },
+    {
+      "name": "missing_usage",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\"}}"
+    },
+    {
+      "name": "usage_not_object",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"turn_id\":\"t\",\"session_id\":\"0195f000-0000-7000-8000-0000000000aa\",\"root_turn_id\":\"t\",\"response_id\":\"resp_hostile\",\"usage\":[1,2,3]}}"
+    },
+    {
+      "name": "truncated_json",
+      "raw": "{\"timestamp\":\"2026-03-29T09:10:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{"
+    }
+  ]
+}

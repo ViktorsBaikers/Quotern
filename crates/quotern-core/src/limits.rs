@@ -1,5 +1,7 @@
 pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// Longest JSONL line read from one file in one pass; a longer unterminated line is discarded.
+pub const MAX_JSONL_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_OPENCODE_RECORD_BYTES: usize = 256 * 1024;
 pub const MAX_TOKEN_COUNT: u64 = 1_000_000_000_000;
 pub const MAX_RECORD_ID_COMPONENT_BYTES: usize = 256;

@@ -1,5 +1,6 @@
+use std::cell::RefCell;
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -7,7 +8,7 @@ use rusqlite::Connection;
 
 use super::sqlite_ro::{self, OpenError};
 use crate::domain::PassCounters;
-use crate::limits::MAX_METADATA_CALLS;
+use crate::limits::{MAX_METADATA_CALLS, MAX_OPEN_DIRECTORIES, MAX_PATH_BYTES};
 
 pub type DirEntries = Box<dyn Iterator<Item = io::Result<PathBuf>> + Send>;
 
@@ -63,6 +64,105 @@ impl FileStamp {
     }
 }
 
+#[derive(Debug)]
+struct SelectedDirectoryLimit;
+
+impl std::fmt::Display for SelectedDirectoryLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("selected directory scope limit exceeded")
+    }
+}
+
+impl std::error::Error for SelectedDirectoryLimit {}
+
+pub(crate) fn selected_directory_limit(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<SelectedDirectoryLimit>())
+}
+
+struct SelectedDirectory {
+    path: PathBuf,
+    stamp: FileStamp,
+    witnessed: bool,
+}
+
+thread_local! {
+    static SELECTED_DIRECTORIES: RefCell<[Option<SelectedDirectory>; MAX_OPEN_DIRECTORIES]> =
+        const { RefCell::new([const { None }; MAX_OPEN_DIRECTORIES]) };
+}
+
+struct SelectedScope(usize);
+
+impl SelectedScope {
+    fn enter(path: &Path, stamp: FileStamp) -> io::Result<Self> {
+        let valid = path.to_str().is_some_and(|text| {
+            text.len() <= MAX_PATH_BYTES
+                && !text.as_bytes().contains(&0)
+                && text.starts_with('/')
+                && (!text.contains("//")
+                    && text
+                        .split('/')
+                        .skip(1)
+                        .all(|part| part != "." && part != ".."))
+        });
+        if !valid {
+            return Err(io::Error::other(SelectedDirectoryLimit));
+        }
+        SELECTED_DIRECTORIES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            let index = scopes
+                .iter()
+                .position(Option::is_none)
+                .ok_or_else(|| io::Error::other(SelectedDirectoryLimit))?;
+            scopes[index] = Some(SelectedDirectory {
+                path: path.to_path_buf(),
+                stamp,
+                witnessed: false,
+            });
+            Ok(Self(index))
+        })
+    }
+
+    fn witnessed(&self) -> bool {
+        SELECTED_DIRECTORIES.with(|scopes| {
+            scopes.borrow()[self.0]
+                .as_ref()
+                .is_some_and(|scope| scope.witnessed)
+        })
+    }
+}
+
+impl Drop for SelectedScope {
+    fn drop(&mut self) {
+        SELECTED_DIRECTORIES.with(|scopes| scopes.borrow_mut()[self.0] = None);
+    }
+}
+
+fn selected_attempt(path: &Path) -> Option<(usize, FileStamp)> {
+    SELECTED_DIRECTORIES.with(|scopes| {
+        let mut scopes = scopes.borrow_mut();
+        let (index, scope) = scopes
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find_map(|(index, scope)| scope.as_mut().map(|scope| (index, scope)))?;
+        if scope.path != path {
+            return None;
+        }
+        scope.witnessed = false;
+        Some((index, scope.stamp))
+    })
+}
+
+fn selected_witness(index: usize) {
+    SELECTED_DIRECTORIES.with(|scopes| {
+        if let Some(scope) = scopes.borrow_mut()[index].as_mut() {
+            scope.witnessed = true;
+        }
+    });
+}
+
 /// Bytes read through one descriptor plus its stamp before and after the read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundedRead {
@@ -73,7 +173,9 @@ pub struct BoundedRead {
 
 /// Raised when the per-pass metadata ceiling is reached: the operation about to run did not.
 #[derive(Debug)]
-struct BudgetExhausted;
+struct BudgetExhausted {
+    validation: bool,
+}
 
 impl std::fmt::Display for BudgetExhausted {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -90,11 +192,26 @@ pub fn budget_exhausted(error: &io::Error) -> bool {
         .is_some_and(|inner| inner.is::<BudgetExhausted>())
 }
 
+pub(crate) fn validation_budget_exhausted(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<BudgetExhausted>())
+        .is_some_and(|budget| budget.validation)
+}
+
+fn validation_budget(error: io::Error) -> io::Error {
+    if budget_exhausted(&error) {
+        io::Error::other(BudgetExhausted { validation: true })
+    } else {
+        error
+    }
+}
+
 /// Charges one metadata-class operation (stat, fstat, lstat or readlink of a canonicalization
 /// step) against the shared per-pass ceiling immediately before it runs.
 pub fn charge_metadata(counters: &mut PassCounters) -> io::Result<()> {
     if counters.stat_calls >= MAX_METADATA_CALLS {
-        return Err(io::Error::other(BudgetExhausted));
+        return Err(io::Error::other(BudgetExhausted { validation: false }));
     }
     counters.stat_calls += 1;
     Ok(())
@@ -193,6 +310,24 @@ pub trait SourceFs {
     fn canonicalize(&self, path: &Path, counters: &mut PassCounters) -> io::Result<PathBuf>;
     fn metadata(&self, path: &Path, counters: &mut PassCounters) -> io::Result<Metadata>;
     fn read_dir(&self, path: &Path, counters: &mut PassCounters) -> io::Result<DirEntries>;
+    /// Acquires the selected native directory descriptor. Providers must return its listing or
+    /// lazily forward every entry, error and EOF in order, retaining the descriptor without
+    /// filtering, prefetching, collecting or sorting. Providers without native proof fail closed.
+    /// The canonical absolute UTF8 path is limited to 4096 bytes, with eight nested scopes per
+    /// thread. Only device/inode bind the selection; directory contents are not a snapshot.
+    fn read_dir_selected(
+        &self,
+        path: &Path,
+        expected: FileStamp,
+        counters: &mut PassCounters,
+    ) -> io::Result<DirEntries> {
+        let scope = SelectedScope::enter(path, expected)?;
+        let entries = self.read_dir(path, counters)?;
+        if !scope.witnessed() {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
+        Ok(entries)
+    }
     fn read_header(&self, path: &Path, counters: &mut PassCounters) -> io::Result<Vec<u8>>;
     fn read_bounded(
         &self,
@@ -201,6 +336,21 @@ pub trait SourceFs {
         counters: &mut PassCounters,
     ) -> io::Result<BoundedRead>;
     fn open_sqlite(&self, canonical_path: &Path) -> Result<Connection, OpenError>;
+
+    /// Reads at most `max_bytes` of the opened file starting at `offset`: exactly
+    /// `min(max_bytes, len - offset)` bytes (none at or past the end), with the file's stamp
+    /// before and after the read. Metered like [`SourceFs::read_bounded`]. A filesystem that
+    /// cannot serve tail reads keeps this default.
+    fn read_tail(
+        &self,
+        path: &Path,
+        offset: u64,
+        max_bytes: usize,
+        counters: &mut PassCounters,
+    ) -> io::Result<BoundedRead> {
+        let _ = (path, offset, max_bytes, counters);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -212,6 +362,7 @@ pub struct FsMetrics {
     pub directory_opens: u64,
     pub bounded_reads: u64,
     pub sqlite_opens: u64,
+    pub tail_reads: u64,
     /// Directory iterators alive right now.
     pub open_directories: u64,
     /// Highest number of directory iterators alive at once.
@@ -450,13 +601,14 @@ impl SourceFs for RealSourceFs {
     }
 
     fn read_dir(&self, path: &Path, counters: &mut PassCounters) -> io::Result<DirEntries> {
+        let selected = selected_attempt(path);
         // One physical open: the iterator is created from this validated handle.
         let handle = OpenOptions::new()
             .read(true)
             .custom_flags(open_flags::NOFOLLOW | open_flags::NONBLOCK | open_flags::DIRECTORY)
             .open(path)?;
         physical::directory_open();
-        charge_metadata(counters)?;
+        charge_metadata(counters).map_err(validation_budget)?;
         let opened = phys_fstat(&handle)?;
         if !opened.is_dir() {
             return Err(io::Error::new(
@@ -464,11 +616,18 @@ impl SourceFs for RealSourceFs {
                 "source path is not a directory",
             ));
         }
-        verify_bound_with(path, &opened, &mut || charge_metadata(counters))?;
-        Ok(Box::new(directory::HeldDirectory::new(
-            handle,
-            path.to_path_buf(),
-        )?))
+        if let Some((_, expected)) = selected
+            && (opened.dev() != expected.device || opened.ino() != expected.inode)
+        {
+            return Err(changed("selected directory changed"));
+        }
+        verify_bound_with(path, &opened, &mut || charge_metadata(counters))
+            .map_err(validation_budget)?;
+        let entries = Box::new(directory::HeldDirectory::new(handle, path.to_path_buf())?);
+        if let Some((index, _)) = selected {
+            selected_witness(index);
+        }
+        Ok(entries)
     }
 
     fn read_header(&self, path: &Path, counters: &mut PassCounters) -> io::Result<Vec<u8>> {
@@ -512,6 +671,59 @@ impl SourceFs for RealSourceFs {
     fn open_sqlite(&self, canonical_path: &Path) -> Result<Connection, OpenError> {
         sqlite_ro::open_canonical(canonical_path)
     }
+
+    fn read_tail(
+        &self,
+        path: &Path,
+        offset: u64,
+        max_bytes: usize,
+        counters: &mut PassCounters,
+    ) -> io::Result<BoundedRead> {
+        read_tail_with(path, offset, max_bytes, counters, || {})
+    }
+}
+
+fn read_tail_with(
+    path: &Path,
+    offset: u64,
+    max_bytes: usize,
+    counters: &mut PassCounters,
+    after_read: impl FnOnce(),
+) -> io::Result<BoundedRead> {
+    let (mut file, opened) = open_regular_with(path, &mut || charge_metadata(counters))?;
+    verify_bound_with(path, &opened, &mut || charge_metadata(counters))?;
+    let wanted = opened
+        .len()
+        .saturating_sub(offset)
+        .min(u64::try_from(max_bytes).unwrap_or(u64::MAX));
+    let mut bytes = Vec::with_capacity(usize::try_from(wanted).unwrap_or(0));
+    physical::bytes_requested(wanted);
+    if wanted > 0 {
+        file.seek(SeekFrom::Start(offset))?;
+        if let Err(error) = (&file).take(wanted).read_to_end(&mut bytes) {
+            counters.bytes_read = counters.bytes_read.saturating_add(bytes.len() as u64);
+            return Err(error);
+        }
+    }
+    after_read();
+    let proof = (|| {
+        charge_metadata(counters)?;
+        let after = phys_fstat(&file)?;
+        verify_bound_with(path, &opened, &mut || charge_metadata(counters))?;
+        Ok(after)
+    })();
+    let after = match proof {
+        Ok(after) => after,
+        Err(error) => {
+            counters.bytes_read = counters.bytes_read.saturating_add(bytes.len() as u64);
+            return Err(error);
+        }
+    };
+    Ok(BoundedRead {
+        bytes,
+        before: FileStamp::of(&opened),
+        after: FileStamp::of(&after),
+    })
 }
 
 #[cfg(feature = "test-faults")]
@@ -534,6 +746,8 @@ mod recording {
         Bounded,
         Directory,
         Sqlite,
+        Tail,
+        TailRead,
     }
 
     type BoundaryHook = Box<dyn FnMut(OpenKind, &Path) + Send>;
@@ -546,6 +760,7 @@ mod recording {
         directory_opens: AtomicU64,
         bounded_reads: AtomicU64,
         sqlite_opens: AtomicU64,
+        tail_reads: AtomicU64,
         open_directories: AtomicU64,
         max_open_directories: AtomicU64,
         hook: Mutex<Option<BoundaryHook>>,
@@ -611,6 +826,7 @@ mod recording {
                 directory_opens: self.calls.directory_opens.load(Relaxed),
                 bounded_reads: self.calls.bounded_reads.load(Relaxed),
                 sqlite_opens: self.calls.sqlite_opens.load(Relaxed),
+                tail_reads: self.calls.tail_reads.load(Relaxed),
                 open_directories: self.calls.open_directories.load(Relaxed),
                 max_open_directories: self.calls.max_open_directories.load(Relaxed),
             }
@@ -652,6 +868,7 @@ mod recording {
         }
 
         fn read_dir(&self, path: &Path, counters: &mut PassCounters) -> io::Result<DirEntries> {
+            super::selected_attempt(path);
             self.calls.directory_opens.fetch_add(1, Ordering::Relaxed);
             self.boundary(OpenKind::Directory, path);
             let entries = self.measured(|| self.inner.read_dir(path, counters))?;
@@ -686,6 +903,22 @@ mod recording {
             self.calls.sqlite_opens.fetch_add(1, Ordering::Relaxed);
             self.boundary(OpenKind::Sqlite, path);
             self.measured(|| self.inner.open_sqlite(path))
+        }
+
+        fn read_tail(
+            &self,
+            path: &Path,
+            offset: u64,
+            max_bytes: usize,
+            counters: &mut PassCounters,
+        ) -> io::Result<BoundedRead> {
+            self.calls.tail_reads.fetch_add(1, Ordering::Relaxed);
+            self.boundary(OpenKind::Tail, path);
+            self.measured(|| {
+                super::read_tail_with(path, offset, max_bytes, counters, || {
+                    self.boundary(OpenKind::TailRead, path)
+                })
+            })
         }
     }
 }

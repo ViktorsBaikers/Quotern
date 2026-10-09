@@ -1,0 +1,23 @@
+{
+  "description": "Hand-written outcome per hostile case of cases.json: how many lines the one pass rejects, the failure code it reports, and the response ids stored afterwards. The control record is always kept; no rejected line leaves a row or any of its text behind.",
+  "cases": {
+    "negative_counter": { "rejected": 1, "failure": "invalid_number", "outcome": "partial", "responses": ["resp_control"] },
+    "fractional_counter": { "rejected": 1, "failure": "invalid_number", "outcome": "partial", "responses": ["resp_control"] },
+    "above_ceiling_counter": { "rejected": 1, "failure": "invalid_number", "outcome": "partial", "responses": ["resp_control"] },
+    "at_ceiling_counter": { "rejected": 0, "failure": null, "outcome": "consistent", "responses": ["resp_control", "resp_hostile"], "input_tokens": 1000000000000 },
+    "string_counter": { "rejected": 1, "failure": "invalid_number", "outcome": "partial", "responses": ["resp_control"] },
+    "exponent_counter": { "rejected": 1, "failure": "invalid_number", "outcome": "partial", "responses": ["resp_control"] },
+    "unparseable_timestamp": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] },
+    "year_10000_timestamp": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] },
+    "pre_epoch_timestamp": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] },
+    "oversize_timestamp": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] },
+    "missing_timestamp": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] },
+    "empty_response_id": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] },
+    "control_char_session_id": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] },
+    "oversize_response_id": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] },
+    "missing_thread_id": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] },
+    "missing_usage": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] },
+    "usage_not_object": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] },
+    "truncated_json": { "rejected": 1, "failure": "invalid_record", "outcome": "partial", "responses": ["resp_control"] }
+  }
+}

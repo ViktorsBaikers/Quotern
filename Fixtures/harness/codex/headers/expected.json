@@ -1,0 +1,117 @@
+{
+  "description": "Hand-written oracle for the header, ownership and era fixtures. Each scenario copies the named files (from sessions/2026/03/29/) into a fresh root, runs one pass at pass_now_ms and reads today_snapshot for (tz, now_ms). Rows are listed by response id with the values on their own fixture lines; file states are read off each file's lines by hand. Inline files (legacy_fork_child, era_cases) are written by codex_ingest.rs from the line specs given here.",
+  "pass_now_ms": 1774785600000,
+  "files": {
+    "rollout-2026-03-29T11-00-00-appended.jsonl": { "header_id": "0195f000-0000-7000-8000-00000000a001", "header_state": "appended_header", "header_era": "record", "record_state": "own", "uncovered_from_ms": 1774782180000, "uncovered_to_ms": 1774782240000, "byte_offset": 1634 },
+    "rollout-2026-03-29T11-30-00-foreign.jsonl": { "header_id": null, "header_state": "foreign_first_line", "header_era": null, "record_state": "none", "uncovered_from_ms": 1774783860000, "uncovered_to_ms": 1774783980000, "byte_offset": 1293 },
+    "rollout-2026-03-29T12-00-00-legacy.jsonl": { "header_id": "0195f000-0000-7000-8000-000000001001", "header_state": "own", "header_era": "legacy", "record_state": "own", "uncovered_from_ms": 1774742100000, "uncovered_to_ms": 1774742100000, "byte_offset": 1487 },
+    "rollout-2026-03-29T12-30-00-subagent.jsonl": { "header_id": "0195f000-0000-7000-8000-000000005001", "header_state": "own", "header_era": "record", "record_state": "own", "uncovered_from_ms": null, "uncovered_to_ms": null, "byte_offset": 550 },
+    "rollout-2026-03-29T13-00-00-record-era.jsonl": { "header_id": "0195f000-0000-7000-8000-00000000e001", "header_state": "own", "header_era": "record", "record_state": "own", "uncovered_from_ms": null, "uncovered_to_ms": null, "byte_offset": 882 },
+    "rollout-2026-03-29T13-30-00-resumed-legacy.jsonl": { "header_id": "0195f000-0000-7000-8000-000000007001", "header_state": "own", "header_era": "legacy", "record_state": "own", "uncovered_from_ms": 1774791060000, "uncovered_to_ms": 1774791120000, "byte_offset": 1380 },
+    "rollout-2026-03-29T14-00-00-copied-prefix.jsonl": { "header_id": "0195f000-0000-7000-8000-000000009001", "header_state": "own_forked", "header_era": "record", "record_state": "own", "uncovered_from_ms": null, "uncovered_to_ms": null, "byte_offset": 1387 }
+  },
+  "rows": {
+    "resp_app_001": { "session_id": "0195f000-0000-7000-8000-00000000a001", "occurred_at_ms": 1774782060000, "input_tokens": 100, "total_tokens": 100 },
+    "resp_leg_001": { "session_id": "0195f000-0000-7000-8000-000000001001", "occurred_at_ms": 1774742700000, "input_tokens": 50, "cache_read_tokens": 10, "output_tokens": 5, "reasoning_tokens": 0, "total_tokens": 55 },
+    "resp_sub_001": { "session_id": "0195f000-0000-7000-8000-000000005000", "occurred_at_ms": 1774787460000, "input_tokens": 70, "total_tokens": 70 },
+    "resp_rec_001": { "session_id": "0195f000-0000-7000-8000-00000000e001", "occurred_at_ms": 1774789260000, "input_tokens": 80, "total_tokens": 80 },
+    "resp_rl_001": { "session_id": "0195f000-0000-7000-8000-000000007001", "occurred_at_ms": 1774791600000, "input_tokens": 90, "total_tokens": 90 },
+    "resp_cp_001": { "session_id": "0195f000-0000-7000-8000-000000009001", "occurred_at_ms": 1774793100000, "input_tokens": 60, "total_tokens": 60 },
+    "resp_lfc_001": { "session_id": "0195f000-0000-7000-8000-00000000b0f1", "occurred_at_ms": 1774797000000, "input_tokens": 77, "total_tokens": 77 }
+  },
+  "scenarios": {
+    "appended_header": {
+      "files": ["rollout-2026-03-29T11-00-00-appended.jsonl"],
+      "rows": ["resp_app_001"],
+      "absent_responses": ["resp_app_002", "resp_app_003"],
+      "tz": "UTC", "now_ms": 1774785600000,
+      "projection": { "records": 1, "input": { "value": 100, "completeness": "partial" }, "total": { "value": 100, "completeness": "partial" }, "output": { "value": null, "completeness": null }, "cache_write": { "value": null, "completeness": null } }
+    },
+    "foreign_first_line": {
+      "files": ["rollout-2026-03-29T11-30-00-foreign.jsonl", "rollout-2026-03-29T13-00-00-record-era.jsonl"],
+      "rows": ["resp_rec_001"],
+      "absent_responses": ["resp_for_001", "resp_for_002"],
+      "tz": "UTC", "now_ms": 1774785600000,
+      "projection": { "records": 1, "input": { "value": 80, "completeness": "partial" }, "total": { "value": 80, "completeness": "partial" }, "output": { "value": null, "completeness": null }, "cache_write": { "value": null, "completeness": null } }
+    },
+    "legacy_counted_day": {
+      "files": ["rollout-2026-03-29T12-00-00-legacy.jsonl"],
+      "rows": ["resp_leg_001"],
+      "absent_responses": [],
+      "tz": "UTC", "now_ms": 1774785600000,
+      "projection": { "records": 1, "input": { "value": 50, "completeness": "complete" }, "cache_read": { "value": 10, "completeness": "complete" }, "output": { "value": 5, "completeness": "complete" }, "reasoning": { "value": 0, "completeness": "complete" }, "total": { "value": 55, "completeness": "complete" }, "cache_write": { "value": null, "completeness": null } }
+    },
+    "legacy_only_day": {
+      "files": ["rollout-2026-03-29T12-00-00-legacy.jsonl"],
+      "rows": ["resp_leg_001"],
+      "absent_responses": [],
+      "tz": "UTC", "now_ms": 1774699200000,
+      "window": { "start_ms": 1774656000000, "end_ms": 1774742400000 },
+      "projection": { "records": 0, "input": { "value": null, "completeness": null, "status": "unavailable" }, "output": { "value": null, "completeness": null, "status": "unavailable" }, "reasoning": { "value": null, "completeness": null, "status": "unavailable" }, "cache_read": { "value": null, "completeness": null, "status": "unavailable" }, "cache_write": { "value": null, "completeness": null, "status": "unavailable" }, "total": { "value": null, "completeness": null, "status": "unavailable" } }
+    },
+    "subagent": {
+      "files": ["rollout-2026-03-29T12-30-00-subagent.jsonl"],
+      "rows": ["resp_sub_001"],
+      "absent_responses": [],
+      "tz": "UTC", "now_ms": 1774785600000,
+      "projection": { "records": 1, "input": { "value": 70, "completeness": "complete" }, "total": { "value": 70, "completeness": "complete" } }
+    },
+    "record_era": {
+      "files": ["rollout-2026-03-29T13-00-00-record-era.jsonl"],
+      "rows": ["resp_rec_001"],
+      "absent_responses": [],
+      "tz": "UTC", "now_ms": 1774785600000,
+      "projection": { "records": 1, "input": { "value": 80, "completeness": "complete" }, "total": { "value": 80, "completeness": "complete" } }
+    },
+    "resumed_legacy": {
+      "files": ["rollout-2026-03-29T13-30-00-resumed-legacy.jsonl"],
+      "rows": ["resp_rl_001"],
+      "absent_responses": [],
+      "tz": "UTC", "now_ms": 1774785600000,
+      "projection": { "records": 1, "input": { "value": 90, "completeness": "partial" }, "total": { "value": 90, "completeness": "partial" } }
+    },
+    "copied_prefix": {
+      "files": ["rollout-2026-03-29T14-00-00-copied-prefix.jsonl"],
+      "rows": ["resp_cp_001"],
+      "absent_responses": ["resp_par_001"],
+      "tz": "UTC", "now_ms": 1774785600000,
+      "projection": { "records": 1, "input": { "value": 60, "completeness": "complete" }, "total": { "value": 60, "completeness": "complete" } }
+    },
+    "legacy_fork_child": {
+      "files": [],
+      "rows": ["resp_lfc_001"],
+      "absent_responses": ["resp_lfp_001"],
+      "tz": "UTC", "now_ms": 1774785600000,
+      "projection": { "records": 1, "input": { "value": 77, "completeness": "partial" }, "total": { "value": 77, "completeness": "partial" } }
+    }
+  },
+  "legacy_fork_child": {
+    "relative_path": "sessions/2026/03/29/rollout-2026-03-29T15-00-00-legacy-fork.jsonl",
+    "lines": [
+      { "kind": "session_meta", "timestamp": "2026-03-29T15:00:00.000Z", "id": "0195f000-0000-7000-8000-00000000b0f1", "forked_from_id": "0195f000-0000-7000-8000-00000000b0f0", "cli_version": "0.152.3" },
+      { "kind": "session_meta", "timestamp": "2026-03-29T15:00:00.001Z", "id": "0195f000-0000-7000-8000-00000000b0f0", "cli_version": "0.152.3" },
+      { "kind": "token_count", "timestamp": "2026-03-29T15:00:00.002Z" },
+      { "kind": "record", "timestamp": "2026-03-29T15:00:00.003Z", "thread_id": "0195f000-0000-7000-8000-00000000b0f0", "session_id": "0195f000-0000-7000-8000-00000000b0f0", "response_id": "resp_lfp_001", "input": 500 },
+      { "kind": "record", "timestamp": "2026-03-29T15:10:00.000Z", "thread_id": "0195f000-0000-7000-8000-00000000b0f1", "session_id": "0195f000-0000-7000-8000-00000000b0f1", "response_id": "resp_lfc_001", "input": 77 }
+    ],
+    "state": { "header_id": "0195f000-0000-7000-8000-00000000b0f1", "header_state": "own_forked", "header_era": "legacy", "record_state": "own", "uncovered_from_ms": 1774796400002, "uncovered_to_ms": 1774796400002 }
+  },
+  "era_cases": [
+    { "cli_version": "0.152.9", "era": "legacy" },
+    { "cli_version": "0.153.0-alpha.0", "era": "legacy" },
+    { "cli_version": "0.153.0-alpha", "era": "legacy" },
+    { "cli_version": null, "era": "legacy" },
+    { "cli_version": "not-a-version", "era": "legacy" },
+    { "cli_version": "v0.153.0", "era": "legacy" },
+    { "cli_version": "0.153", "era": "legacy" },
+    { "cli_version": "0.153.01", "era": "legacy" },
+    { "cli_version": "0.153.0-alpha.1", "era": "record" },
+    { "cli_version": "0.153.0-alpha.2", "era": "record" },
+    { "cli_version": "0.153.0-alpha.10", "era": "record" },
+    { "cli_version": "0.153.0-beta.1", "era": "record" },
+    { "cli_version": "0.153.0-alpha.1+build.7", "era": "record" },
+    { "cli_version": "0.153.0", "era": "record" },
+    { "cli_version": "0.154.2", "era": "record" },
+    { "cli_version": "1.0.0", "era": "record" }
+  ]
+}

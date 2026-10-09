@@ -1,0 +1,21 @@
+{
+  "description": "Byte steps applied to a working copy of base/sessions/2026/03/29/rollout-2026-03-29T09-00-00-inc.jsonl at the same relative path in a fresh root. Each step makes the working file exactly the first `length` bytes of the base file (an append of the bytes after the previous step), then one pass runs at now_ms.",
+  "relative_path": "sessions/2026/03/29/rollout-2026-03-29T09-00-00-inc.jsonl",
+  "steps": [
+    {
+      "step": 1,
+      "length": 700,
+      "now_ms": 1774785600000
+    },
+    {
+      "step": 2,
+      "length": 915,
+      "now_ms": 1774785660000
+    },
+    {
+      "step": 3,
+      "length": 915,
+      "now_ms": 1774785720000
+    }
+  ]
+}

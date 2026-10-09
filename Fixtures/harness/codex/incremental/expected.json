@@ -1,0 +1,233 @@
+{
+  "description": "Hand-written oracle for steps.json and the fork layout. tail_reads are the exact (offset, length, bytes) each step's single content read returns: step 1 reads the whole 700-byte prefix, whose last 149 bytes are an unterminated line kept pending (byte_offset stays 551, the end of the last complete line); step 2 observes a changed stamp and rereads the complete 915-byte file from offset 0; step 3 is unchanged and reads nothing. The bytes are copied verbatim from the base fixture.",
+  "tail_reads": [
+    {
+      "step": 1,
+      "offset": 0,
+      "length": 700,
+      "bytes": "{\"timestamp\":\"2026-03-29T09:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"0195f000-0000-7000-8000-00000000c001\",\"cli_version\":\"0.153.0\",\"source\":\"cli\"}}\n{\"timestamp\":\"2026-03-29T09:01:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-00000000c001\",\"turn_id\":\"t1\",\"session_id\":\"0195f000-0000-7000-8000-00000000c001\",\"root_turn_id\":\"t1\",\"response_id\":\"resp_inc_001\",\"usage\":{\"input_tokens\":10,\"cached_input_tokens\":2,\"cache_write_input_tokens\":1,\"output_tokens\":5,\"reasoning_output_tokens\":1,\"total_tokens\":16}}}\n{\"timestamp\":\"2026-03-29T09:02:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-00000000c001\",\"turn_id\":\"t2\",\"ses"
+    },
+    {
+      "step": 2,
+      "offset": 0,
+      "length": 915,
+      "bytes": "{\"timestamp\":\"2026-03-29T09:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"0195f000-0000-7000-8000-00000000c001\",\"cli_version\":\"0.153.0\",\"source\":\"cli\"}}\n{\"timestamp\":\"2026-03-29T09:01:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-00000000c001\",\"turn_id\":\"t1\",\"session_id\":\"0195f000-0000-7000-8000-00000000c001\",\"root_turn_id\":\"t1\",\"response_id\":\"resp_inc_001\",\"usage\":{\"input_tokens\":10,\"cached_input_tokens\":2,\"cache_write_input_tokens\":1,\"output_tokens\":5,\"reasoning_output_tokens\":1,\"total_tokens\":16}}}\n{\"timestamp\":\"2026-03-29T09:02:00.000Z\",\"type\":\"token_usage_record\",\"payload\":{\"thread_id\":\"0195f000-0000-7000-8000-00000000c001\",\"turn_id\":\"t2\",\"session_id\":\"0195f000-0000-7000-8000-00000000c001\",\"root_turn_id\":\"t2\",\"response_id\":\"resp_inc_002\",\"usage\":{\"input_tokens\":20,\"cached_input_tokens\":4,\"output_tokens\":6,\"reasoning_output_tokens\":2,\"total_tokens\":26}}}\n"
+    }
+  ],
+  "provider_extra": [
+    {
+      "step": 2,
+      "offset": 551,
+      "cap": 10,
+      "length": 10,
+      "bytes": "{\"timestam"
+    },
+    {
+      "step": 2,
+      "offset": 915,
+      "cap": 100,
+      "length": 0,
+      "bytes": ""
+    },
+    {
+      "step": 2,
+      "offset": 2000,
+      "cap": 5,
+      "length": 0,
+      "bytes": ""
+    }
+  ],
+  "after_step": [
+    {
+      "step": 1,
+      "bytes_read": 700,
+      "byte_offset": 551,
+      "tail_state": "pending",
+      "pending_partial": true,
+      "outcome": "partial",
+      "records_committed": 1,
+      "events": [
+        {
+          "session_id": "0195f000-0000-7000-8000-00000000c001",
+          "response_id": "resp_inc_001",
+          "occurred_at_ms": 1774774860000,
+          "input_tokens": 10,
+          "cache_read_tokens": 2,
+          "cache_write_tokens": 1,
+          "output_tokens": 5,
+          "reasoning_tokens": 1,
+          "total_tokens": 16,
+          "mirror_path": "sessions/2026/03/29/rollout-2026-03-29T09-00-00-inc.jsonl",
+          "revision": 1
+        }
+      ]
+    },
+    {
+      "step": 2,
+      "bytes_read": 915,
+      "byte_offset": 915,
+      "tail_state": null,
+      "pending_partial": false,
+      "outcome": "consistent",
+      "records_committed": 1,
+      "events": [
+        {
+          "session_id": "0195f000-0000-7000-8000-00000000c001",
+          "response_id": "resp_inc_001",
+          "occurred_at_ms": 1774774860000,
+          "input_tokens": 10,
+          "cache_read_tokens": 2,
+          "cache_write_tokens": 1,
+          "output_tokens": 5,
+          "reasoning_tokens": 1,
+          "total_tokens": 16,
+          "mirror_path": "sessions/2026/03/29/rollout-2026-03-29T09-00-00-inc.jsonl",
+          "revision": 1
+        },
+        {
+          "session_id": "0195f000-0000-7000-8000-00000000c001",
+          "response_id": "resp_inc_002",
+          "occurred_at_ms": 1774774920000,
+          "input_tokens": 20,
+          "cache_read_tokens": 4,
+          "cache_write_tokens": null,
+          "output_tokens": 6,
+          "reasoning_tokens": 2,
+          "total_tokens": 26,
+          "mirror_path": "sessions/2026/03/29/rollout-2026-03-29T09-00-00-inc.jsonl",
+          "revision": 1
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "bytes_read": 0,
+      "byte_offset": 915,
+      "tail_state": null,
+      "pending_partial": false,
+      "outcome": "consistent",
+      "records_committed": 0,
+      "events": [
+        {
+          "session_id": "0195f000-0000-7000-8000-00000000c001",
+          "response_id": "resp_inc_001",
+          "occurred_at_ms": 1774774860000,
+          "input_tokens": 10,
+          "cache_read_tokens": 2,
+          "cache_write_tokens": 1,
+          "output_tokens": 5,
+          "reasoning_tokens": 1,
+          "total_tokens": 16,
+          "mirror_path": "sessions/2026/03/29/rollout-2026-03-29T09-00-00-inc.jsonl",
+          "revision": 1
+        },
+        {
+          "session_id": "0195f000-0000-7000-8000-00000000c001",
+          "response_id": "resp_inc_002",
+          "occurred_at_ms": 1774774920000,
+          "input_tokens": 20,
+          "cache_read_tokens": 4,
+          "cache_write_tokens": null,
+          "output_tokens": 6,
+          "reasoning_tokens": 2,
+          "total_tokens": 26,
+          "mirror_path": "sessions/2026/03/29/rollout-2026-03-29T09-00-00-inc.jsonl",
+          "revision": 1
+        }
+      ]
+    }
+  ],
+  "fork": {
+    "description": "Parent P = base file (own r1, r2). Child C = fork file: own header with forked_from_id P, then a copied P session_meta and copied r1, r2 (thread_id P, re-stamped at copy time), then own r3. Inherited records are never stored or counted, whether or not P is selected.",
+    "parent_and_child": {
+      "events": [
+        {
+          "session_id": "0195f000-0000-7000-8000-00000000c001",
+          "response_id": "resp_inc_001",
+          "occurred_at_ms": 1774774860000,
+          "input_tokens": 10,
+          "cache_read_tokens": 2,
+          "cache_write_tokens": 1,
+          "output_tokens": 5,
+          "reasoning_tokens": 1,
+          "total_tokens": 16,
+          "mirror_path": "sessions/2026/03/29/rollout-2026-03-29T09-00-00-inc.jsonl",
+          "revision": 1
+        },
+        {
+          "session_id": "0195f000-0000-7000-8000-00000000c001",
+          "response_id": "resp_inc_002",
+          "occurred_at_ms": 1774774920000,
+          "input_tokens": 20,
+          "cache_read_tokens": 4,
+          "cache_write_tokens": null,
+          "output_tokens": 6,
+          "reasoning_tokens": 2,
+          "total_tokens": 26,
+          "mirror_path": "sessions/2026/03/29/rollout-2026-03-29T09-00-00-inc.jsonl",
+          "revision": 1
+        },
+        {
+          "session_id": "0195f000-0000-7000-8000-00000000c002",
+          "response_id": "resp_inc_003",
+          "occurred_at_ms": 1774778700000,
+          "input_tokens": 30,
+          "cache_read_tokens": 6,
+          "cache_write_tokens": 0,
+          "output_tokens": 7,
+          "reasoning_tokens": 3,
+          "total_tokens": 37,
+          "mirror_path": "sessions/2026/03/29/rollout-2026-03-29T10-00-00-fork.jsonl",
+          "revision": 1
+        }
+      ],
+      "projection": {
+        "records": 3,
+        "input": 60,
+        "cache_read": 12,
+        "cache_write": 1,
+        "cache_write_completeness": "partial",
+        "output": 18,
+        "reasoning": 6,
+        "total": 79
+      }
+    },
+    "child_only": {
+      "events": [
+        {
+          "session_id": "0195f000-0000-7000-8000-00000000c002",
+          "response_id": "resp_inc_003",
+          "occurred_at_ms": 1774778700000,
+          "input_tokens": 30,
+          "cache_read_tokens": 6,
+          "cache_write_tokens": 0,
+          "output_tokens": 7,
+          "reasoning_tokens": 3,
+          "total_tokens": 37,
+          "mirror_path": "sessions/2026/03/29/rollout-2026-03-29T10-00-00-fork.jsonl",
+          "revision": 1
+        }
+      ],
+      "projection": {
+        "records": 1,
+        "input": 30,
+        "cache_read": 6,
+        "cache_write": 0,
+        "cache_write_completeness": "complete",
+        "output": 7,
+        "reasoning": 3,
+        "total": 37
+      }
+    },
+    "child_file": {
+      "relative_path": "sessions/2026/03/29/rollout-2026-03-29T10-00-00-fork.jsonl",
+      "header_id": "0195f000-0000-7000-8000-00000000c002",
+      "header_state": "own_forked",
+      "header_era": "record",
+      "record_state": "own",
+      "uncovered_from_ms": null,
+      "uncovered_to_ms": null,
+      "byte_offset": 1522
+    }
+  }
+}

@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::discovery::DataAnchor;
 use crate::domain::{
-    AcquisitionConsistency, ConsentState, FailureCode, OPENCODE_SOURCE_CONVENTION,
-    ObservationStatus, OriginUncertainty, PassCounters, PassOutcome, ProjectionConsistency,
-    Provenance, RecordCandidate, SourceKind, SourceReportedObservation, TokenComponents,
-    TokenObservation, TokenUnit, is_valid_id_component, required_nullable, total_metadata_is_valid,
+    AcquisitionConsistency, CodexHeaderEra, CodexHeaderState, CodexRecordState, CodexTailState,
+    ConsentState, FailureCode, Harness, OPENCODE_SOURCE_CONVENTION, ObservationStatus,
+    OriginUncertainty, PassCounters, PassOutcome, ProjectionConsistency, Provenance,
+    RecordCandidate, SourceKind, SourceReportedObservation, TokenComponents, TokenObservation,
+    TokenUnit, codex_event_key, is_valid_id_component, required_nullable, total_metadata_is_valid,
 };
 use crate::ingest::sqlite_ro::{
     self, ReadRange, ViewReads, WalError, WalMark, WalOverlay, with_rollback_view,
@@ -64,6 +65,8 @@ pub enum StoreError {
     RootOverlap,
     /// An admission bound refused a valid existing history, which stays untouched.
     AdmissionLimit(AdmissionBound),
+    /// The operation reads one harness family only and the source belongs to another.
+    UnsupportedHarness,
     #[cfg(feature = "test-faults")]
     InjectedBeforeCommit,
     #[cfg(feature = "test-faults")]
@@ -97,6 +100,9 @@ impl std::fmt::Display for StoreError {
             Self::RootOverlap => formatter.write_str("source root overlaps the data directory"),
             Self::AdmissionLimit(bound) => {
                 write!(formatter, "admission limit exceeded: {}", bound.as_str())
+            }
+            Self::UnsupportedHarness => {
+                formatter.write_str("operation does not apply to this source's harness")
             }
             #[cfg(feature = "test-faults")]
             Self::InjectedBeforeCommit => {
@@ -1099,6 +1105,11 @@ fn backoff_ms(change_count: u32) -> i64 {
 impl Store {
     /// Opens the history store under `data_dir`, binding to the nearest existing ancestor as it is
     /// right now. Callers that validated roots earlier use [`Store::open_bound`] instead.
+    ///
+    /// Store v1 never shipped and is revised in place (the Codex reported extension): a store
+    /// written with an earlier unshipped v1 shape, such as one created before that extension, is
+    /// refused [`StoreError::Corrupt`] (`store_corrupt`) by design and stays byte-unchanged. It is
+    /// never migrated, backed up or deleted; development uses a fresh data directory.
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
         let (data, anchor) = crate::discovery::anchor_for(data_dir).map_err(|_| StoreError::Io)?;
         Self::open_bound(&data, &anchor)
@@ -1357,15 +1368,29 @@ impl Store {
         self.fault.take()
     }
 
+    /// Registers an OpenCode root; see [`Store::register_harness_source`].
     pub fn register_source(
         &mut self,
         canonical_root: &Path,
         kind: SourceKind,
         root_identity: (u64, u64),
     ) -> Result<SourceRegistration, StoreError> {
+        self.register_harness_source(Harness::OpenCode, canonical_root, kind, root_identity)
+    }
+
+    /// Registers `canonical_root` for `harness`, or re-enables its existing row. A root already
+    /// registered for another harness is refused with [`StoreError::InvalidRoot`] before any
+    /// write, whichever harness came first.
+    pub fn register_harness_source(
+        &mut self,
+        harness: Harness,
+        canonical_root: &Path,
+        kind: SourceKind,
+        root_identity: (u64, u64),
+    ) -> Result<SourceRegistration, StoreError> {
         let root = canonical_root.to_str().ok_or(StoreError::InvalidRoot)?;
         let transaction = self.begin()?;
-        let source_id = ensure_source(&transaction, root, kind.as_str())?;
+        let source_id = ensure_source(&transaction, harness, root, kind.as_str())?;
         let (generation, device, inode): (i64, Option<i64>, Option<i64>) =
             sqlite(transaction.query_row(
                 "SELECT generation, root_device, root_inode FROM sources WHERE source_id = ?1",
@@ -1632,6 +1657,17 @@ impl Store {
     }
 }
 
+/// The uncovered-day lookup: whether any file of the source (present or missing) has an uncovered
+/// range intersecting `[start_ms, end_ms)`. One bounded probe over the `source_files` primary-key
+/// prefix; no index exists for it.
+const UNCOVERED_SQL: &str = "SELECT 1 FROM source_files WHERE source_id = ?1 \
+     AND uncovered_from_ms < ?3 AND uncovered_to_ms >= ?2 LIMIT 1";
+
+/// Uncovered-lookup query text, exposed so tests can measure its plan and cost.
+pub fn uncovered_lookup_sql() -> &'static str {
+    UNCOVERED_SQL
+}
+
 const KNOWN_PATHS_SQL: &str = "SELECT relative_path FROM source_files \
      WHERE source_id = ?1 AND adapter_state = ?2 AND file_state = 'present' \
      ORDER BY visit_seq, mtime_ns DESC, relative_path LIMIT ?3";
@@ -1660,6 +1696,15 @@ impl Store {
     /// Stages one pass and publishes its completed groups in a single transaction. Staging alone
     /// never advances last-good; only a publication in this transaction does.
     pub fn stage_scan(&mut self, request: StageRequest<'_>) -> Result<StageSummary, StoreError> {
+        self.stage_scan_with_freshness(request, true, None)
+    }
+
+    pub(crate) fn stage_scan_with_freshness(
+        &mut self,
+        request: StageRequest<'_>,
+        allow_last_good: bool,
+        retry_files: Option<&[SpoolFile]>,
+    ) -> Result<StageSummary, StoreError> {
         #[cfg(feature = "test-faults")]
         let fault = self.take_fault();
         let transaction = self.begin()?;
@@ -1679,7 +1724,15 @@ impl Store {
             &request.batch,
             &mut affected,
         )?;
-        if let Some(frontier) = request.frontier {
+        if request.failure == Some(FailureCode::RootOverlap) {
+            requeue_directories(
+                &transaction,
+                request.source_id,
+                request.root,
+                request.generation,
+                request.frontier.unwrap_or_default(),
+            )?;
+        } else if let Some(frontier) = request.frontier {
             sqlite(replace_frontier(
                 &transaction,
                 request.source_id,
@@ -1722,8 +1775,18 @@ impl Store {
         if let Some(reason) = request.backoff {
             schedule_retry(&transaction, request.source_id, reason, request.now_ms)?;
         }
+        if let Some(files) = retry_files {
+            discard_unverified_directories(
+                &transaction,
+                request.source_id,
+                request.generation,
+                files,
+            )?;
+        }
         touch_visited(&transaction, request.source_id, request.batch.visited)?;
-        let advance = summary.records_committed > 0 && request.outcome == PassOutcome::CatchingUp;
+        let advance = summary.records_committed > 0
+            && request.outcome == PassOutcome::CatchingUp
+            && allow_last_good;
         save_status(
             &transaction,
             request.source_id,
@@ -2183,6 +2246,69 @@ fn replace_frontier(
     Ok(())
 }
 
+fn discard_unverified_directories(
+    transaction: &Transaction<'_>,
+    source_id: &str,
+    generation: u64,
+    files: &[SpoolFile],
+) -> Result<(), StoreError> {
+    let generation = sql_count(generation)?;
+    sqlite(transaction.execute(
+        "DELETE FROM metadata_spool WHERE source_id = ?1 AND generation = ?2 AND relative_path = '' AND parser_kind = 'directory'",
+        params![source_id, generation],
+    ))?;
+    for file in files.iter().filter(|file| file.parser_kind == "directory") {
+        for ancestor in file.relative_path.ancestors() {
+            let relative = relative_text(Path::new("."), ancestor)?;
+            sqlite(transaction.execute(
+                "DELETE FROM metadata_spool WHERE source_id = ?1 AND generation = ?2 AND relative_path = ?3 AND parser_kind = 'directory'",
+                params![source_id, generation, relative],
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn requeue_directories(
+    transaction: &Transaction<'_>,
+    source_id: &str,
+    root: &Path,
+    generation: u64,
+    frontier: &[(PathBuf, usize, bool)],
+) -> Result<(), StoreError> {
+    let generation = sql_count(generation)?;
+    sqlite(transaction.execute(
+        "DELETE FROM metadata_spool WHERE source_id = ?1 AND generation = ?2",
+        params![source_id, generation],
+    ))?;
+    // Retain prior pending work, then merge live work while slots remain. Overflow is rediscovered
+    // from the root: its deleted completion witness keeps that work pending across reopen.
+    for (path, depth, _) in frontier
+        .iter()
+        .chain(std::iter::once(&(root.to_path_buf(), 0, false)))
+    {
+        let relative = relative_text(root, path)?;
+        sqlite(transaction.execute(
+            "INSERT INTO frontier_directories(source_id, generation, relative_path, depth, ordinal, restart_blocked) \
+             SELECT ?1, ?2, ?3, ?4, COALESCE(MAX(ordinal) + 1, 0), 0 FROM frontier_directories \
+                WHERE source_id = ?1 AND generation = ?2 \
+             HAVING COUNT(*) < ?5 OR EXISTS(SELECT 1 FROM frontier_directories \
+                WHERE source_id = ?1 AND generation = ?2 AND relative_path = ?3) \
+             ON CONFLICT(source_id, generation, relative_path) DO UPDATE SET restart_blocked = 0",
+            params![source_id, generation, relative, sql_count(*depth as u64)?, crate::limits::MAX_FRONTIER_DIRECTORIES as i64],
+        ))?;
+    }
+    let count: i64 = sqlite(transaction.query_row(
+        "SELECT COUNT(*) FROM frontier_directories WHERE source_id = ?1 AND generation = ?2",
+        params![source_id, generation],
+        |row| row.get(0),
+    ))?;
+    if count > crate::limits::MAX_FRONTIER_DIRECTORIES as i64 {
+        return Err(StoreError::LimitExceeded);
+    }
+    Ok(())
+}
+
 /// Writes a batch into the generation's spool. Tie and stale-state failures abort the whole
 /// transaction, so the durable frontier and cursors are never partly advanced.
 fn stage_batch(
@@ -2410,19 +2536,23 @@ enum CandidateWrite {
 
 fn ensure_source(
     transaction: &Transaction<'_>,
+    harness: Harness,
     canonical_root: &str,
     kind: &str,
 ) -> Result<String, StoreError> {
-    let existing = sqlite(
+    let existing: Option<(String, String)> = sqlite(
         transaction
             .query_row(
-                "SELECT source_id FROM sources WHERE canonical_root = ?1",
+                "SELECT source_id, harness FROM sources WHERE canonical_root = ?1",
                 [canonical_root],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional(),
     )?;
-    if let Some(source_id) = existing {
+    if let Some((source_id, registered)) = existing {
+        if registered != harness.as_str() {
+            return Err(StoreError::InvalidRoot);
+        }
         sqlite(transaction.execute(
             "UPDATE sources SET consent = ?2 WHERE source_id = ?1",
             params![source_id, ConsentState::Enabled.as_str()],
@@ -2437,8 +2567,8 @@ fn ensure_source(
     }
     sqlite(transaction.query_row(
         "INSERT INTO sources(source_id, harness, canonical_root, kind, consent) \
-         VALUES(lower(hex(randomblob(16))), 'opencode', ?1, ?2, 'enabled') RETURNING source_id",
-        params![canonical_root, kind],
+         VALUES(lower(hex(randomblob(16))), ?3, ?1, ?2, 'enabled') RETURNING source_id",
+        params![canonical_root, kind, harness.as_str()],
         |row| row.get(0),
     ))
 }
@@ -3316,13 +3446,27 @@ impl Store {
         Ok(page.observations)
     }
 
-    /// One page of raw durable records in `(occurred_at_ms, record_id)` order.
+    /// One page of raw durable records in `(occurred_at_ms, record_id)` order. Only OpenCode
+    /// sources have tuple records; any other harness is [`StoreError::UnsupportedHarness`].
     pub fn observations_page(
         &self,
         source_id: &str,
         after: Option<&ObservationCursor>,
         limit: usize,
     ) -> Result<ObservationPage, StoreError> {
+        // Raw pages are OpenCode tuple records; a Codex source is read through its projection.
+        let harness: Option<String> = sqlite(
+            self.connection
+                .query_row(
+                    "SELECT harness FROM sources WHERE source_id = ?1",
+                    [source_id],
+                    |row| row.get(0),
+                )
+                .optional(),
+        )?;
+        if harness.is_some_and(|harness| harness != Harness::OpenCode.as_str()) {
+            return Err(StoreError::UnsupportedHarness);
+        }
         let limit = limit.clamp(1, MAX_OBSERVATION_PAGE);
         let fetch = i64::try_from(limit + 1).unwrap_or(i64::MAX);
         let rows = if let Some(cursor) = after {
@@ -3370,7 +3514,8 @@ impl Store {
     /// aggregate over the `usage_events_source` index, producing the same 19 counters as
     /// `source_projection_totals` and converted by the same code. A SQLite integer `sum()`
     /// overflow is an error and is never wrapped; a window with no records has `records` 0 and
-    /// every observation unavailable, never 0.
+    /// every observation unavailable, never 0. A window intersecting any file's uncovered range
+    /// (unadmitted Codex usage) makes every present observation partial.
     pub fn source_window_projection(
         &self,
         source_id: &str,
@@ -3400,7 +3545,34 @@ impl Store {
                 Ok(totals)
             },
         ))?;
-        Self::projection_from_totals(totals)
+        let mut projection = Self::projection_from_totals(totals)?;
+        let uncovered = sqlite(
+            self.connection
+                .query_row(
+                    UNCOVERED_SQL,
+                    params![source_id, window.start_ms, window.end_ms],
+                    |_| Ok(()),
+                )
+                .optional(),
+        )?
+        .is_some();
+        if uncovered {
+            // Usage that was seen but not admitted fell in this window: no present value is
+            // complete. Absent values stay unavailable.
+            for observation in [
+                &mut projection.input,
+                &mut projection.output,
+                &mut projection.reasoning,
+                &mut projection.cache_read,
+                &mut projection.cache_write,
+                &mut projection.total,
+            ] {
+                if observation.value.is_some() {
+                    observation.status = ObservationStatus::Partial;
+                }
+            }
+        }
+        Ok(projection)
     }
 
     /// Every registered source with its consent and last status row, at most
@@ -3550,6 +3722,574 @@ impl Store {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Codex reported records (SLICE-002, DEC-077)
+
+/// The durable parse state of one Codex rollout file: numbers, the bounded own header id and
+/// enums only, never text from the file beyond that id.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexFile {
+    pub relative_path: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub mtime_ns: i64,
+    /// End of the last complete (or discarded) line: where the next read starts.
+    pub byte_offset: u64,
+    pub first_line_fnv64: u64,
+    pub header_id: Option<String>,
+    pub header_state: Option<CodexHeaderState>,
+    pub header_era: Option<CodexHeaderEra>,
+    pub record_state: CodexRecordState,
+    pub tail_state: Option<CodexTailState>,
+    /// Inclusive `[from, to]` of every unadmitted usage-bearing line's timestamp.
+    pub uncovered: Option<(i64, i64)>,
+    /// `false` once a terminal generation found the file gone.
+    pub present: bool,
+}
+
+/// One own `token_usage_record`: its root session, response, line timestamp and the six raw
+/// counters (input, output, reasoning, cache read, cache write, total), each `None` when absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexRecord {
+    pub session_id: String,
+    pub response_id: String,
+    pub occurred_at_ms: i64,
+    pub values: [Option<u64>; 6],
+}
+
+/// The end of one Codex pass, written in one transaction.
+#[derive(Clone, Copy)]
+pub struct CodexPassRequest<'a> {
+    pub source_id: &'a str,
+    pub root: &'a Path,
+    pub generation: u64,
+    /// Known files revalidated by the current lane, so the next pass rotates to the others.
+    pub visited: &'a [PathBuf],
+    /// Directories completed and files seen in this generation.
+    pub files: &'a [SpoolFile],
+    pub frontier: &'a [(PathBuf, usize, bool)],
+    /// Every directory of the generation reached its end: the generation completes.
+    pub drained: bool,
+    /// An entry was skipped or failed: the completed generation is not terminal.
+    pub incomplete: bool,
+    pub outcome: PassOutcome,
+    pub failure: Option<FailureCode>,
+    pub rejection: Option<FailureCode>,
+    pub records_committed: u32,
+    pub counters: PassCounters,
+    pub now_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CodexPassSummary {
+    pub outcome: PassOutcome,
+    pub failure: Option<FailureCode>,
+    /// The generation completed and the next pass starts a new one.
+    pub completed: bool,
+}
+
+const CODEX_FILE_COLUMNS: &str = "device, inode, size, mtime_ns, byte_offset, first_line_fnv64, \
+     header_id, header_state, header_era, record_state, tail_state, uncovered_from_ms, \
+     uncovered_to_ms, file_state";
+
+fn parse_stored<T>(
+    value: Option<String>,
+    parse: fn(&str) -> Option<T>,
+) -> Result<Option<T>, StoreError> {
+    value
+        .map(|text| parse(&text).ok_or(StoreError::InvalidStoredValue))
+        .transpose()
+}
+
+impl Store {
+    /// The stored state of one Codex file, `None` when it was never committed.
+    pub fn codex_file(
+        &self,
+        source_id: &str,
+        relative_path: &Path,
+    ) -> Result<Option<CodexFile>, StoreError> {
+        let path = relative_text(Path::new("."), relative_path)?;
+        type Row = (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            String,
+        );
+        let row: Option<Row> = sqlite(
+            self.connection
+                .query_row(
+                    &format!(
+                        "SELECT {CODEX_FILE_COLUMNS} FROM source_files WHERE source_id = ?1 \
+                         AND relative_path = ?2 AND adapter_state = 'codex_jsonl'"
+                    ),
+                    [source_id, path.as_str()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
+                            row.get(11)?,
+                            row.get(12)?,
+                            row.get(13)?,
+                        ))
+                    },
+                )
+                .optional(),
+        )?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let unsigned =
+            |value: i64| u64::try_from(value).map_err(|_| StoreError::InvalidStoredValue);
+        Ok(Some(CodexFile {
+            relative_path: relative_path.to_path_buf(),
+            device: unsigned(row.0)?,
+            inode: unsigned(row.1)?,
+            size: unsigned(row.2)?,
+            mtime_ns: row.3,
+            byte_offset: unsigned(row.4)?,
+            first_line_fnv64: row.5.cast_unsigned(),
+            header_id: row.6,
+            header_state: parse_stored(row.7, CodexHeaderState::parse)?,
+            header_era: parse_stored(row.8, CodexHeaderEra::parse)?,
+            record_state: parse_stored(row.9, CodexRecordState::parse)?
+                .ok_or(StoreError::InvalidStoredValue)?,
+            tail_state: parse_stored(row.10, CodexTailState::parse)?,
+            uncovered: match (row.11, row.12) {
+                (Some(from), Some(to)) => Some((from, to)),
+                (None, None) => None,
+                _ => return Err(StoreError::InvalidStoredValue),
+            },
+            present: row.13 == "present",
+        }))
+    }
+
+    /// Persisted Codex files for the reserved current lane, least recently revalidated first.
+    pub fn known_codex_paths(
+        &self,
+        source_id: &str,
+        limit: usize,
+    ) -> Result<Vec<PathBuf>, StoreError> {
+        let mut statement = sqlite(self.connection.prepare(KNOWN_PATHS_SQL))?;
+        let rows = sqlite(statement.query_map(
+            params![
+                source_id,
+                "codex_jsonl",
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| row.get::<_, String>(0),
+        ))?;
+        rows.map(|row| checked_relative_path(&sqlite(row)?))
+            .collect()
+    }
+
+    /// Whether any Codex file of the source ends in an unterminated, pending tail.
+    pub fn codex_pending_tail(&self, source_id: &str) -> Result<bool, StoreError> {
+        sqlite(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM source_files WHERE source_id = ?1 AND tail_state = 'pending')",
+            [source_id],
+            |row| row.get(0),
+        ))
+    }
+
+    /// Commits one file's records, their projection deltas and its parse state in one
+    /// transaction; returns how many records were inserted or changed.
+    pub fn commit_codex_file(
+        &mut self,
+        source_id: &str,
+        file: &CodexFile,
+        records: &[CodexRecord],
+        now_ms: i64,
+    ) -> Result<u32, StoreError> {
+        #[cfg(feature = "test-faults")]
+        let fault = self.take_fault();
+        let path = relative_text(Path::new("."), &file.relative_path)?;
+        let transaction = self.begin()?;
+        let mut changed = 0_u32;
+        for record in records {
+            if upsert_codex_record(&transaction, source_id, &path, record, now_ms)? {
+                changed = changed.saturating_add(1);
+            }
+        }
+        write_codex_file(&transaction, source_id, &path, file)?;
+        #[cfg(feature = "test-faults")]
+        panic_if_armed();
+        #[cfg(feature = "test-faults")]
+        if fault == Some(FaultPoint::BeforeCommit) {
+            return Err(StoreError::InjectedBeforeCommit);
+        }
+        sqlite(transaction.commit())?;
+        #[cfg(feature = "test-faults")]
+        if fault == Some(FaultPoint::AfterCommit) {
+            return Err(StoreError::InjectedAfterCommit);
+        }
+        Ok(changed)
+    }
+
+    /// Ends a Codex pass: spools what it saw, keeps or completes the generation and records the
+    /// status, all or nothing. A completed generation classifies unseen files missing only when
+    /// it is terminal: nothing was skipped, failed or rejected in it.
+    pub fn finish_codex_pass(
+        &mut self,
+        request: CodexPassRequest<'_>,
+    ) -> Result<CodexPassSummary, StoreError> {
+        self.finish_codex_pass_with_freshness(request, true, None)
+    }
+
+    pub(crate) fn finish_codex_pass_with_freshness(
+        &mut self,
+        request: CodexPassRequest<'_>,
+        allow_last_good: bool,
+        retry_files: Option<&[SpoolFile]>,
+    ) -> Result<CodexPassSummary, StoreError> {
+        #[cfg(feature = "test-faults")]
+        let fault = self.take_fault();
+        let transaction = self.begin()?;
+        expect_generation(&transaction, request.source_id, request.generation)?;
+        let generation = sql_count(request.generation)?;
+        sqlite(transaction.execute(
+            "UPDATE sources SET dirty = 1 WHERE source_id = ?1",
+            [request.source_id],
+        ))?;
+        stage_batch(
+            &transaction,
+            request.source_id,
+            request.root,
+            request.generation,
+            &StageBatch {
+                files: request.files,
+                ..StageBatch::default()
+            },
+            &mut BTreeSet::new(),
+        )?;
+        if let Some(code) = request.rejection {
+            note_generation_failure(&transaction, request.source_id, code)?;
+        }
+        let mut outcome = request.outcome;
+        let mut failure = request.failure;
+        if request.drained {
+            ensure_spool_capacity(&transaction, request.source_id, request.generation)?;
+            let sticky: Option<String> = sqlite(transaction.query_row(
+                "SELECT generation_failure FROM sources WHERE source_id = ?1",
+                [request.source_id],
+                |row| row.get(0),
+            ))?;
+            let sticky = sticky.as_deref().and_then(FailureCode::parse);
+            if !request.incomplete && failure.is_none() && sticky.is_none() {
+                sqlite(transaction.execute(
+                    "UPDATE source_files SET file_state = 'missing' \
+                     WHERE source_id = ?1 AND adapter_state = 'codex_jsonl' \
+                       AND file_state = 'present' AND relative_path NOT IN (\
+                         SELECT relative_path FROM metadata_spool \
+                         WHERE source_id = ?1 AND generation = ?2)",
+                    params![request.source_id, generation],
+                ))?;
+            }
+            if outcome == PassOutcome::Consistent && sticky.is_some() {
+                outcome = PassOutcome::Partial;
+                failure = failure.or(sticky);
+            }
+            clear_acquisition(&transaction, request.source_id, generation)?;
+            let next = request
+                .generation
+                .checked_add(1)
+                .ok_or(StoreError::CountOutOfRange)?;
+            sqlite(transaction.execute(
+                "UPDATE sources SET generation = ?2, generation_failure = NULL, dirty = ?3 \
+                 WHERE source_id = ?1",
+                params![
+                    request.source_id,
+                    sql_count(next)?,
+                    i64::from(outcome != PassOutcome::Consistent)
+                ],
+            ))?;
+        } else {
+            if request.failure == Some(FailureCode::RootOverlap) {
+                requeue_directories(
+                    &transaction,
+                    request.source_id,
+                    request.root,
+                    request.generation,
+                    request.frontier,
+                )?;
+            } else {
+                sqlite(replace_frontier(
+                    &transaction,
+                    request.source_id,
+                    request.root,
+                    request.generation,
+                    request.frontier,
+                ))?;
+            }
+            ensure_spool_capacity(&transaction, request.source_id, request.generation)?;
+        }
+        let pending: bool = sqlite(transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM source_files WHERE source_id = ?1 AND tail_state = 'pending')",
+            [request.source_id],
+            |row| row.get(0),
+        ))?;
+        if outcome == PassOutcome::Consistent && pending {
+            // An unterminated tail keeps its line uncounted until its newline arrives.
+            outcome = PassOutcome::Partial;
+        }
+        if let Some(files) = retry_files {
+            discard_unverified_directories(
+                &transaction,
+                request.source_id,
+                request.generation,
+                files,
+            )?;
+        }
+        touch_visited(&transaction, request.source_id, request.visited)?;
+        let advance = allow_last_good
+            && (outcome == PassOutcome::Consistent
+                || (outcome == PassOutcome::CatchingUp && request.records_committed > 0));
+        save_status(
+            &transaction,
+            request.source_id,
+            outcome,
+            failure,
+            request.counters,
+            request.now_ms,
+            advance,
+        )?;
+        #[cfg(feature = "test-faults")]
+        panic_if_armed();
+        #[cfg(feature = "test-faults")]
+        if fault == Some(FaultPoint::BeforeCommit) {
+            return Err(StoreError::InjectedBeforeCommit);
+        }
+        sqlite(transaction.commit())?;
+        #[cfg(feature = "test-faults")]
+        if fault == Some(FaultPoint::AfterCommit) {
+            return Err(StoreError::InjectedAfterCommit);
+        }
+        Ok(CodexPassSummary {
+            outcome,
+            failure,
+            completed: request.drained,
+        })
+    }
+}
+
+fn write_codex_file(
+    transaction: &Transaction<'_>,
+    source_id: &str,
+    path: &str,
+    file: &CodexFile,
+) -> Result<(), StoreError> {
+    if file
+        .header_id
+        .as_ref()
+        .is_some_and(|id| !is_valid_id_component(id))
+    {
+        return Err(StoreError::InvalidStoredValue);
+    }
+    sqlite(transaction.execute(
+        "INSERT INTO source_files(source_id, relative_path, device, inode, size, mtime_ns, \
+            byte_offset, first_line_fnv64, adapter_state, parse_generation, file_state, \
+            header_id, header_state, header_era, record_state, tail_state, uncovered_from_ms, \
+            uncovered_to_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'codex_jsonl', \
+            (SELECT generation FROM sources WHERE source_id = ?1), ?9, ?10, ?11, ?12, ?13, ?14, \
+            ?15, ?16) \
+         ON CONFLICT(source_id, relative_path) DO UPDATE SET device = excluded.device, \
+            inode = excluded.inode, size = excluded.size, mtime_ns = excluded.mtime_ns, \
+            byte_offset = excluded.byte_offset, first_line_fnv64 = excluded.first_line_fnv64, \
+            adapter_state = excluded.adapter_state, parse_generation = excluded.parse_generation, \
+            file_state = excluded.file_state, header_id = excluded.header_id, \
+            header_state = excluded.header_state, header_era = excluded.header_era, \
+            record_state = excluded.record_state, tail_state = excluded.tail_state, \
+            uncovered_from_ms = excluded.uncovered_from_ms, \
+            uncovered_to_ms = excluded.uncovered_to_ms",
+        params![
+            source_id,
+            path,
+            sql_count(file.device)?,
+            sql_count(file.inode)?,
+            sql_count(file.size)?,
+            file.mtime_ns,
+            sql_count(file.byte_offset)?,
+            // A bit-for-bit 64-bit hash, stored as SQLite's signed integer.
+            file.first_line_fnv64.cast_signed(),
+            if file.present { "present" } else { "missing" },
+            file.header_id,
+            file.header_state.map(CodexHeaderState::as_str),
+            file.header_era.map(CodexHeaderEra::as_str),
+            file.record_state.as_str(),
+            file.tail_state.map(CodexTailState::as_str),
+            file.uncovered.map(|range| range.0),
+            file.uncovered.map(|range| range.1),
+        ],
+    ))?;
+    Ok(())
+}
+
+/// Writes one own record under the Codex precedence rules and keeps the source projection in
+/// step. Returns whether the stored numbers changed (an insert or a revision).
+///
+/// The key is per source, root session and response. The same key from the same path with other
+/// numbers is a revision. From another path, equal numbers move `mirror_path` to the byte-smaller
+/// path without a revision; different numbers flag `mirror_conflict` and the byte-smaller path's
+/// numbers are the stored ones, whatever order the copies arrived in. Copies are never added.
+fn upsert_codex_record(
+    transaction: &Transaction<'_>,
+    source_id: &str,
+    path: &str,
+    record: &CodexRecord,
+    now_ms: i64,
+) -> Result<bool, StoreError> {
+    if record
+        .values
+        .iter()
+        .flatten()
+        .any(|value| *value > MAX_TOKEN_COUNT)
+    {
+        return Err(StoreError::CountOutOfRange);
+    }
+    if !(0..=MAX_SOURCE_TIMESTAMP_MS).contains(&record.occurred_at_ms)
+        || !is_valid_id_component(&record.session_id)
+        || !is_valid_id_component(&record.response_id)
+        || record.session_id.len() + record.response_id.len() > MAX_RECORD_ID_BYTES
+    {
+        return Err(StoreError::InvalidStoredValue);
+    }
+    let event_key = codex_event_key(source_id, &record.session_id, &record.response_id);
+    let values = [
+        sql_optional(record.values[0])?,
+        sql_optional(record.values[1])?,
+        sql_optional(record.values[2])?,
+        sql_optional(record.values[3])?,
+        sql_optional(record.values[4])?,
+        sql_optional(record.values[5])?,
+    ];
+    let provenance = values[5].map(|_| provenance_str(Provenance::Reported));
+    let stored: Option<(String, i64, [Option<i64>; 6])> = sqlite(
+        transaction
+            .query_row(
+                "SELECT mirror_path, occurred_at_ms, input_tokens, output_tokens, \
+                 reasoning_tokens, cache_read_tokens, cache_write_tokens, total_tokens \
+                 FROM usage_events WHERE event_key = ?1",
+                [&event_key],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        [
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ],
+                    ))
+                },
+            )
+            .optional(),
+    )?;
+    let Some((stored_path, stored_at, stored_values)) = stored else {
+        sqlite(transaction.execute(
+            "INSERT INTO usage_events(event_key, family, measurement_kind, harness, source_id, \
+                session_id, message_id, occurred_at_ms, input_tokens, output_tokens, \
+                reasoning_tokens, cache_read_tokens, cache_write_tokens, total_tokens, \
+                total_provenance, source_convention, acquisition_consistency, origin_uncertainty, \
+                total_mismatch, mirror_conflict, selected_part_ids, format_rank, mirror_path, \
+                pending_partial, pending_reason, revision, first_seen_ms, updated_ms) \
+             VALUES (?1, 'codex', 'source_reported', 'codex', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
+                ?10, ?11, ?12, NULL, 'file_by_file_best_effort', 'unverified_origin', 0, 0, '[]', \
+                0, ?13, 0, NULL, 1, ?14, ?14)",
+            params![
+                event_key,
+                source_id,
+                record.session_id,
+                record.response_id,
+                record.occurred_at_ms,
+                values[0],
+                values[1],
+                values[2],
+                values[3],
+                values[4],
+                values[5],
+                provenance,
+                path,
+                now_ms,
+            ],
+        ))?;
+        let after = load_summary(transaction, &event_key)?.ok_or(StoreError::InvalidStoredValue)?;
+        apply_summary(transaction, &after, 1)?;
+        return Ok(true);
+    };
+    let same_numbers = stored_at == record.occurred_at_ms && stored_values == values;
+    let smaller = path.as_bytes() < stored_path.as_bytes();
+    let (take_numbers, rebind, conflict) = match (stored_path == path, same_numbers) {
+        (true, true) => return Ok(false),
+        (true, false) => (true, false, false),
+        (false, true) => (false, smaller, false),
+        (false, false) => (smaller, smaller, true),
+    };
+    if !take_numbers && !rebind && !conflict {
+        return Ok(false);
+    }
+    let before = load_summary(transaction, &event_key)?.ok_or(StoreError::InvalidStoredValue)?;
+    apply_summary(transaction, &before, -1)?;
+    if take_numbers {
+        sqlite(transaction.execute(
+            "UPDATE usage_events SET occurred_at_ms = ?2, input_tokens = ?3, output_tokens = ?4, \
+                reasoning_tokens = ?5, cache_read_tokens = ?6, cache_write_tokens = ?7, \
+                total_tokens = ?8, total_provenance = ?9, mirror_path = ?10, \
+                revision = revision + 1, updated_ms = ?11 \
+             WHERE event_key = ?1",
+            params![
+                event_key,
+                record.occurred_at_ms,
+                values[0],
+                values[1],
+                values[2],
+                values[3],
+                values[4],
+                values[5],
+                provenance,
+                path,
+                now_ms,
+            ],
+        ))?;
+    } else if rebind {
+        sqlite(transaction.execute(
+            "UPDATE usage_events SET mirror_path = ?2 WHERE event_key = ?1",
+            params![event_key, path],
+        ))?;
+    }
+    if conflict {
+        sqlite(transaction.execute(
+            "UPDATE usage_events SET mirror_conflict = 1 WHERE event_key = ?1",
+            [&event_key],
+        ))?;
+    }
+    let after = load_summary(transaction, &event_key)?.ok_or(StoreError::InvalidStoredValue)?;
+    apply_summary(transaction, &after, 1)?;
+    Ok(take_numbers)
+}
+
 /// Maintained-counter algebra: every counter is non-negative and bounded by what the record
 /// count and the raw-record ceiling permit, presence counts never exceed records, zero presence
 /// carries a zero sum, derived totals are a subset of present totals, and the two acquisition
@@ -3632,7 +4372,8 @@ pub struct SourceRow {
 
 const SOURCE_ROW_SQL: &str = "SELECT s.source_id, s.harness, s.canonical_root, s.kind, \
      s.consent, s.root_device, s.root_inode, st.outcome, st.last_attempt_ms, \
-     st.last_success_ms, st.last_error_code, st.rejected_count, COALESCE(p.pending_count, 0) \
+     st.last_success_ms, st.last_error_code, st.rejected_count, COALESCE(p.pending_count, 0) + \
+     EXISTS(SELECT 1 FROM source_files f WHERE f.source_id = s.source_id AND f.tail_state = 'pending') \
      FROM sources s LEFT JOIN source_status st ON st.source_id = s.source_id \
      LEFT JOIN source_projection_totals p ON p.source_id = s.source_id";
 
