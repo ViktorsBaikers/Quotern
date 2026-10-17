@@ -2,3 +2,6 @@ target/
 .build/
 build/
 .codegraph/
+.DS_Store
+**/xcuserdata/
+*.xcuserstate
