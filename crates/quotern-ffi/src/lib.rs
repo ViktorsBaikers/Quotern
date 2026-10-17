@@ -50,6 +50,22 @@ pub unsafe fn queued_waiters(engine: *const QuoternEngine) -> usize {
     unsafe { &*engine }.queued.load(Ordering::SeqCst)
 }
 
+#[cfg(feature = "test-faults")]
+thread_local! {
+    static DISPATCH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test boundary: domain dispatch entries on this thread, including existing-descriptor reads.
+#[cfg(feature = "test-faults")]
+pub fn dispatch_count() -> usize {
+    DISPATCH_COUNT.get()
+}
+
+#[cfg(feature = "test-faults")]
+pub fn reset_dispatch_count() {
+    DISPATCH_COUNT.set(0);
+}
+
 struct ApiError {
     code: &'static str,
     message: String,
@@ -286,7 +302,7 @@ fn check_now(now_ms: i64) -> Result<(), ApiError> {
 
 fn parse_selection(request: &str) -> Result<SetSelection, ApiError> {
     let request: SetSelection = parse(request)?;
-    if request.harness != "opencode" {
+    if !matches!(request.harness.as_str(), "opencode" | "codex") {
         return Err(ApiError::invalid("harness"));
     }
     absolute_field(&request.root, "root")?;
@@ -339,6 +355,8 @@ fn dispatch(
     request: &str,
     cancel: &AtomicBool,
 ) -> Result<Value, ApiError> {
+    #[cfg(feature = "test-faults")]
+    DISPATCH_COUNT.set(DISPATCH_COUNT.get() + 1);
     match method {
         "set_source_selection" => {
             let request = parse_selection(request)?;
@@ -348,6 +366,14 @@ fn dispatch(
                 .map_err(|error| store_api_error(&error))?;
             if !request.selected {
                 let id = known.ok_or_else(|| ApiError::invalid("root"))?;
+                let matching_harness = engine
+                    .source_entries()
+                    .map_err(|error| store_api_error(&error))?
+                    .iter()
+                    .any(|entry| entry.source_id == id && entry.harness == request.harness);
+                if !matching_harness {
+                    return Err(ApiError::invalid("root"));
+                }
                 engine.deny(&id).map_err(|error| store_api_error(&error))?;
                 return sources(engine);
             }
@@ -366,9 +392,13 @@ fn dispatch(
                 selected: true,
                 consent: ConsentState::Enabled,
             };
-            if let Err(report) =
-                engine.attach_opencode(RealSourceFs, root, authorization, SourceKind::Custom)
-            {
+            let attached = match request.harness.as_str() {
+                "codex" => {
+                    engine.attach_codex(RealSourceFs, root, authorization, SourceKind::Custom)
+                }
+                _ => engine.attach_opencode(RealSourceFs, root, authorization, SourceKind::Custom),
+            };
+            if let Err(report) = attached {
                 if let Some(error) = engine.last_store_error() {
                     return Err(store_api_error(error));
                 }

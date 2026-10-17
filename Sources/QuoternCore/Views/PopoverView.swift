@@ -157,6 +157,7 @@ private struct SourceSection: View {
     static func harnessName(_ harness: String?) -> String {
         switch harness {
         case "opencode": "OpenCode"
+        case "codex": "Codex"
         case let other?: other
         case nil: "Source"
         }

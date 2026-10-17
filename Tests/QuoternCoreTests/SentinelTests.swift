@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Darwin
 import XCTest
 @testable import QuoternCore
 
@@ -12,7 +13,7 @@ final class SentinelTests: XCTestCase {
     /// inventory check fails.
     static let declaredSinks: Set<String> = [
         "log capture", "accessibility tree", "decoded responses", "data-directory files",
-        "UserDefaults domain", "self-test journey.json", "self-test popover.png",
+        "UserDefaults domain",
     ]
 
     /// What each sink held, as scanned.
@@ -56,15 +57,90 @@ final class SentinelTests: XCTestCase {
     }
 
     private func durableFiles(_ directory: String) throws -> [Data] {
-        guard let walk = FileManager.default.enumerator(atPath: directory) else { return [] }
-        var files: [Data] = []
-        while let name = walk.nextObject() as? String {
-            var isDirectory: ObjCBool = false
-            let path = directory + "/" + name
-            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else { continue }
-            files.append(try Data(contentsOf: URL(fileURLWithPath: path)))
+        func read(_ directory: URL) throws -> [Data] {
+            var files: [Data] = []
+            for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey]) {
+                if try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true {
+                    files += try read(url)
+                } else {
+                    files.append(try Data(contentsOf: url))
+                }
+            }
+            return files
         }
+        let files = try read(URL(fileURLWithPath: directory))
+        guard !files.isEmpty else { throw NSError(domain: "QuoternTests.Inventory", code: 1) }
         return files
+    }
+
+    @MainActor
+    private func waitForExit(_ process: Process, deadline: ContinuousClock.Instant) async throws {
+        defer {
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            process.waitUntilExit()
+        }
+        while process.isRunning, ContinuousClock().now < deadline {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        try Task.checkCancellation()
+        guard !process.isRunning else { throw NSError(domain: "QuoternTests.Child", code: 1) }
+    }
+
+    func testDurableInventoryRejectsMissingEmptyAndInaccessibleSubtree() throws {
+        let base = try Support.canonicalTemporaryDirectory()
+        defer { Support.remove(base) }
+        XCTAssertThrowsError(try durableFiles(base.appendingPathComponent("missing").path))
+        XCTAssertThrowsError(try durableFiles(base.path))
+        try Data("clean".utf8).write(to: base.appendingPathComponent("visible"))
+        let nested = base.appendingPathComponent("nested")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data(Self.sentinel.utf8).write(to: nested.appendingPathComponent("hidden"))
+        XCTAssertEqual(try durableFiles(base.path).count, 2)
+        XCTAssertNotEqual(geteuid(), 0, "the permission discriminator requires non-root")
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: nested.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: nested.path) }
+        XCTAssertThrowsError(try durableFiles(base.path), "a readable sibling cannot mask a skipped subtree")
+    }
+
+    @MainActor
+    func testOwnedChildTimeoutKillsAndJoinsHungProcess() async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["60"]
+        try process.run()
+        do {
+            try await waitForExit(process, deadline: ContinuousClock().now)
+            XCTFail("a running child past its deadline must fail")
+        } catch let error as NSError {
+            XCTAssertEqual(error.domain, "QuoternTests.Child")
+            XCTAssertEqual(error.code, 1)
+        }
+        XCTAssertFalse(process.isRunning)
+        XCTAssertEqual(process.terminationReason, .uncaughtSignal)
+        XCTAssertEqual(process.terminationStatus, SIGKILL)
+        let completed = Process()
+        completed.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try completed.run()
+        try await waitForExit(completed, deadline: ContinuousClock().now.advanced(by: .seconds(5)))
+        XCTAssertEqual(completed.terminationStatus, 0)
+    }
+
+    @MainActor
+    func testOwnedChildCancellationKillsAndJoins() async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["60"]
+        try process.run()
+        let task = Task { try await waitForExit(process, deadline: ContinuousClock().now.advanced(by: .seconds(90))) }
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("cancellation must fail the owned child")
+        } catch is CancellationError {}
+        XCTAssertFalse(process.isRunning)
+        XCTAssertEqual(process.terminationReason, .uncaughtSignal)
+        XCTAssertEqual(process.terminationStatus, SIGKILL)
     }
 
     @MainActor
@@ -75,7 +151,7 @@ final class SentinelTests: XCTestCase {
         for placement in ["content", "model", "provider", "path"] {
             try await run(placement: placement, into: &scan)
         }
-        try journey(into: &scan)
+        try await codex(into: &scan)
         XCTAssertEqual(Self.problems(scan), [], "every declared sink scanned, non-empty and clean")
     }
 
@@ -134,42 +210,43 @@ final class SentinelTests: XCTestCase {
         scan["data-directory files", default: []] += try durableFiles(world.data)
     }
 
-    /// The real self-test journey over a copy of the journey home whose records carry the
-    /// sentinel in every text field the adapter skips. Its outputs are scanned whatever its
-    /// checks concluded (the status-item click needs a menu bar).
-    private func journey(into scan: inout Scan) throws {
-        let executable = Bundle(for: Self.self).bundleURL.deletingLastPathComponent().appendingPathComponent("Quotern")
-        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: executable.path), "the Quotern executable is built beside the tests: \(executable.path)")
-        let base = try Support.canonicalTemporaryDirectory()
-        defer { Support.remove(base) }
-        let home = base.appendingPathComponent("home")
-        try FileManager.default.copyItem(at: Support.root.appendingPathComponent("Fixtures/journey-home"), to: home)
-        let storage = home.appendingPathComponent(".local/share/opencode/storage")
-        for (relative, field) in [
-            ("message/ses_journey/msg_journey.json", "modelID"),
-            ("part/msg_journey/prt_journey.json", "text"),
-            ("session/journey/ses_journey.json", "title"),
-        ] {
-            let url = storage.appendingPathComponent(relative)
-            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
-            object[field] = "api_key=\(Self.sentinel)"
-            try JSONSerialization.data(withJSONObject: object).write(to: url)
-        }
-        let out = base.appendingPathComponent("out").path
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = [
-            "--selftest-journey", "--selftest-home", home.path, "--data-dir", base.appendingPathComponent("data").path,
-            "--now", "2026-09-30T12:00:00Z", "--phase", "first", "--out", out,
-        ]
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        process.waitUntilExit()
-        let record = try Data(contentsOf: URL(fileURLWithPath: out + "/journey.json"))
-        let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: record) as? [String: Any])
-        XCTAssertNotNil(parsed["displayed"], "the journey recorded what it displayed")
-        scan["self-test journey.json", default: []].append(record)
-        scan["self-test popover.png", default: []].append(try Data(contentsOf: URL(fileURLWithPath: out + "/popover.png")))
+    @MainActor
+    private func codex(into scan: inout Scan) async throws {
+        QuoternLog.reset()
+        let world = try CodexWorld()
+        let lines = try String(contentsOf: world.rollout, encoding: .utf8).split(separator: "\n")
+        let hostile = try lines.map { line -> String in
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+            var payload = try XCTUnwrap(object["payload"] as? [String: Any])
+            for field in ["content", "model", "provider", "cwd", "instructions"] { payload[field] = Self.sentinel }
+            object["payload"] = payload
+            return String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+        }.joined(separator: "\n") + "\n"
+        XCTAssertTrue(hostile.contains(Self.sentinel))
+        try Data(hostile.utf8).write(to: world.rollout)
+        let client = EngineClient()
+        let now: Int64 = 1_790_769_600_000
+        try await client.open(world.config)
+        scan["decoded responses", default: []].append(try JSONEncoder().encode(try await client.setSourceSelection(world.selection)))
+        scan["decoded responses", default: []].append(try JSONEncoder().encode(try await client.ingest(nowMs: now)))
+        scan["decoded responses", default: []].append(try JSONEncoder().encode(try await client.listSources()))
+        let snapshot = try await client.todaySnapshot(tz: "UTC", nowMs: now)
+        XCTAssertEqual(snapshot.bySource.first?.harness, "codex")
+        XCTAssertEqual(snapshot.sourceReported.first?.total.value, 10)
+        scan["decoded responses", default: []].append(try JSONEncoder().encode(snapshot))
+        await client.close()
+        let rendered = Render.render(Render.model(.success(snapshot), nowMs: now), dark: false)
+        XCTAssertEqual(rendered.text("Total, Codex reported tokens")?.value, "10 tokens, Reported, Current, Updated just now")
+        rendered.window.orderOut(nil)
+        scan["accessibility tree", default: []] += rendered.texts.map { Data(($0.label + " " + $0.value).utf8) }
+        scan["log capture", default: []] += QuoternLog.captured.map { Data($0.utf8) }
+        scan["data-directory files", default: []] += try durableFiles(world.data)
+        let suite = "app.quotern.tests.codex-sentinel.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        WatchedRoots(defaults: defaults).add(world.source)
+        let domain = try XCTUnwrap(defaults.persistentDomain(forName: suite))
+        scan["UserDefaults domain", default: []].append(try PropertyListSerialization.data(fromPropertyList: domain, format: .xml, options: 0))
+        defaults.removePersistentDomain(forName: suite)
     }
 
     /// Mutants of the inventory check: each one is reported, and a clean full scan is not.

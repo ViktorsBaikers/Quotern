@@ -1,4 +1,5 @@
 import CoreServices
+import Darwin
 import Foundation
 import XCTest
 @testable import QuoternCore
@@ -299,6 +300,121 @@ final class SourceWatcherTests: XCTestCase {
         XCTAssertEqual(second?.value, 45, "42 + 1 + 2, counted on launch")
         XCTAssertEqual(second?.status, .current)
         XCTAssertEqual(second?.lastGoodMs, start + 3_600_000)
+    }
+
+    func testIdleElevenMinutesUnchangedJsonlReadsNoContent() async throws {
+        XCTAssertNotEqual(geteuid(), 0, "0000 must actually refuse content reads")
+        let world = try CodexWorld()
+        let client = EngineClient()
+        let start: Int64 = 1_790_769_600_000
+        try await client.open(world.config)
+        _ = try await client.setSourceSelection(world.selection)
+        let clock = self.clock!
+        let model = TodayModel(client: client, zone: "Europe/Riga", nowMs: { start + Int64(clock.now * 1_000) })
+        let watcher = watcher(pass: { [unowned self] in
+            passes += 1
+            await model.reconcile()
+        })
+        watcher.update(enabled: true, roots: [world.source])
+        await advance(watcher, to: 0)
+        XCTAssertEqual(passes, 1)
+        XCTAssertEqual(model.snapshot?.sourceReported.first?.total.value, 10)
+        let auth = world.source + "/auth.json"
+        let paths = [world.rollout.path, auth]
+        var before: [stat] = []
+        for path in paths {
+            var metadata = stat()
+            XCTAssertEqual(lstat(path, &metadata), 0)
+            before.append(metadata)
+            XCTAssertEqual(chmod(path, 0o000), 0)
+        }
+        for tick in [300.0, 600.0] {
+            await advance(watcher, to: tick)
+            let entry = try XCTUnwrap(model.snapshot?.bySource.first)
+            XCTAssertEqual(entry.outcome, "consistent", "unreadable unchanged content is never reopened")
+            XCTAssertNil(entry.lastErrorCode)
+            XCTAssertEqual(entry.lastSuccessMs, start + Int64(tick * 1_000))
+            XCTAssertEqual(model.snapshot?.sourceReported.first?.total.value, 10)
+        }
+        await advance(watcher, to: 660)
+        XCTAssertEqual(passes, 3, "launch plus exactly two 300 s periodic passes")
+        XCTAssertEqual(clock.scheduled.filter { $0.delay == 300 }.map(\.leeway), [30, 30, 30])
+        let total = try XCTUnwrap(model.snapshot?.sourceReported.first?.total)
+        XCTAssertEqual(total.lastGoodMs, start + 600_000)
+        XCTAssertEqual(total.status, .current)
+        for (path, original) in zip(paths, before) {
+            var metadata = stat()
+            XCTAssertEqual(lstat(path, &metadata), 0)
+            XCTAssertEqual(metadata.st_ino, original.st_ino)
+            XCTAssertEqual(metadata.st_size, original.st_size)
+            XCTAssertEqual(metadata.st_mtimespec.tv_sec, original.st_mtimespec.tv_sec)
+            XCTAssertEqual(metadata.st_mtimespec.tv_nsec, original.st_mtimespec.tv_nsec)
+            XCTAssertEqual(metadata.st_mode & 0o777, 0)
+        }
+        watcher.update(enabled: false, roots: [])
+        await client.close()
+    }
+
+    func testClosedAppCurrentPathAppendCountedAtLaunchWithoutFSEvent() async throws {
+        try await codexClosedAppChange(correctPrefix: false)
+    }
+
+    func testClosedAppPrefixCorrectionAndAppendReconciledAtLaunch() async throws {
+        try await codexClosedAppChange(correctPrefix: true)
+    }
+
+    private func codexClosedAppChange(correctPrefix: Bool) async throws {
+        let world = try CodexWorld()
+        let start: Int64 = 1_790_769_600_000
+        func launch(_ now: Int64) async throws -> SourceReported {
+            let client = EngineClient()
+            try await client.open(world.config)
+            if now == start { _ = try await client.setSourceSelection(world.selection) }
+            let model = TodayModel(client: client, zone: "Europe/Riga", nowMs: { now })
+            let watcher = watcher(pass: { await model.reconcile() })
+            watcher.update(enabled: true, roots: [world.source])
+            await advance(watcher, to: clock.now + 1)
+            XCTAssertEqual(watcher.passCount, 1, "one launch pass with no delivered FSEvent")
+            XCTAssertNil(model.snapshot?.bySource.first?.lastErrorCode)
+            watcher.update(enabled: false, roots: [])
+            await client.close()
+            return try XCTUnwrap(model.snapshot?.sourceReported.first)
+        }
+        let first = try await launch(start)
+        XCTAssertEqual(first.total.value, 10)
+        let text = try String(contentsOf: world.rollout, encoding: .utf8)
+        var record = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(text.split(separator: "\n").last).utf8)) as? [String: Any])
+        var payload = try XCTUnwrap(record["payload"] as? [String: Any])
+        payload["response_id"] = "resp_later"
+        payload["usage"] = ["input_tokens": 3, "total_tokens": 3]
+        record["payload"] = payload
+        var append = try JSONSerialization.data(withJSONObject: record)
+        append.append(0x0A)
+        let attributes = try FileManager.default.attributesOfItem(atPath: world.rollout.path)
+        let file = try FileHandle(forUpdating: world.rollout)
+        if correctPrefix {
+            let corrected = text.replacingOccurrences(of: "\"input_tokens\":10", with: "\"input_tokens\":20")
+                .replacingOccurrences(of: "\"total_tokens\":10", with: "\"total_tokens\":20")
+            XCTAssertNotEqual(corrected, text)
+            try file.write(contentsOf: Data(corrected.utf8))
+        }
+        try file.seekToEnd()
+        try file.write(contentsOf: append)
+        try file.close()
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: world.rollout.path)[.systemFileNumber] as? NSNumber,
+                       attributes[.systemFileNumber] as? NSNumber, "same inode across correction and append")
+        let second = try await launch(start + 3_600_000)
+        XCTAssertEqual(second.input.value, correctPrefix ? 23 : 13)
+        XCTAssertEqual(second.total.value, correctPrefix ? 23 : 13)
+        XCTAssertEqual(second.records, 2)
+        XCTAssertEqual(second.total.provenance, .reported)
+        XCTAssertEqual(second.originUncertainty, "unverified_origin")
+        XCTAssertNil(second.output.value)
+        XCTAssertNil(second.output.provenance)
+        XCTAssertEqual(second.total.status, .current)
+        XCTAssertEqual(second.total.lastGoodMs, start + 3_600_000)
+        let replay = try await launch(start + 7_200_000)
+        XCTAssertEqual(Support.acquired(replay), Support.acquired(second), "next launch adds zero")
     }
 
     /// SAME decoded `error-engine-failed.json` in TodayModel's result entry: last good stays,

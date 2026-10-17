@@ -49,17 +49,20 @@ final class BridgeContractV1Tests: XCTestCase {
         func parsed(_ text: String) throws -> NSDictionary {
             try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? NSDictionary)
         }
-        let encoded: [String: String] = [
-            "open": EngineClient.encode(EngineConfig(dataDir: "/quotern-golden/data", home: "/quotern-golden/home")),
-            "set_source_selection": EngineClient.encode(
-                SourceSelection(harness: "opencode", root: "/quotern-golden/opencode", selected: true)),
-            "list_sources": "{}",
-            "ingest": EngineClient.encode(IngestRequest(nowMs: 1_775_124_000_000)),
-            "today_snapshot": EngineClient.encode(TodayRequest(tz: "UTC", nowMs: 1_775_124_000_000)),
+        let encoded: [String: [String]] = [
+            "open": [EngineClient.encode(EngineConfig(dataDir: "/quotern-golden/data", home: "/quotern-golden/home"))],
+            "set_source_selection": [
+                EngineClient.encode(SourceSelection(harness: "opencode", root: "/quotern-golden/opencode", selected: true)),
+                EngineClient.encode(SourceSelection(harness: "codex", root: "/quotern-golden/codex", selected: true)),
+            ],
+            "list_sources": ["{}"],
+            "ingest": [EngineClient.encode(IngestRequest(nowMs: 1_775_124_000_000))],
+            "today_snapshot": [EngineClient.encode(TodayRequest(tz: "UTC", nowMs: 1_775_124_000_000))],
         ]
         XCTAssertEqual(Set(file.keys), Set(encoded.keys), "every first-use method is in the golden")
-        for (method, text) in encoded {
-            XCTAssertEqual(try parsed(text), file[method] as? NSDictionary, method)
+        for (method, texts) in encoded {
+            let requests = method == "set_source_selection" ? file[method] as? [NSDictionary] : (file[method] as? NSDictionary).map { [$0] }
+            XCTAssertEqual(try texts.map(parsed), requests, method)
         }
     }
 
@@ -77,6 +80,28 @@ final class BridgeContractV1Tests: XCTestCase {
 
         let pending = try decodeGolden("snapshot-pending-partial.json", as: TodaySnapshot.self)
         XCTAssertEqual(pending.sourceReported.first?.pendingPartial, true)
+        XCTAssertEqual(pending.bySource.first { $0.harness == "codex" }?.pendingPartial, true)
+        let pendingCodex = try XCTUnwrap(pending.sourceReported.first { $0.sourceId == pending.bySource.first { $0.harness == "codex" }?.sourceId })
+        XCTAssertEqual(pendingCodex.input.value, 7)
+        XCTAssertEqual(pendingCodex.input.lastGoodMs, 1_775_124_000_000)
+        XCTAssertEqual(catching.bySource.first { $0.harness == "codex" }?.outcome, "catching_up")
+        let catchingCodex = try XCTUnwrap(catching.sourceReported.first { $0.sourceId == catching.bySource.first { $0.harness == "codex" }?.sourceId })
+        XCTAssertEqual(catchingCodex.total.value, 7)
+        XCTAssertEqual(catchingCodex.total.status, .catchingUp)
+
+        let codex = try decodeGolden("snapshot-codex-basic.json", as: TodaySnapshot.self)
+        XCTAssertEqual(codex.bySource.map(\.harness), ["codex", "codex"])
+        XCTAssertEqual(codex.sourceReported.map(\.originUncertainty), ["unverified_origin", "unverified_origin"])
+        let basic = try XCTUnwrap(codex.sourceReported.first)
+        XCTAssertEqual([basic.input.value, basic.output.value, basic.reasoning.value, basic.cacheRead.value, basic.cacheWrite.value, basic.total.value], [1700, 350, 120, 800, 100, 2050])
+        XCTAssertEqual(basic.cacheWrite.completeness, .partial)
+        XCTAssertEqual(basic.total.provenance, .reported)
+        let headers = try XCTUnwrap(codex.sourceReported.last)
+        XCTAssertEqual(headers.input.value, 100)
+        XCTAssertEqual(headers.input.completeness, .partial)
+        XCTAssertNil(headers.output.value)
+        XCTAssertNil(headers.output.provenance)
+        XCTAssertEqual(headers.output.status, .unavailable)
 
         let open = try decodeGolden("open-ok.json", as: OpenData.self)
         XCTAssertEqual(open.abiVersion, 1)
@@ -125,7 +150,7 @@ final class BridgeContractV1Tests: XCTestCase {
         // Inventory: every response golden in the contract directory is decoded above.
         let decoded = Set([
             "snapshot-empty.json", "snapshot-catching-up.json", "snapshot-pending-partial.json",
-            "snapshot-opencode-reported.json", "open-ok.json", "sources-list.json", "snapshot-states.json",
+            "snapshot-opencode-reported.json", "snapshot-codex-basic.json", "open-ok.json", "sources-list.json", "snapshot-states.json",
         ]).union(errors.keys)
         let directory = Support.root.appendingPathComponent("Contracts/bridge-v1").path
         let responses = try FileManager.default.contentsOfDirectory(atPath: directory)
@@ -148,6 +173,55 @@ final class BridgeContractV1Tests: XCTestCase {
         let sharedReported = try XCTUnwrap(shared.sourceReported.first)
         XCTAssertEqual(liveReported, try Support.reported("utc_counters", sourceId: liveReported.sourceId))
         XCTAssertEqual(try Support.reported("utc_counters", sourceId: sharedReported.sourceId), sharedReported)
+    }
+
+    func testCodexSharedGoldenMatchesLiveAcquisition() async throws {
+        let world = try World(rows: [])
+        let client = EngineClient()
+        try await client.open(world.config)
+        for (name, fixture) in [("codex-home", "basic"), ("codex-headers", "headers")] {
+            let source = world.base.appendingPathComponent(name)
+            try FileManager.default.copyItem(at: Support.root.appendingPathComponent("Fixtures/harness/codex/\(fixture)"), to: source)
+            if fixture == "headers" {
+                let directory = source.appendingPathComponent("sessions/2026/03/29")
+                for file in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+                    where file.lastPathComponent != "rollout-2026-03-29T11-00-00-appended.jsonl" {
+                    try FileManager.default.removeItem(at: file)
+                }
+            }
+            _ = try await client.setSourceSelection(.init(harness: "codex", root: source.path, selected: true))
+        }
+        let now: Int64 = 1_774_785_600_000
+        _ = try await client.ingest(nowMs: now)
+        let live = try await client.todaySnapshot(tz: "UTC", nowMs: now)
+        await client.close()
+        let shared = try decodeGolden("snapshot-codex-basic.json", as: TodaySnapshot.self)
+        XCTAssertEqual(live.window, shared.window)
+        XCTAssertEqual(live.sourceReported.count, 2)
+        for entry in live.bySource {
+            let sharedEntry = try XCTUnwrap(shared.bySource.first { $0.rootDisplay == entry.rootDisplay })
+            let actual = try XCTUnwrap(live.sourceReported.first { $0.sourceId == entry.sourceId })
+            let expected = try XCTUnwrap(shared.sourceReported.first { $0.sourceId == sharedEntry.sourceId })
+            let normalized = SourceReported(
+                sourceId: expected.sourceId,
+                records: actual.records,
+                input: actual.input,
+                output: actual.output,
+                reasoning: actual.reasoning,
+                cacheRead: actual.cacheRead,
+                cacheWrite: actual.cacheWrite,
+                total: actual.total,
+                sourceConvention: actual.sourceConvention,
+                acquisitionConsistency: actual.acquisitionConsistency,
+                originUncertainty: actual.originUncertainty,
+                totalMismatch: actual.totalMismatch,
+                mirrorConflict: actual.mirrorConflict,
+                pendingPartial: actual.pendingPartial
+            )
+            XCTAssertEqual(normalized, expected)
+            XCTAssertEqual(entry.harness, "codex")
+            XCTAssertNil(entry.lastErrorCode)
+        }
     }
 
     func testDecodedEngineFailedRequiresReopen() throws {

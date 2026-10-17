@@ -1,7 +1,26 @@
 {
-  "open": {"data_dir": "/quotern-golden/data", "home": "/quotern-golden/home"},
-  "set_source_selection": {"harness": "opencode", "root": "/quotern-golden/opencode", "selected": true},
+  "open": {
+    "data_dir": "/quotern-golden/data",
+    "home": "/quotern-golden/home"
+  },
+  "set_source_selection": [
+    {
+      "harness": "opencode",
+      "root": "/quotern-golden/opencode",
+      "selected": true
+    },
+    {
+      "harness": "codex",
+      "root": "/quotern-golden/codex",
+      "selected": true
+    }
+  ],
   "list_sources": {},
-  "ingest": {"now_ms": 1775124000000},
-  "today_snapshot": {"tz": "UTC", "now_ms": 1775124000000}
+  "ingest": {
+    "now_ms": 1775124000000
+  },
+  "today_snapshot": {
+    "tz": "UTC",
+    "now_ms": 1775124000000
+  }
 }

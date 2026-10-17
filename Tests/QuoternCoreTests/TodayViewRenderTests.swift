@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftUI
 import XCTest
 @testable import QuoternCore
@@ -142,9 +143,67 @@ final class TodayViewRenderTests: XCTestCase {
         let partial = try Render.snapshot("snapshot-pending-partial.json")
         for dark in [false, true] {
             let rendered = Render.render(Render.model(.success(partial), nowMs: t), dark: dark)
-            XCTAssertTrue(rendered.rows.allSatisfy { $0.value.hasSuffix(", Partial, Error, \(atTen)") }, "\(rendered.rows)")
+            let opencodeRows = rendered.rows.filter { $0.label.contains("OpenCode reported tokens") }
+            XCTAssertEqual(opencodeRows.count, 6)
+            XCTAssertTrue(opencodeRows.allSatisfy { $0.value.hasSuffix(", Partial, Error, \(atTen)") }, "\(opencodeRows)")
+            XCTAssertEqual(rendered.text("Total, Codex reported tokens in codex-home")?.value, "7 tokens, Reported, Current, Updated just now")
             XCTAssertTrue(rendered.texts.contains { $0.value == "Last read failed. Refresh to try again." }, "\(rendered.texts)")
             try Render.save(rendered, as: dark ? "slice-008-reported-partial-dark" : "slice-008-reported-partial")
+        }
+    }
+
+    func testCodexRowsLabelledReportedOriginUnverified() throws {
+        let snapshot = try Render.snapshot("snapshot-codex-basic.json")
+        let now: Int64 = 1_774_785_600_000
+        for dark in [false, true] {
+            let rendered = Render.render(Render.model(.success(snapshot), nowMs: now), dark: dark)
+            XCTAssertLessThanOrEqual(rendered.view.fittingSize.width, PopoverView.width)
+            let rows = Dictionary(uniqueKeysWithValues: rendered.rows.map { ($0.label, $0.value) })
+            XCTAssertEqual(rows.count, 12)
+            for (label, value) in [
+                ("Total", "2,050 tokens, Reported, Current, Updated just now"),
+                ("Input", "1,700 tokens, Reported, Current, Updated just now"),
+                ("Output", "350 tokens, Reported, Current, Updated just now"),
+                ("Reasoning", "120 tokens, Reported, Current, Updated just now"),
+                ("Cache read", "800 tokens, Reported, Current, Updated just now"),
+                ("Cache write", "100 tokens, Reported, Partial, Current, Updated just now"),
+            ] {
+                XCTAssertEqual(rows["\(label), Codex reported tokens in codex-home"], value)
+            }
+            for label in ["Input", "Total"] {
+                XCTAssertEqual(rows["\(label), Codex reported tokens in codex-headers"], "100 tokens, Reported, Partial, Current, Updated just now")
+            }
+            for label in ["Output", "Reasoning", "Cache read", "Cache write"] {
+                XCTAssertEqual(rows["\(label), Codex reported tokens in codex-headers"], "Unavailable, Updated at 12:00\u{202F}PM")
+            }
+            XCTAssertEqual(rendered.texts.filter { $0.value == "Origin unverified" }.count, 2)
+            XCTAssertNotNil(rendered.text("Codex reported tokens, codex-home"))
+            XCTAssertNotNil(rendered.text("Codex reported tokens, codex-headers"))
+            XCTAssertFalse(rendered.texts.contains { ($0.label + $0.value).localizedCaseInsensitiveContains("measured") })
+            try Render.save(rendered, as: "slice-011-codex-\(dark ? "dark" : "light")")
+        }
+        let catching = try Render.snapshot("snapshot-catching-up.json")
+        let rendered = Render.render(Render.model(.success(catching), nowMs: t), dark: false)
+        XCTAssertEqual(rendered.text("Total, Codex reported tokens in codex-home")?.value, "7 tokens, Reported, Catching up, \(atTen)")
+        XCTAssertTrue(rendered.texts.contains { $0.value == "Reading earlier activity; totals may rise." })
+        rendered.window.orderOut(nil)
+    }
+
+    func testCodexStaleKeepsLastGoodAndUnavailable() async throws {
+        let world = try CodexWorld()
+        let client = EngineClient()
+        let now: Int64 = 1_790_769_600_000
+        try await client.open(world.config)
+        _ = try await client.setSourceSelection(world.selection)
+        _ = try await client.ingest(nowMs: now)
+        let stale = try await client.todaySnapshot(tz: "UTC", nowMs: now + 600_001)
+        await client.close()
+        for dark in [false, true] {
+            let rendered = Render.render(Render.model(.success(stale), nowMs: now + 600_001), dark: dark)
+            XCTAssertEqual(rendered.text("Total, Codex reported tokens")?.value, "10 tokens, Reported, Stale, Updated at 12:00\u{202F}PM")
+            XCTAssertEqual(rendered.text("Output, Codex reported tokens")?.value, "Unavailable, Updated at 12:00\u{202F}PM")
+            XCTAssertTrue(rendered.texts.contains { $0.value == "Origin unverified" })
+            rendered.window.orderOut(nil)
         }
     }
 

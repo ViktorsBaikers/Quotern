@@ -198,6 +198,25 @@ final class World {
     }
 }
 
+/// A real selected Codex source in an isolated home, shared by client, watcher and sink tests.
+final class CodexWorld {
+    let base: URL
+    var home: String { base.appendingPathComponent("home").path }
+    var source: String { base.appendingPathComponent("codex-home").path }
+    var data: String { base.appendingPathComponent("data").path }
+    var config: EngineConfig { EngineConfig(dataDir: data, home: home) }
+    var selection: SourceSelection { SourceSelection(harness: "codex", root: source, selected: true) }
+    var rollout: URL { URL(fileURLWithPath: source + "/sessions/2026/09/30/rollout-2026-09-30T09-00-00-journey.jsonl") }
+
+    init() throws {
+        base = try Support.canonicalTemporaryDirectory()
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: false)
+        try FileManager.default.copyItem(at: Support.root.appendingPathComponent("Fixtures/journey-home/.codex"), to: URL(fileURLWithPath: source))
+    }
+
+    deinit { Support.remove(base) }
+}
+
 /// A controlled `/usr/bin/sqlite3` writer child: stdin piped, applies the schema in WAL mode and
 /// stays open, so `-wal` and `-shm` exist until `quit()`.
 final class WalWriter: Sendable {
@@ -555,7 +574,7 @@ extension BridgeRoundTripTests {
         let client = EngineClient()
         try await client.open(world.config)
         for selection in [
-            SourceSelection(harness: "codex", root: world.source, selected: true),
+            SourceSelection(harness: "cursor", root: world.source, selected: true),
             SourceSelection(harness: "opencode", root: "relative", selected: true),
             SourceSelection(harness: "opencode", root: world.source, selected: false),
         ] {

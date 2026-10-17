@@ -87,10 +87,7 @@ fn file_sinks(root: &Path) -> std::io::Result<Vec<Sink>> {
     let mut pending = vec![root.to_path_buf()];
     let mut sinks = Vec::new();
     while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries {
+        for entry in std::fs::read_dir(&directory)? {
             let entry = entry?;
             let path = entry.path();
             let kind = entry.file_type()?;
@@ -156,10 +153,16 @@ struct Session {
     responses: BTreeMap<String, Vec<u8>>,
     data: PathBuf,
     failed: bool,
+    storage_present_at_open: bool,
 }
 
 impl Session {
     fn open(data: &Path, home: &Path) -> TestResult<Self> {
+        let storage_present_at_open = match std::fs::symlink_metadata(data) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
         let config = CString::new(json!({"data_dir": data, "home": home}).to_string())?;
         let mut engine = std::ptr::null_mut();
         let response = text(unsafe { quotern_engine_open(config.as_ptr(), &mut engine) });
@@ -169,6 +172,7 @@ impl Session {
             responses: BTreeMap::new(),
             data: data.to_path_buf(),
             failed: false,
+            storage_present_at_open,
         };
         session.record("open-response", &response);
         Ok(session)
@@ -208,7 +212,15 @@ impl Session {
 
     /// Every sink of the current state: files, responses and the table dump.
     fn sinks(&self) -> TestResult<Vec<Sink>> {
-        let mut sinks = file_sinks(&self.data)?;
+        // A fresh engine creates no storage until its first accepted selection.
+        let absent_preselection = !self.storage_present_at_open
+            && !self.responses.contains_key("set_source_selection-response")
+            && matches!(std::fs::symlink_metadata(&self.data), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+        let mut sinks = if absent_preselection {
+            Vec::new()
+        } else {
+            file_sinks(&self.data)?
+        };
         for name in SERIALIZED_SINKS {
             if name != "history-table-dump" {
                 sinks.push(Sink {
@@ -219,10 +231,10 @@ impl Session {
         }
         sinks.push(Sink {
             name: "history-table-dump".to_owned(),
-            bytes: if self.data.join("history.sqlite").exists() {
-                table_dump(&self.data)?
-            } else {
+            bytes: if absent_preselection {
                 Vec::new()
+            } else {
+                table_dump(&self.data)?
             },
         });
         Ok(sinks)
@@ -426,6 +438,121 @@ fn opencode_text_and_hostile_requests_never_reach_bridge_sinks() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn codex_text_and_hostile_requests_never_reach_bridge_sinks() -> TestResult {
+    use std::io::Write;
+    let directory = tempfile::tempdir()?;
+    let base = directory.path().canonicalize()?;
+    let (data, home, source) = (
+        base.join("data"),
+        base.join("home"),
+        base.join("codex-home"),
+    );
+    std::fs::create_dir(&home)?;
+    std::fs::create_dir_all(source.join("sessions/2026/04/02"))?;
+    let session_id = "0195f000-0000-7000-8000-00000000ff01";
+    let header = json!({"timestamp": "2026-04-02T09:00:00.000Z", "type": "session_meta", "payload": {"id": session_id, "source": "cli", "cli_version": "0.153.0", "cwd": SENTINEL, "instructions": SENTINEL}});
+    let record = |response: &str, input: u64| json!({"timestamp": "2026-04-02T09:01:00.000Z", "type": "token_usage_record", "payload": {"thread_id": session_id, "session_id": session_id, "response_id": response, "model": SENTINEL, "provider": SENTINEL, "content": SENTINEL, "usage": {"input_tokens": input, "total_tokens": input}}});
+    let path = source.join("sessions/2026/04/02/rollout-sentinel.jsonl");
+    std::fs::write(&path, format!("{header}\n{}\n", record("resp", 10)))?;
+    std::fs::write(
+        source.join("auth.json"),
+        format!("{{\"api_key\":\"{SENTINEL}\"}}"),
+    )?;
+    let before = file_sinks(&source)?
+        .into_iter()
+        .map(|sink| (sink.name, sink.bytes))
+        .collect::<BTreeMap<_, _>>();
+    assert!(before.values().any(|bytes| contains_sentinel(bytes)));
+    let mut session = Session::open(&data, &home)?;
+    hostile(&mut session);
+    let mut scanned = session.assert_clean()?;
+    assert_eq!(
+        session.call(
+            "set_source_selection",
+            &json!({"harness": "codex", "root": source, "selected": true}).to_string()
+        )["ok"],
+        json!(true)
+    );
+    assert_eq!(
+        session.call("ingest", &json!({"now_ms": T}).to_string())["ok"],
+        json!(true)
+    );
+    let snapshot = session.call(
+        "today_snapshot",
+        &json!({"tz": "UTC", "now_ms": T}).to_string(),
+    );
+    assert_eq!(snapshot["data"]["by_source"][0]["harness"], json!("codex"));
+    assert_eq!(
+        snapshot["data"]["source_reported"][0]["input"]["value"],
+        json!(10)
+    );
+    assert_eq!(
+        snapshot["data"]["source_reported"][0]["origin_uncertainty"],
+        json!("unverified_origin")
+    );
+    session.call("list_sources", "{}");
+    scanned += session.assert_clean()?;
+    assert_eq!(
+        file_sinks(&source)?
+            .into_iter()
+            .map(|sink| (sink.name, sink.bytes))
+            .collect::<BTreeMap<_, _>>(),
+        before
+    );
+    let token = quotern_cancel_new();
+    unsafe { quotern_cancel_trigger(token) };
+    let (name, body) = (
+        CString::new("ingest")?,
+        CString::new(json!({"now_ms": T + 1}).to_string())?,
+    );
+    let cancelled =
+        text(unsafe { quotern_call(session.engine, name.as_ptr(), body.as_ptr(), token) });
+    unsafe { quotern_cancel_free(token) };
+    assert_eq!(
+        serde_json::from_str::<Value>(&cancelled)?["error"]["code"],
+        json!("cancelled")
+    );
+    session.record("error-responses", &cancelled);
+    scanned += session.assert_clean()?;
+    writeln!(
+        std::fs::OpenOptions::new().append(true).open(&path)?,
+        "{}",
+        record("resp_later", 5)
+    )?;
+    quotern_core::store::panic_next_commit();
+    assert_eq!(
+        session.call("ingest", &json!({"now_ms": T + 2}).to_string())["error"]["code"],
+        json!("internal_panic")
+    );
+    session.failed = true;
+    for method in ["list_sources", "today_snapshot", "ingest"] {
+        assert_eq!(
+            session.call(method, "{}")["error"]["code"],
+            json!("engine_failed")
+        );
+    }
+    scanned += session.assert_clean()?;
+    drop(session);
+    let mut reopened = Session::open(&data, &home)?;
+    assert_eq!(
+        reopened.call("ingest", &json!({"now_ms": T + 3}).to_string())["ok"],
+        json!(true)
+    );
+    let snapshot = reopened.call(
+        "today_snapshot",
+        &json!({"tz": "UTC", "now_ms": T}).to_string(),
+    );
+    assert_eq!(
+        snapshot["data"]["source_reported"][0]["total"]["value"],
+        json!(15)
+    );
+    hostile(&mut reopened);
+    scanned += reopened.assert_clean()?;
+    assert!(scanned > 20, "states scanned: {scanned}");
+    Ok(())
+}
+
 /// The inventory is falsifiable: a planted leak, an undeclared sink and a declared sink the scan
 /// never reached are each rejected with attribution.
 #[test]
@@ -498,5 +625,85 @@ fn sink_inventory_rejects_extra_and_unscanned_sinks() -> TestResult {
         BTreeSet::from(["history-table-dump".to_owned()])
     );
     assert!(found.leaks.is_empty() && found.unexpected.is_empty());
+    Ok(())
+}
+
+#[test]
+fn sink_enumeration_rejects_inaccessible_directory() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    assert_ne!(
+        unsafe { geteuid() },
+        0,
+        "permission control requires non-root"
+    );
+    let (_directory, data, home, source) = world()?;
+    let mut session = Session::open(&data, &home)?;
+    assert!(!data.exists());
+    assert_eq!(
+        session.sinks()?.len(),
+        SERIALIZED_SINKS.len(),
+        "absent preselection storage is legitimate"
+    );
+    assert_eq!(
+        session.call(
+            "set_source_selection",
+            &json!({"harness": "opencode", "root": source, "selected": true}).to_string()
+        )["ok"],
+        json!(true)
+    );
+    let hidden = data.join("inaccessible");
+    std::fs::create_dir(&hidden)?;
+    std::fs::write(hidden.join("diagnostics.log"), SENTINEL)?;
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000))?;
+    let inaccessible = session.sinks();
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700))?;
+    let error = inaccessible
+        .err()
+        .ok_or("unreadable sink directory was silently skipped")?;
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::PermissionDenied)
+    );
+    assert!(
+        scan(&session.sinks()?, &declared(&session.sinks()?))
+            .leaks
+            .contains("file:inaccessible/diagnostics.log")
+    );
+    assert!(
+        file_sinks(&data.join("missing")).is_err(),
+        "raw traversal never hides a missing root"
+    );
+    Ok(())
+}
+
+#[test]
+fn sink_enumeration_rejects_missing_reopened_storage() -> TestResult {
+    let (_directory, data, home, source) = world()?;
+    let mut session = Session::open(&data, &home)?;
+    assert_eq!(
+        session.call(
+            "set_source_selection",
+            &json!({"harness": "opencode", "root": source, "selected": true}).to_string()
+        )["ok"],
+        json!(true)
+    );
+    drop(session);
+    let reopened = Session::open(&data, &home)?;
+    std::fs::rename(&data, data.with_extension("moved"))?;
+    let error = reopened
+        .sinks()
+        .err()
+        .ok_or("missing existing storage was treated as preselection")?;
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::NotFound)
+    );
     Ok(())
 }

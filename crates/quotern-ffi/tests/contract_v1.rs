@@ -339,15 +339,16 @@ impl Drop for Live {
 fn make_source(base: &Path, source_rows: &[Value]) -> TestResult {
     std::fs::create_dir(base.join("source"))?;
     std::fs::create_dir(base.join("home"))?;
-    let connection = Connection::open(base.join("source/opencode.db"))?;
+    let mut connection = Connection::open(base.join("source/opencode.db"))?;
     let schema: String = include_str!("../../../Fixtures/harness/opencode/wal/schema.sql")
         .lines()
         .filter(|line| !line.trim_start().starts_with("PRAGMA"))
         .collect::<Vec<_>>()
         .join("\n");
     connection.execute_batch(&schema)?;
+    let transaction = connection.transaction()?;
     for row in source_rows {
-        connection.execute(
+        transaction.execute(
             "INSERT INTO message(id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![
                 row["id"].as_str().unwrap(),
@@ -357,6 +358,7 @@ fn make_source(base: &Path, source_rows: &[Value]) -> TestResult {
             ],
         )?;
     }
+    transaction.commit()?;
     drop(connection);
     Ok(())
 }
@@ -386,7 +388,14 @@ fn first_use_request_goldens_use_production_codec() -> TestResult {
     let directory = tempfile::tempdir()?;
     let base = directory.path().canonicalize()?;
     make_source(&base, &daily_rows())?;
-    let requests = consumed_golden("requests-first-use.json")?;
+    let mut requests = consumed_golden("requests-first-use.json")?;
+    let selections = requests["set_source_selection"].as_array().unwrap().clone();
+    assert_eq!(selections.len(), 2);
+    for selection in &selections {
+        let written = request_round_trip("set_source_selection", &selection.to_string())?;
+        assert_eq!(serde_json::from_str::<Value>(&written)?, *selection);
+    }
+    requests["set_source_selection"] = selections[0].clone();
     let methods: Vec<&str> = requests
         .as_object()
         .unwrap()
@@ -568,7 +577,7 @@ fn first_use_request_goldens_use_production_codec() -> TestResult {
         (
             "unimplemented harness",
             edited(selection, &|o| {
-                o.insert("harness".into(), json!("codex"));
+                o.insert("harness".into(), json!("cursor"));
             }),
             "harness",
         ),
@@ -580,6 +589,40 @@ fn first_use_request_goldens_use_production_codec() -> TestResult {
             label,
         );
     }
+    let codex_root = base.join("codex");
+    copy_codex_fixture(
+        &codex_root,
+        "basic",
+        "sessions/2026/03/29/rollout-2026-03-29T09-00-00-basic.jsonl",
+    )?;
+    let codex_request = selections[1]
+        .to_string()
+        .replace("/quotern-golden/codex", codex_root.to_str().unwrap());
+    assert_eq!(
+        live.call("set_source_selection", &codex_request)["ok"],
+        json!(true)
+    );
+    assert_eq!(
+        live.call("ingest", &json!({"now_ms": CODEX_T}).to_string())["ok"],
+        json!(true)
+    );
+    let codex_snapshot = live.call(
+        "today_snapshot",
+        &json!({"tz": "UTC", "now_ms": CODEX_T}).to_string(),
+    );
+    let codex_entry = codex_snapshot["data"]["by_source"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["harness"] == "codex")
+        .unwrap();
+    let codex_reported = codex_snapshot["data"]["source_reported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["source_id"] == codex_entry["source_id"])
+        .unwrap();
+    assert_eq!(codex_reported["total"]["value"], json!(2050));
     let long_tz = edited(&requests["today_snapshot"], &|o| {
         o.insert("tz".into(), json!("a".repeat(4_097)));
     });
@@ -604,19 +647,39 @@ const ID: &str = "0123456789abcdef0123456789abcdef";
 
 /// Replaces the store-minted id with the golden's fixed one.
 fn normalized(mut value: Value) -> Value {
-    fn walk(value: &mut Value) {
+    let mut ids = std::collections::BTreeMap::new();
+    if let Some(entries) = value["data"]["by_source"].as_array() {
+        for entry in entries {
+            let stable = match (entry["harness"].as_str(), entry["root_display"].as_str()) {
+                (Some("codex"), Some("codex-headers")) => "2123456789abcdef0123456789abcdef",
+                (Some("codex"), _) => "1123456789abcdef0123456789abcdef",
+                _ => ID,
+            };
+            ids.insert(entry["source_id"].as_str().unwrap().to_owned(), stable);
+        }
+    }
+    fn walk(value: &mut Value, ids: &std::collections::BTreeMap<String, &str>) {
         match value {
             Value::Object(map) => {
                 if let Some(id) = map.get_mut("source_id") {
-                    *id = json!(ID);
+                    *id = json!(ids.get(id.as_str().unwrap()).copied().unwrap_or(ID));
                 }
-                map.values_mut().for_each(walk);
+                map.values_mut().for_each(|value| walk(value, ids));
             }
-            Value::Array(items) => items.iter_mut().for_each(walk),
+            Value::Array(items) => items.iter_mut().for_each(|value| walk(value, ids)),
             _ => {}
         }
     }
-    walk(&mut value);
+    walk(&mut value, &ids);
+    for key in ["by_source", "source_reported"] {
+        if let Some(entries) = value
+            .get_mut("data")
+            .and_then(|data| data.get_mut(key))
+            .and_then(Value::as_array_mut)
+        {
+            entries.sort_by_key(|entry| entry["source_id"].as_str().unwrap().to_owned());
+        }
+    }
     value
 }
 
@@ -625,6 +688,99 @@ fn normalized(mut value: Value) -> Value {
 fn check_golden(name: &str, actual: Value) -> TestResult {
     assert_eq!(consumed_golden(name)?, actual, "{name}");
     Ok(())
+}
+
+const CODEX_T: i64 = 1_774_785_600_000;
+
+fn copy_codex_fixture(root: &Path, fixture: &str, relative: &str) -> TestResult {
+    let destination = root.join(relative);
+    std::fs::create_dir_all(destination.parent().unwrap())?;
+    std::fs::copy(
+        self::root()
+            .join("Fixtures/harness/codex")
+            .join(fixture)
+            .join(relative),
+        destination,
+    )?;
+    Ok(())
+}
+
+fn codex_small_file() -> String {
+    let session = "0195f000-0000-7000-8000-00000000ff01";
+    format!(
+        "{}\n{}\n",
+        json!({"timestamp": "2026-04-02T09:00:00.000Z", "type": "session_meta", "payload": {"id": session, "source": "cli", "cli_version": "0.153.0"}}),
+        json!({"timestamp": "2026-04-02T09:01:00.000Z", "type": "token_usage_record", "payload": {"thread_id": session, "session_id": session, "response_id": "resp", "usage": {"input_tokens": 7, "total_tokens": 7}}})
+    )
+}
+
+fn codex_small_root(live: &Live, tail: &str) -> TestResult<PathBuf> {
+    let root = live.base().join("codex-home");
+    std::fs::create_dir_all(root.join("sessions/2026/04/02"))?;
+    std::fs::write(
+        root.join("sessions/2026/04/02/rollout-small.jsonl"),
+        codex_small_file() + tail,
+    )?;
+    select_codex(live, &root);
+    Ok(root)
+}
+
+fn select_codex(live: &Live, root: &Path) {
+    let selected = live.call(
+        "set_source_selection",
+        &json!({"harness": "codex", "root": root, "selected": true}).to_string(),
+    );
+    assert_eq!(selected["ok"], json!(true), "{selected}");
+}
+
+#[test]
+fn codex_golden_equals_provider_serialization() -> TestResult {
+    let (live, _) = open_live(&[])?;
+    let basic = live.base().join("codex-home");
+    copy_codex_fixture(
+        &basic,
+        "basic",
+        "sessions/2026/03/29/rollout-2026-03-29T09-00-00-basic.jsonl",
+    )?;
+    let headers = live.base().join("codex-headers");
+    copy_codex_fixture(
+        &headers,
+        "headers",
+        "sessions/2026/03/29/rollout-2026-03-29T11-00-00-appended.jsonl",
+    )?;
+    select_codex(&live, &basic);
+    select_codex(&live, &headers);
+    ingest_at(&live, CODEX_T);
+    let actual = normalized(live.call(
+        "today_snapshot",
+        &json!({"tz": "UTC", "now_ms": CODEX_T}).to_string(),
+    ));
+    let oracle: Value = serde_json::from_str(include_str!(
+        "../../../Fixtures/harness/codex/basic/expected.json"
+    ))?;
+    let mut expected = oracle["snapshot"]["source_reported"].clone();
+    expected["source_id"] = json!("1123456789abcdef0123456789abcdef");
+    assert_eq!(actual["data"]["source_reported"][0], expected);
+    let headers_oracle: Value = serde_json::from_str(include_str!(
+        "../../../Fixtures/harness/codex/headers/expected.json"
+    ))?;
+    for (field, observation) in headers_oracle["scenarios"]["appended_header"]["projection"]
+        .as_object()
+        .unwrap()
+    {
+        if observation.is_object() {
+            for (key, value) in observation.as_object().unwrap() {
+                assert_eq!(
+                    actual["data"]["source_reported"][1][field][key], *value,
+                    "{field}.{key}"
+                );
+            }
+        } else {
+            assert_eq!(actual["data"]["source_reported"][1][field], *observation);
+        }
+    }
+    assert_eq!(actual["data"].as_object().unwrap().len(), 3);
+    check_golden("snapshot-codex-basic.json", actual)
 }
 
 const T: i64 = 1_775_124_000_000;
@@ -881,6 +1037,7 @@ fn every_golden_is_inventoried_by_a_live_comparison() -> TestResult {
                 "open-ok.json",
                 "requests-first-use.json",
                 "snapshot-catching-up.json",
+                "snapshot-codex-basic.json",
                 "snapshot-empty.json",
                 "snapshot-opencode-reported.json",
                 "snapshot-pending-partial.json",
@@ -891,6 +1048,7 @@ fn every_golden_is_inventoried_by_a_live_comparison() -> TestResult {
         ),
         "the 001 golden set plus the 008 lifecycle states"
     );
+    codex_golden_equals_provider_serialization()?;
     open_and_first_use_goldens_equal_live_responses()?;
     empty_inventory_and_error_goldens_equal_live_responses()?;
     pending_and_catching_up_goldens_equal_live_responses()?;
@@ -970,13 +1128,18 @@ fn pending_and_catching_up_goldens_equal_live_responses() -> TestResult {
         "set_source_selection",
         &json!({"harness": "opencode", "root": live.source(), "selected": true}).to_string(),
     );
+    let codex_root = codex_small_root(&live, "")?;
     live.call("ingest", &json!({"now_ms": T}).to_string());
+    std::fs::write(
+        codex_root.join("sessions/2026/04/02/rollout-small.jsonl"),
+        codex_small_file() + "{\"type\":",
+    )?;
     std::fs::write(live.source().join("opencode.db"), b"overwritten with junk")?;
     live.call("ingest", &json!({"now_ms": T + 1}).to_string());
-    let pending = live.call(
+    let pending = normalized(live.call(
         "today_snapshot",
         &json!({"tz": "UTC", "now_ms": T}).to_string(),
-    );
+    ));
     assert_eq!(
         pending["data"]["source_reported"][0]["pending_partial"],
         json!(true)
@@ -994,7 +1157,17 @@ fn pending_and_catching_up_goldens_equal_live_responses() -> TestResult {
             "{field}"
         );
     }
-    check_golden("snapshot-pending-partial.json", normalized(pending))?;
+    let pending = normalized(pending);
+    assert_eq!(
+        pending["data"]["by_source"][1]["pending_partial"],
+        json!(true)
+    );
+    assert_eq!(
+        pending["data"]["source_reported"][1]["input"]["value"],
+        json!(7),
+        "the incomplete tail adds nothing"
+    );
+    check_golden("snapshot-pending-partial.json", pending)?;
 
     // Catching up: more rows than one pass reads, so nothing is published yet.
     let bulk: Vec<Value> = (0..5_100)
@@ -1002,15 +1175,20 @@ fn pending_and_catching_up_goldens_equal_live_responses() -> TestResult {
             "data": {"role": "assistant", "tokens": {"input": 1, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}, "total": 1}}}))
         .collect();
     let (live, _) = open_live(&bulk)?;
+    let ignored = format!(
+        "{}\n",
+        json!({"type": "response_item", "payload": {"text": "x".repeat(60_000)}})
+    );
+    codex_small_root(&live, &ignored.repeat(40))?;
     live.call(
         "set_source_selection",
         &json!({"harness": "opencode", "root": live.source(), "selected": true}).to_string(),
     );
     live.call("ingest", &json!({"now_ms": T}).to_string());
-    let catching = live.call(
+    let catching = normalized(live.call(
         "today_snapshot",
         &json!({"tz": "UTC", "now_ms": T}).to_string(),
-    );
+    ));
     assert_eq!(
         catching["data"]["by_source"][0]["outcome"],
         json!("catching_up")
@@ -1034,7 +1212,39 @@ fn pending_and_catching_up_goldens_equal_live_responses() -> TestResult {
             "{field}"
         );
     }
-    check_golden("snapshot-catching-up.json", normalized(catching))?;
+    assert_eq!(
+        catching["data"]["by_source"][1]["outcome"],
+        json!("catching_up")
+    );
+    assert_eq!(
+        catching["data"]["source_reported"][1]["input"]["value"],
+        json!(7)
+    );
+    check_golden("snapshot-catching-up.json", catching)?;
+    for index in 1..=8 {
+        ingest_at(&live, T + index);
+        if normalized(live.call(
+            "today_snapshot",
+            &json!({"tz": "UTC", "now_ms": T + index}).to_string(),
+        ))["data"]["by_source"][1]["outcome"]
+            == "consistent"
+        {
+            break;
+        }
+    }
+    let drained = normalized(live.call(
+        "today_snapshot",
+        &json!({"tz": "UTC", "now_ms": T + 8}).to_string(),
+    ));
+    assert_eq!(
+        drained["data"]["by_source"][1]["outcome"],
+        json!("consistent")
+    );
+    assert_eq!(
+        drained["data"]["source_reported"][1]["input"]["value"],
+        json!(7),
+        "continuation drains without duplicates"
+    );
     Ok(())
 }
 
@@ -1427,6 +1637,7 @@ fn observation_shape_rejects_mutated_goldens() -> TestResult {
     for name in [
         "snapshot-states.json",
         "snapshot-opencode-reported.json",
+        "snapshot-codex-basic.json",
         "snapshot-catching-up.json",
         "snapshot-pending-partial.json",
         "snapshot-empty.json",

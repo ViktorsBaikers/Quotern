@@ -528,7 +528,7 @@ fn fresh_open_creates_nothing_until_first_valid_selection() -> TestResult {
     // Invalid and denied first selections create nothing.
     let invalid = live.call(
         "set_source_selection",
-        &json!({"harness": "codex", "root": world.source(), "selected": true}).to_string(),
+        &json!({"harness": "cursor", "root": world.source(), "selected": true}).to_string(),
     );
     assert_eq!(code(&invalid).0, "invalid_request");
     let relative = live.call(
@@ -552,6 +552,444 @@ fn fresh_open_creates_nothing_until_first_valid_selection() -> TestResult {
     live.ingest(T);
     let id = live.id_of("source");
     assert_eq!(live.input(&id), json!(ORACLE_A));
+    Ok(())
+}
+
+fn select_codex(live: &Live, root: &Path) -> Value {
+    live.call(
+        "set_source_selection",
+        &json!({"harness": "codex", "root": root, "selected": true}).to_string(),
+    )
+}
+
+fn basic_codex(root: &Path) -> TestResult {
+    let relative = "sessions/2026/03/29/rollout-2026-03-29T09-00-00-basic.jsonl";
+    std::fs::create_dir_all(root.join(relative).parent().unwrap())?;
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Fixtures/harness/codex/basic")
+            .join(relative),
+        root.join(relative),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn codex_selection_attaches_to_the_one_store() -> TestResult {
+    let world = World::with_source(&daily_rows())?;
+    let root = world.named("codex-home");
+    basic_codex(&root)?;
+    let oracle: Value = serde_json::from_str(include_str!(
+        "../../../Fixtures/harness/codex/basic/expected.json"
+    ))?;
+    let now = oracle["pass_now_ms"].as_i64().unwrap();
+    let live = world.live();
+    assert_eq!(live.select(&world.source())["ok"], json!(true));
+    assert_eq!(select_codex(&live, &root)["ok"], json!(true));
+    assert_eq!(live.ingest(now)["ok"], json!(true));
+    let id = live.id_of("codex-home");
+    let snapshot = live.call(
+        "today_snapshot",
+        &json!({"tz": "UTC", "now_ms": now}).to_string(),
+    );
+    let mut entry = entry_of(&snapshot["data"]["by_source"], &id);
+    entry.as_object_mut().unwrap().remove("source_id");
+    assert_eq!(entry, oracle["snapshot"]["by_source"]);
+    assert_eq!(
+        without_id(reported_of(&snapshot, &id)),
+        oracle["snapshot"]["source_reported"]
+    );
+    assert_eq!(live.input(&live.id_of("source")), json!(ORACLE_A));
+    assert_eq!(snapshot["data"]["by_source"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        snapshot["data"].as_object().unwrap().len(),
+        3,
+        "only the existing DTO keys"
+    );
+    drop(live);
+    let reopened = world.live();
+    assert_eq!(reopened.ingest(now + 1)["ok"], json!(true));
+    let replay = reopened.call(
+        "today_snapshot",
+        &json!({"tz": "UTC", "now_ms": now}).to_string(),
+    );
+    assert_eq!(
+        acquired(&reported_of(&replay, &id)),
+        acquired(&reported_of(&snapshot, &id)),
+        "reattach and replay add zero"
+    );
+    Ok(())
+}
+
+#[test]
+fn codex_selection_on_opencode_root_refused() -> TestResult {
+    let world = World::with_source(&daily_rows())?;
+    let live = world.live();
+    assert_eq!(live.select(&world.source())["ok"], json!(true));
+    live.ingest(T);
+    let before = history_image(&world.data());
+    let listed = live.sources();
+    let id = live.id_of("source");
+    let acquired_before = acquired(&reported_of(&live.snapshot(), &id));
+    for selected in [true, false] {
+        let response = live.call(
+            "set_source_selection",
+            &json!({"harness": "codex", "root": world.source(), "selected": selected}).to_string(),
+        );
+        assert_eq!(
+            response["ok"],
+            json!(false),
+            "cross-harness selection {selected}"
+        );
+        assert_eq!(
+            code(&response),
+            ("invalid_request", "invalid request: root", false)
+        );
+        assert_eq!(history_image(&world.data()), before);
+        assert_eq!(live.sources(), listed);
+        assert_eq!(
+            acquired(&reported_of(&live.snapshot(), &id)),
+            acquired_before
+        );
+    }
+    assert_eq!(history_image(&world.data()), before);
+    assert_eq!(live.sources(), listed);
+    assert_eq!(live.input(&live.id_of("source")), json!(ORACLE_A));
+    Ok(())
+}
+
+#[test]
+fn opencode_selection_on_codex_root_refused() -> TestResult {
+    let world = World::new()?;
+    let root = world.named("codex-home");
+    codex_file(&root, 0, 10)?;
+    let live = world.live();
+    assert_eq!(select_codex(&live, &root)["ok"], json!(true));
+    assert_eq!(live.ingest(T)["ok"], json!(true));
+    let id = live.id_of("codex-home");
+    let before = history_image(&world.data());
+    let listed = live.sources();
+    let acquired_before = acquired(&reported_of(&live.snapshot(), &id));
+    for selected in [true, false] {
+        let response = live.call(
+            "set_source_selection",
+            &json!({"harness": "opencode", "root": root, "selected": selected}).to_string(),
+        );
+        assert_eq!(
+            response["ok"],
+            json!(false),
+            "cross-harness selection {selected}"
+        );
+        assert_eq!(
+            code(&response),
+            ("invalid_request", "invalid request: root", false)
+        );
+        assert_eq!(history_image(&world.data()), before);
+        assert_eq!(live.sources(), listed);
+        assert_eq!(
+            acquired(&reported_of(&live.snapshot(), &id)),
+            acquired_before
+        );
+        assert_eq!(live.input(&id), json!(10));
+    }
+    Ok(())
+}
+
+fn codex_file(root: &Path, index: u32, input: u64) -> TestResult<PathBuf> {
+    let session = format!("0195f000-0000-7000-8000-{index:012x}");
+    let directory = root.join("sessions/2026/04/02");
+    std::fs::create_dir_all(&directory)?;
+    let file = directory.join(format!("rollout-{index}.jsonl"));
+    let text = format!(
+        "{}\n{}\n",
+        json!({"timestamp": "2026-04-02T09:00:00.000Z", "type": "session_meta", "payload": {"id": session, "source": "cli", "cli_version": "0.153.0"}}),
+        json!({"timestamp": "2026-04-02T09:01:00.000Z", "type": "token_usage_record", "payload": {"thread_id": session, "session_id": session, "response_id": "resp", "usage": {"input_tokens": input, "total_tokens": input}}})
+    );
+    std::fs::write(&file, text)?;
+    Ok(file)
+}
+
+#[test]
+fn codex_denial_persists_without_acquisition_and_reenable_recovers() -> TestResult {
+    assert!(!root_euid_is_zero(), "permission control requires non-root");
+    let world = World::with_source(&daily_rows())?;
+    let root = world.named("codex-home");
+    codex_file(&root, 0, 10)?;
+    let live = world.live();
+    assert_eq!(live.select(&world.source())["ok"], json!(true));
+    assert_eq!(select_codex(&live, &root)["ok"], json!(true));
+    assert_eq!(live.ingest(T)["ok"], json!(true));
+    let id = live.id_of("codex-home");
+    assert_eq!(live.input(&id), json!(10));
+    let acquired_before = acquired(&reported_of(&live.snapshot(), &id));
+    let denied = live.call(
+        "set_source_selection",
+        &json!({"harness": "codex", "root": root, "selected": false}).to_string(),
+    );
+    assert_eq!(denied["ok"], json!(true));
+    assert_eq!(
+        entry_of(&denied["data"]["sources"], &id)["consent"],
+        json!("denied")
+    );
+    let denied_rows = durable_rows(&world.data(), &id)?;
+    codex_file(&root, 1, 3)?;
+    set_mode(&root.join("sessions"), 0o000)?;
+    assert!(
+        std::fs::read_dir(root.join("sessions")).is_err(),
+        "source is inaccessible"
+    );
+    add_rows(&world.source(), &[message("after-denial", 1, T + 1)])?;
+    let mut live = live;
+    for reopened in [false, true] {
+        if reopened {
+            drop(live);
+            live = world.live();
+        }
+        assert_eq!(
+            entry_of(&live.sources()["data"]["sources"], &id)["consent"],
+            json!("denied")
+        );
+        assert_eq!(live.ingest(T + 2)["ok"], json!(true));
+        assert_eq!(
+            live.input(&live.id_of("source")),
+            json!(28),
+            "OpenCode still acquires"
+        );
+        assert_eq!(
+            acquired(&reported_of(&live.snapshot(), &id)),
+            acquired_before
+        );
+        assert_eq!(
+            durable_rows(&world.data(), &id)?,
+            denied_rows,
+            "denial prevents acquisition and status writes"
+        );
+    }
+    set_mode(&root.join("sessions"), 0o700)?;
+    drop(live);
+    let live = world.live();
+    assert_eq!(select_codex(&live, &root)["ok"], json!(true));
+    assert_eq!(
+        entry_of(&live.sources()["data"]["sources"], &id)["consent"],
+        json!("enabled")
+    );
+    assert_eq!(live.ingest(T + 3)["ok"], json!(true));
+    assert_eq!(live.input(&id), json!(13));
+    let recovered = acquired(&reported_of(&live.snapshot(), &id));
+    assert_eq!(live.ingest(T + 4)["ok"], json!(true));
+    assert_eq!(
+        acquired(&reported_of(&live.snapshot(), &id)),
+        recovered,
+        "replay adds zero"
+    );
+    Ok(())
+}
+
+#[test]
+fn cancel_from_other_thread_during_codex_ingest() -> TestResult {
+    let world = World::new()?;
+    let root = world.named("codex-home");
+    for index in 0..3 {
+        codex_file(&root, index, 7)?;
+    }
+    let live = world.live();
+    assert_eq!(select_codex(&live, &root)["ok"], json!(true));
+    let id = live.id_of("codex-home");
+    let token = quotern_cancel_new();
+    let address = token as usize;
+    let commits = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = std::rc::Rc::clone(&commits);
+    quotern_core::adapters::codex::set_file_commit_hook(Some(Box::new(move || {
+        seen.set(seen.get() + 1);
+        std::thread::spawn(move || unsafe {
+            quotern_cancel_trigger(address as *const QuoternCancel)
+        })
+        .join()
+        .expect("trigger thread");
+    })));
+    let cancelled = live.call_with("ingest", &json!({"now_ms": T}).to_string(), token);
+    quotern_core::adapters::codex::set_file_commit_hook(None);
+    unsafe { quotern_cancel_free(token) };
+    assert_eq!(code(&cancelled), ("cancelled", "cancelled", true));
+    assert_eq!(commits.get(), 1);
+    let immediate = reported_of(&live.snapshot(), &id);
+    assert_eq!(
+        (&immediate["records"], &immediate["input"]["value"]),
+        (&json!(1), &json!(7)),
+        "exactly the committed file"
+    );
+    assert_eq!(live.ingest(T + 1)["ok"], json!(true));
+    assert_eq!(live.input(&id), json!(21));
+    let converged = acquired(&reported_of(&live.snapshot(), &id));
+    assert_eq!(live.ingest(T + 2)["ok"], json!(true));
+    assert_eq!(
+        acquired(&reported_of(&live.snapshot(), &id)),
+        converged,
+        "replay adds zero"
+    );
+    Ok(())
+}
+
+#[test]
+fn codex_commit_panic_recovery() -> TestResult {
+    codex_commit_panic_recovery_with_owner_unwind(false)
+}
+
+#[test]
+fn codex_commit_owner_unwind_joins_waiter_before_close() -> TestResult {
+    codex_commit_panic_recovery_with_owner_unwind(true)
+}
+
+fn codex_commit_panic_recovery_with_owner_unwind(owner_unwind: bool) -> TestResult {
+    struct OwnerUnwind;
+
+    let world = World::new()?;
+    let root = world.named("codex-home");
+    codex_file(&root, 0, 10)?;
+    let live = world.live();
+    assert_eq!(select_codex(&live, &root)["ok"], json!(true));
+    assert_eq!(live.ingest(T)["ok"], json!(true));
+    let id = live.id_of("codex-home");
+    assert_eq!(live.input(&id), json!(10));
+    codex_file(&root, 1, 3)?;
+    codex_file(&root, 2, 3)?;
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_completed = std::sync::Arc::clone(&completed);
+    let owner_completed = std::sync::Arc::clone(&completed);
+    let owner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let address = live.engine as usize;
+        let waiter = std::thread::spawn(move || {
+            if entered_rx.recv().is_err() {
+                return None;
+            }
+            reset_counters();
+            reset_dispatch_count();
+            // The main thread owns this borrowed handle, including during waiter unwind.
+            let waiting = std::mem::ManuallyDrop::new(Live {
+                engine: address as *mut QuoternEngine,
+            });
+            let response = waiting.call("list_sources", "{}");
+            assert!(
+                finish_rx.recv().is_err(),
+                "owner closes the completion gate"
+            );
+            worker_completed.store(true, std::sync::atomic::Ordering::Release);
+            Some((response, counters(), dispatch_count()))
+        });
+        let queued_seen = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = std::rc::Rc::clone(&queued_seen);
+        quotern_core::adapters::codex::set_file_commit_hook(Some(Box::new(move || {
+            entered_tx.send(()).expect("waiter listens");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while unsafe { queued_waiters(address as *const QuoternEngine) } == 0
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            seen.set(unsafe { queued_waiters(address as *const QuoternEngine) } > 0);
+            store::panic_next_commit();
+        })));
+        let mut panic = None;
+        let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic = Some(live.ingest(T + 1));
+            if owner_unwind {
+                assert!(
+                    queued_seen.get(),
+                    "owner unwind requires a real queued waiter"
+                );
+                assert!(
+                    !owner_completed.load(std::sync::atomic::Ordering::Acquire),
+                    "waiter remains owned during unwind"
+                );
+                std::panic::panic_any(OwnerUnwind);
+            }
+        }));
+        quotern_core::adapters::codex::set_file_commit_hook(None);
+        drop(finish_tx);
+        let joined = waiter.join();
+        let unwind = match called {
+            Ok(()) => None,
+            Err(payload) if payload.is::<OwnerUnwind>() => Some(payload),
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        assert!(
+            queued_seen.get(),
+            "the waiter really queued before the panic"
+        );
+        assert_eq!(
+            code(panic.as_ref().expect("ingest response")),
+            ("internal_panic", "internal panic", false)
+        );
+        assert!(
+            dispatch_count() > 0,
+            "live calls entered the observed dispatcher"
+        );
+        let (queued, io, dispatched) = joined.expect("waiter thread").expect("file committed");
+        assert_eq!(code(&queued), ("engine_failed", "engine failed", false));
+        assert_eq!(io, (0, 0));
+        reset_counters();
+        reset_dispatch_count();
+        for (method, request) in [
+            ("list_sources", "{}".to_owned()),
+            (
+                "today_snapshot",
+                json!({"tz": "UTC", "now_ms": T}).to_string(),
+            ),
+        ] {
+            assert_eq!(
+                code(&live.call(method, &request)),
+                ("engine_failed", "engine failed", false)
+            );
+        }
+        assert_eq!(
+            (dispatched, dispatch_count()),
+            (0, 0),
+            "queued waiter and both later failed-handle calls must not dispatch"
+        );
+        assert_eq!(
+            dispatched, 0,
+            "queued failed-handle waiter must not dispatch"
+        );
+        assert_eq!(counters(), (0, 0), "failed calls do no I/O");
+        assert!(
+            owner_completed.load(std::sync::atomic::Ordering::Acquire),
+            "waiter completed before owner close"
+        );
+        if let Some(payload) = unwind {
+            std::panic::resume_unwind(payload);
+        }
+        drop(live);
+    }));
+    match owner {
+        Ok(()) => assert!(!owner_unwind, "owner control must unwind"),
+        Err(payload) if owner_unwind && payload.is::<OwnerUnwind>() => {}
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+    assert!(
+        completed.load(std::sync::atomic::Ordering::Acquire),
+        "waiter completed before owner close"
+    );
+    let reopened = world.live();
+    assert_eq!(
+        reopened.input(&id),
+        json!(13),
+        "pre-panic committed history remains"
+    );
+    assert_eq!(reopened.ingest(T + 2)["ok"], json!(true));
+    assert_eq!(
+        reopened.input(&id),
+        json!(16),
+        "the rolled-back file counts once"
+    );
+    let converged = acquired(&reported_of(&reopened.snapshot(), &id));
+    assert_eq!(reopened.ingest(T + 3)["ok"], json!(true));
+    assert_eq!(
+        acquired(&reported_of(&reopened.snapshot(), &id)),
+        converged,
+        "replay adds zero"
+    );
     Ok(())
 }
 
@@ -2561,7 +2999,7 @@ fn cold_first_attach_claims_owner() -> TestResult {
     assert_eq!(counters(), (0, 0));
     let invalid = h2.call(
         "set_source_selection",
-        &json!({"harness": "codex", "root": world.source(), "selected": true}).to_string(),
+        &json!({"harness": "cursor", "root": world.source(), "selected": true}).to_string(),
     );
     assert_eq!(code(&invalid).0, "invalid_request");
     assert_eq!(code(&h2.deselect(&world.source())).0, "invalid_request");

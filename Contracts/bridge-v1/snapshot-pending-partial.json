@@ -13,6 +13,19 @@
         "rejected_count": 0,
         "root_display": "source",
         "source_id": "0123456789abcdef0123456789abcdef"
+      },
+      {
+        "consent": "enabled",
+        "harness": "codex",
+        "kind": "custom",
+        "last_attempt_ms": 1775124000001,
+        "last_error_code": null,
+        "last_success_ms": 1775124000000,
+        "outcome": "partial",
+        "pending_partial": true,
+        "rejected_count": 0,
+        "root_display": "codex-home",
+        "source_id": "1123456789abcdef0123456789abcdef"
       }
     ],
     "source_reported": [
@@ -73,6 +86,64 @@
           "value": 141
         },
         "total_mismatch": true
+      },
+      {
+        "acquisition_consistency": "file_by_file_best_effort",
+        "cache_read": {
+          "completeness": null,
+          "last_good_ms": 1775124000000,
+          "provenance": null,
+          "status": "unavailable",
+          "unit": "tokens",
+          "value": null
+        },
+        "cache_write": {
+          "completeness": null,
+          "last_good_ms": 1775124000000,
+          "provenance": null,
+          "status": "unavailable",
+          "unit": "tokens",
+          "value": null
+        },
+        "input": {
+          "completeness": "complete",
+          "last_good_ms": 1775124000000,
+          "provenance": "reported",
+          "status": "current",
+          "unit": "tokens",
+          "value": 7
+        },
+        "mirror_conflict": false,
+        "origin_uncertainty": "unverified_origin",
+        "output": {
+          "completeness": null,
+          "last_good_ms": 1775124000000,
+          "provenance": null,
+          "status": "unavailable",
+          "unit": "tokens",
+          "value": null
+        },
+        "pending_partial": false,
+        "reasoning": {
+          "completeness": null,
+          "last_good_ms": 1775124000000,
+          "provenance": null,
+          "status": "unavailable",
+          "unit": "tokens",
+          "value": null
+        },
+        "records": 1,
+        "source_convention": null,
+        "source_id": "1123456789abcdef0123456789abcdef",
+        "total": {
+          "completeness": "complete",
+          "last_good_ms": 1775124000000,
+          "provenance": "reported",
+          "status": "current",
+          "unit": "tokens",
+          "value": 7
+        },
+        "total_mismatch": false
       }
     ],
     "window": {

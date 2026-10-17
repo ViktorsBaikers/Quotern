@@ -1,0 +1,36 @@
+// !$*UTF8*$!
+{
+    archiveVersion = 1;
+    classes = {};
+    objectVersion = 56;
+    objects = {
+        A00000000000000000000001 = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = NO; LastUpgradeCheck = 2600;}; buildConfigurationList = A00000000000000000000010; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; knownRegions = (en, Base); mainGroup = A00000000000000000000002; productRefGroup = A00000000000000000000003; projectDirPath = ""; projectRoot = ""; targets = (A00000000000000000000004);};
+        A00000000000000000000002 = {isa = PBXGroup; children = (A00000000000000000000014, A00000000000000000000015, A00000000000000000000016, A00000000000000000000017, A00000000000000000000005, A00000000000000000000018, A00000000000000000000019, A00000000000000000000020, A00000000000000000000003); sourceTree = "<group>";};
+        A00000000000000000000003 = {isa = PBXGroup; children = (A00000000000000000000006); name = Products; sourceTree = "<group>";};
+        A00000000000000000000004 = {isa = PBXNativeTarget; buildConfigurationList = A00000000000000000000011; buildPhases = (A00000000000000000000007, A00000000000000000000008); buildRules = (); dependencies = (); name = QuoternNativeUITests; productName = QuoternNativeUITests; productReference = A00000000000000000000006; productType = "com.apple.product-type.bundle.ui-testing";};
+        A00000000000000000000005 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeJourneyUITests.swift; sourceTree = "<group>";};
+        A00000000000000000000006 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = QuoternNativeUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR;};
+        A00000000000000000000007 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000021, A00000000000000000000022, A00000000000000000000023, A00000000000000000000024, A00000000000000000000009, A00000000000000000000025, A00000000000000000000026, A00000000000000000000027); runOnlyForDeploymentPostprocessing = 0;};
+        A00000000000000000000008 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0;};
+        A00000000000000000000009 = {isa = PBXBuildFile; fileRef = A00000000000000000000005;};
+        A00000000000000000000010 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000012); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug;};
+        A00000000000000000000011 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000013); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug;};
+        A00000000000000000000012 = {isa = XCBuildConfiguration; buildSettings = {MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 6.0; ARCHS = arm64; ALWAYS_SEARCH_USER_PATHS = NO;}; name = Debug;};
+        A00000000000000000000013 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = app.quotern.nativeproof.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_STRICT_CONCURRENCY = complete;}; name = Debug;};
+        A00000000000000000000014 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Native011Receipt.swift; sourceTree = "<group>";};
+        A00000000000000000000015 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Native011Evidence.swift; sourceTree = "<group>";};
+        A00000000000000000000016 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Native011LaunchSession.swift; sourceTree = "<group>";};
+        A00000000000000000000017 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Native011RetainedOutput.swift; sourceTree = "<group>";};
+        A00000000000000000000018 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Native011SelfCheck.swift; sourceTree = "<group>";};
+        A00000000000000000000019 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Native011SelfCheckCorrections.swift; sourceTree = "<group>";};
+        A00000000000000000000020 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Native011SelfCheckEvidence.swift; sourceTree = "<group>";};
+        A00000000000000000000021 = {isa = PBXBuildFile; fileRef = A00000000000000000000014;};
+        A00000000000000000000022 = {isa = PBXBuildFile; fileRef = A00000000000000000000015;};
+        A00000000000000000000023 = {isa = PBXBuildFile; fileRef = A00000000000000000000016;};
+        A00000000000000000000024 = {isa = PBXBuildFile; fileRef = A00000000000000000000017;};
+        A00000000000000000000025 = {isa = PBXBuildFile; fileRef = A00000000000000000000018;};
+        A00000000000000000000026 = {isa = PBXBuildFile; fileRef = A00000000000000000000019;};
+        A00000000000000000000027 = {isa = PBXBuildFile; fileRef = A00000000000000000000020;};
+    };
+    rootObject = A00000000000000000000001;
+}
