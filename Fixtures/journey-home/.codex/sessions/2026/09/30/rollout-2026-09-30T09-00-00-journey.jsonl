@@ -1,0 +1,2 @@
+{"timestamp":"2026-09-30T09:00:00.000Z","type":"session_meta","payload":{"id":"0195f011-0000-7000-8000-000000000001","timestamp":"2026-09-30T09:00:00.000Z","cwd":"/work/journey","originator":"codex_cli_rs","cli_version":"0.153.0","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-09-30T09:01:00.000Z","type":"token_usage_record","payload":{"thread_id":"0195f011-0000-7000-8000-000000000001","session_id":"0195f011-0000-7000-8000-000000000001","response_id":"resp_journey_001","usage":{"input_tokens":10,"total_tokens":10}}}

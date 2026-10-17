@@ -1,8 +1,9 @@
 //! Codex source-reported ingestion (DEC-077): own-header ownership, fail-closed headers, the
 //! legacy coverage era, identity and mirror precedence, the store v1 Codex extension and the
 //! shared reported projection. Every expectation comes from the hand-written oracles under
-//! `Fixtures/harness/codex/`, `Fixtures/hostile/codex/` and `Fixtures/harness/opencode/peer/`, or
-//! from inline line specs whose numbers are read off the lines themselves.
+//! `Fixtures/harness/codex/`, `Fixtures/hostile/codex/`, `Fixtures/harness/opencode/peer/` and
+//! `Fixtures/journey-home/`, or from inline line specs whose numbers are read off the lines
+//! themselves.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,6 +31,11 @@ const PEER_EXPECTED: &str = include_str!("../../../Fixtures/harness/opencode/pee
 const OPENCODE_SCHEMA: &str = include_str!("../../../Fixtures/harness/opencode/wal/schema.sql");
 
 const BASIC_FILE: &str = "sessions/2026/03/29/rollout-2026-03-29T09-00-00-basic.jsonl";
+const JOURNEY_FILE: &str = "sessions/2026/09/30/rollout-2026-09-30T09-00-00-journey.jsonl";
+const JOURNEY_ROLL: &str = include_str!(
+    "../../../Fixtures/journey-home/.codex/sessions/2026/09/30/rollout-2026-09-30T09-00-00-journey.jsonl"
+);
+const JOURNEY_EXPECTED: &str = include_str!("../../../Fixtures/journey-home/expected.json");
 const DAY_NOW: i64 = 1_774_785_600_000;
 
 fn fixtures() -> PathBuf {
@@ -98,6 +104,13 @@ impl World {
 
     fn basic(&self) -> TestResult<PathBuf> {
         self.fixture(&format!("harness/codex/basic/{BASIC_FILE}"), BASIC_FILE)
+    }
+
+    /// The committed journey Codex tree: the rollout named by the Swift tests, plus `auth.json`.
+    fn journey_codex(&self) -> TestResult<(PathBuf, PathBuf)> {
+        let rollout = self.fixture(&format!("journey-home/.codex/{JOURNEY_FILE}"), JOURNEY_FILE)?;
+        let auth = self.fixture("journey-home/.codex/auth.json", "auth.json")?;
+        Ok((rollout, auth))
     }
 
     fn engine(&self) -> TestResult<(Engine<RealSourceFs>, String)> {
@@ -2190,6 +2203,199 @@ fn auth_json_never_opened() -> TestResult {
         );
     }
     assert!(observed.metrics().tail_reads >= 1);
+    Ok(())
+}
+
+/// The SLICE-011 journey home: one own record of input 10 and total 10 inside the hand-written
+/// Europe/Riga day, `auth.json` never opened, an unchanged mode-000 file unread, and the closed-app
+/// prefix correction plus append (10 replaced by 20, plus 3) counted once as 23.
+#[test]
+fn journey_home_codex_matches_hand_written_oracle() -> TestResult {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+
+    assert_ne!(
+        unsafe { geteuid() },
+        0,
+        "mode 000 must refuse a content open"
+    );
+    assert_eq!(JOURNEY_ROLL.matches("\"input_tokens\":10").count(), 1);
+    assert_eq!(JOURNEY_ROLL.matches("\"total_tokens\":10").count(), 1);
+    assert!(
+        JOURNEY_ROLL
+            .lines()
+            .next()
+            .is_some_and(|line| line.contains("\"type\":\"session_meta\""))
+    );
+    assert!(
+        JOURNEY_ROLL
+            .lines()
+            .next_back()
+            .is_some_and(|line| line.contains("\"type\":\"token_usage_record\""))
+    );
+
+    let expected = json(JOURNEY_EXPECTED)?;
+    let now = expected["now_ms"].as_i64().ok_or("now")?;
+    let tz = expected["tz"].as_str().ok_or("tz")?;
+    let observations = &expected["codex"]["source_reported"];
+    let world = World::new()?;
+    let (rollout, auth) = world.journey_codex()?;
+    let auth_bytes = std::fs::read(&auth)?;
+    let auth_before = std::fs::metadata(&auth)?;
+    let observed = RecordingFs::new();
+    let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let opened = Arc::clone(&opened);
+        observed.on_boundary(move |kind, path| {
+            if matches!(
+                kind,
+                OpenKind::Header | OpenKind::Bounded | OpenKind::Tail | OpenKind::TailRead
+            ) && let Ok(mut opened) = opened.lock()
+            {
+                opened.push(path.to_path_buf());
+            }
+        });
+    }
+    let mut engine: Engine<RecordingFs> = Engine::open(&world.data, &world.home);
+    let id = engine
+        .attach_codex(observed.clone(), &world.root, enabled(), SourceKind::Custom)
+        .map_err(|report| format!("{report:?}"))?;
+    let first = engine.pass(&id, enabled(), now);
+    assert_eq!(first.outcome, PassOutcome::Consistent);
+    assert!(first.failure.is_none());
+    assert_eq!(first.records_committed, 1);
+    let shot = snapshot(&engine, tz, now)?;
+    assert_eq!(shot["window"], expected["window"]);
+    let reported = reported_of(&shot, &id)?;
+    for name in [
+        "input",
+        "output",
+        "reasoning",
+        "cache_read",
+        "cache_write",
+        "total",
+    ] {
+        assert_eq!(&reported[name], &observations[name], "{name}");
+    }
+    assert_eq!(reported["records"], 1);
+    assert_eq!(reported["origin_uncertainty"], "unverified_origin");
+    let source = by_source_of(&shot, &id)?;
+    assert_eq!(source["harness"], "codex");
+    assert_eq!(source["consent"], "enabled");
+    assert_eq!(source["outcome"], "consistent");
+    assert!(source["last_error_code"].is_null());
+    let opened = opened.lock().map_err(|_| "poisoned")?;
+    assert!(
+        opened.iter().any(|path| path == &rollout),
+        "the rollout was read"
+    );
+    assert!(
+        opened.iter().all(|path| path != &auth),
+        "auth.json was opened"
+    );
+    drop(opened);
+
+    for path in [&rollout, &auth] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))?;
+    }
+    assert!(
+        std::fs::File::open(&rollout).is_err(),
+        "content open is refused"
+    );
+    let before = observed.metrics();
+    let idle_now = now + 300_000;
+    let idle = engine.pass(&id, enabled(), idle_now);
+    assert_eq!(idle.outcome, PassOutcome::Consistent);
+    assert!(idle.failure.is_none());
+    assert_eq!(idle.records_committed, 0);
+    let after = observed.metrics();
+    assert_eq!(after.tail_reads, before.tail_reads, "no JSONL content read");
+    assert_eq!(after.header_reads, before.header_reads);
+    assert_eq!(after.bounded_reads, before.bounded_reads);
+    let idle_shot = snapshot(&engine, tz, idle_now)?;
+    let idle_reported = reported_of(&idle_shot, &id)?;
+    assert_eq!(idle_reported["total"]["value"], 10);
+    assert_eq!(idle_reported["total"]["status"], "current");
+    assert!(by_source_of(&idle_shot, &id)?["last_error_code"].is_null());
+    drop(engine);
+
+    for path in [&rollout, &auth] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
+    }
+    let text = std::fs::read_to_string(&rollout)?;
+    let corrected = text
+        .replace("\"input_tokens\":10", "\"input_tokens\":20")
+        .replace("\"total_tokens\":10", "\"total_tokens\":20");
+    assert_ne!(corrected, text);
+    assert_eq!(corrected.len(), text.len(), "10 and 20 are the same width");
+    let last = text.lines().next_back().ok_or("record line")?;
+    let mut record: Value = serde_json::from_str(last)?;
+    record["payload"]["response_id"] = json!("resp_later");
+    record["payload"]["usage"] = json!({"input_tokens": 3, "total_tokens": 3});
+    let mut append = serde_json::to_vec(&record)?;
+    append.push(b'\n');
+    let inode = std::fs::metadata(&rollout)?.ino();
+    let mut file = std::fs::OpenOptions::new().write(true).open(&rollout)?;
+    file.write_all(corrected.as_bytes())?;
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(&append)?;
+    file.sync_all()?;
+    assert_eq!(std::fs::metadata(&rollout)?.ino(), inode);
+
+    let launch_now = now + 3_600_000;
+    let (mut engine, reopened) = world.engine()?;
+    assert_eq!(reopened, id);
+    let second = pass(&mut engine, &id, launch_now);
+    assert_eq!(second.outcome, PassOutcome::Consistent);
+    assert_eq!(
+        second.records_committed, 2,
+        "revision plus the appended record"
+    );
+    let reconciled = reported_of(&snapshot(&engine, tz, launch_now)?, &id)?;
+    assert_eq!(reconciled["records"], 2);
+    assert_eq!(reconciled["input"]["value"], 23);
+    assert_eq!(reconciled["total"]["value"], 23);
+    assert_eq!(reconciled["input"]["provenance"], "reported");
+    assert_eq!(reconciled["total"]["provenance"], "reported");
+    assert_eq!(reconciled["total"]["status"], "current");
+    assert!(reconciled["output"]["value"].is_null());
+    assert!(reconciled["output"]["provenance"].is_null());
+    assert_eq!(reconciled["origin_uncertainty"], "unverified_origin");
+    assert!(by_source_of(&snapshot(&engine, tz, launch_now)?, &id)?["last_error_code"].is_null());
+    let rows = events(&world.history()?, &id)?;
+    assert_eq!(rows.len(), 2);
+    let original = rows
+        .iter()
+        .find(|row| row["message_id"] == "resp_journey_001")
+        .ok_or("original response")?;
+    assert_eq!(original["input_tokens"], 20);
+    assert_eq!(original["total_tokens"], 20);
+    assert_eq!(original["revision"], 2);
+    assert!(original["output_tokens"].is_null());
+    let added = rows
+        .iter()
+        .find(|row| row["message_id"] == "resp_later")
+        .ok_or("appended response")?;
+    assert_eq!(added["input_tokens"], 3);
+    assert_eq!(added["total_tokens"], 3);
+    assert_eq!(added["revision"], 1);
+    assert_eq!(
+        pass(&mut engine, &id, launch_now + 1_000).records_committed,
+        0
+    );
+
+    let auth_after = std::fs::metadata(&auth)?;
+    assert_eq!(auth_after.ino(), auth_before.ino());
+    assert_eq!(auth_after.len(), auth_before.len());
+    assert_eq!(
+        (auth_after.mtime(), auth_after.mtime_nsec()),
+        (auth_before.mtime(), auth_before.mtime_nsec())
+    );
+    assert_eq!(std::fs::read(&auth)?, auth_bytes);
     Ok(())
 }
 
